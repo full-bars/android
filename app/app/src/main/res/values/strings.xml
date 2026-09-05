@@ -439,6 +439,9 @@
     <string name="mock_location_disclosure_device_wide">This changes the location reported to every app on your device, not just URnetwork.</string>
     <string name="mock_location_disclosure_turn_off_first">Turn this off in URnetwork before you turn off developer options, deselect URnetwork, or uninstall the app — otherwise your device location can stay frozen until you restart.</string>
     <string name="mock_location_error_cleanup_required">URnetwork could not remove the simulated location. Re-select URnetwork under developer options and turn this off, or restart your device.</string>
+    <string name="mock_location_status_stuck">GPS frozen — action needed</string>
+    <string name="mock_location_error_stuck_title">Simulated location is stuck</string>
+    <string name="mock_location_error_stuck_detail">URnetwork was deselected while active, so Android locked the simulated GPS. Re-select URnetwork in Developer options to restore your real GPS, or restart your phone.</string>
     <string name="mock_location_guide_intro">When enabled, apps on this device see the location of the provider you have been connected to the longest, instead of your real location.</string>
     <string name="mock_location_guide_title">Sync device location</string>
     <string name="mock_location_needs_setup">Setup required</string>

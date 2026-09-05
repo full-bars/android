@@ -1,5 +1,6 @@
 package com.bringyour.network.ui.connect.providerlocations
 
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -37,6 +38,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import androidx.lifecycle.Lifecycle
@@ -48,6 +50,7 @@ import com.bringyour.network.location.openAboutPhone
 import com.bringyour.network.location.openDeveloperOptions
 import com.bringyour.network.location.openLocationSettings
 import com.bringyour.network.ui.components.URButton
+import com.bringyour.network.ui.components.URSwitch
 import com.bringyour.network.ui.theme.Black
 import com.bringyour.network.ui.theme.Green
 import com.bringyour.network.ui.theme.MainTintedBackgroundBase
@@ -123,6 +126,43 @@ fun MockLocationGuideScreen(
 
             Spacer(modifier = Modifier.height(24.dp))
 
+            if (state.status == MockLocationStatus.ORPHANED) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(
+                            MaterialTheme.colorScheme.error.copy(alpha = 0.12f),
+                            shape = RoundedCornerShape(12.dp),
+                        )
+                        .padding(16.dp),
+                ) {
+                    Column {
+                        Text(
+                            stringResource(id = R.string.mock_location_error_stuck_title),
+                            style = MaterialTheme.typography.bodyLarge,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            stringResource(id = R.string.mock_location_error_stuck_detail),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = Color.White,
+                        )
+                        Spacer(modifier = Modifier.height(14.dp))
+                        URButton(
+                            onClick = { openDeveloperOptions(context) },
+                        ) { buttonTextStyle ->
+                            Text(
+                                stringResource(id = R.string.mock_location_open_developer_options),
+                                style = buttonTextStyle,
+                            )
+                        }
+                    }
+                }
+                Spacer(modifier = Modifier.height(24.dp))
+            }
+
             // Steps read the raw setup signals, not `status`: with the toggle
             // off `status` is DISABLED regardless of how the device is
             // configured, which would mark every step done and hide the
@@ -141,7 +181,8 @@ fun MockLocationGuideScreen(
                 text = stringResource(id = R.string.mock_location_step_select_app),
                 done = state.mockAppSelected,
                 actionLabel = stringResource(id = R.string.mock_location_open_developer_options),
-                current = state.devOptionsEnabled && !state.mockAppSelected,
+                current = state.devOptionsEnabled && !state.mockAppSelected &&
+                        state.status != MockLocationStatus.ORPHANED,
                 onAction = { openDeveloperOptions(context) },
             )
 
@@ -158,21 +199,34 @@ fun MockLocationGuideScreen(
 
             Spacer(modifier = Modifier.height(24.dp))
 
-            if (state.setupComplete) {
-                Text(
-                    stringResource(id = R.string.mock_location_ready),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = Green,
-                )
-                Spacer(modifier = Modifier.height(24.dp))
-            }
+            if (state.setupComplete && state.status != MockLocationStatus.ORPHANED) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    val target = state.target
+                    val statusText = when {
+                        state.status == MockLocationStatus.ACTIVE && target != null ->
+                            stringResource(id = R.string.mock_location_active, target.label)
+                        state.enabled ->
+                            stringResource(id = R.string.mock_location_waiting_for_provider)
+                        else ->
+                            stringResource(id = R.string.mock_location_ready)
+                    }
 
-            if (state.status == MockLocationStatus.ORPHANED) {
-                Text(
-                    stringResource(id = R.string.mock_location_error_cleanup_required),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.error,
-                )
+                    Text(
+                        statusText,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Green,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    URSwitch(
+                        checked = state.enabled,
+                        toggle = { viewModel.setEnabled(!state.enabled) },
+                    )
+                }
                 Spacer(modifier = Modifier.height(24.dp))
             }
 
