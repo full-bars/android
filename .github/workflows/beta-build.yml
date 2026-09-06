@@ -30,7 +30,7 @@ jobs:
       - name: Check out forked SDK
         uses: actions/checkout@v4
         with:
-          repository: Ryanmello07/urnetwork-sdk
+          repository: full-bars/sdk
           ref: beta/custom-server
           path: urnetwork-sdk
 
