@@ -80,7 +80,7 @@ jobs:
           cache-dependency-path: urnetwork-sdk/build/go.sum
 
       - name: Check out connect dependency
-        run: git clone --depth 1 --branch beta/custom-server https://github.com/Ryanmello07/connect.git connect
+        run: git clone --depth 1 --branch beta/custom-server https://github.com/full-bars/connect.git connect
 
       - name: Check out glog dependency
         run: git clone --depth 1 https://github.com/urnetwork/glog.git glog
