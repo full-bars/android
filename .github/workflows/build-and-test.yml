@@ -89,8 +89,8 @@ jobs:
       - name: Check out the SDK
         uses: actions/checkout@v4
         with:
-          repository: urnetwork/sdk
-          ref: main
+          repository: full-bars/sdk
+          ref: fix/rpc-ipv4-prefer
           path: sdk
 
       # sdk/build/go.mod resolves these with `replace ... => ../../<name>` (and
