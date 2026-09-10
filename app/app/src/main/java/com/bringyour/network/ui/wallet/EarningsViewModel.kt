@@ -290,13 +290,14 @@ class EarningsViewModel @Inject constructor(
      * Bittensor wallet. `address` binds the challenge to a manually entered coldkey.
      */
     fun connectWithBridge(context: Context, address: String? = null) {
-        val api = byDevice?.api
-        if (api == null) {
-            _connectState.value = WalletConnectState.Failed(null)
-            return
-        }
-        _connectState.value = WalletConnectState.RequestingChallenge
         viewModelScope.launch {
+            awaitDevice()
+            val api = byDevice?.api
+            if (api == null) {
+                _connectState.value = WalletConnectState.Failed(null)
+                return@launch
+            }
+            _connectState.value = WalletConnectState.RequestingChallenge
             requestBittensorChallenge(api, address)
                 .onSuccess { message ->
                     val launched = launchBittensorSignMessage(context, message, BITTENSOR_SIGN_PURPOSE_CONNECT)
