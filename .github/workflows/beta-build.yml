@@ -31,7 +31,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: full-bars/sdk
-          ref: beta/custom-server
+          ref: fix/rpc-ipv4-prefer
           path: urnetwork-sdk
 
       - name: Set up JDK
