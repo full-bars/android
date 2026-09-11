@@ -8,6 +8,7 @@ import com.bringyour.sdk.SnWallet
 import com.bringyour.sdk.SnWalletChangeListener
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
+import android.util.Log
 
 class SnProtocolException(val code: String?, message: String) : Exception(message)
 
@@ -41,20 +42,26 @@ class SdkProtocolSource private constructor(
 
     private suspend fun ensureChainSettings() {
         if (chainSettingsSynced) {
+            Log.i("ClaimsDiag", "ensureChainSettings: already synced")
             return
         }
-        if (device.snChainSettings?.isConfigured == true) {
+        val preSync = device.snChainSettings?.isConfigured
+        Log.i("ClaimsDiag", "ensureChainSettings: pre-sync isConfigured=$preSync")
+        if (preSync == true) {
             chainSettingsSynced = true
             return
         }
         suspendCancellableCoroutine<Unit> { continuation ->
-            device.syncSnChainSettings { _, _ ->
+            device.syncSnChainSettings { result, err ->
+                Log.i("ClaimsDiag", "ensureChainSettings: sync result=$result err=$err")
                 if (continuation.isActive) {
                     continuation.resume(Unit)
                 }
             }
         }
-        chainSettingsSynced = device.snChainSettings?.isConfigured == true
+        val postSync = device.snChainSettings?.isConfigured
+        Log.i("ClaimsDiag", "ensureChainSettings: post-sync isConfigured=$postSync")
+        chainSettingsSynced = postSync == true
     }
 
     override fun currentWallet(): SnWalletState? = device.snWallet?.toState()
@@ -150,15 +157,28 @@ class SdkProtocolSource private constructor(
 
     override suspend fun claims(): Result<ClaimsSnapshot> {
         ensureChainSettings()
+        Log.i("ClaimsDiag", "claims: calling device.snClaims()")
         return suspendCancellableCoroutine { continuation ->
             device.snClaims { result, err ->
+                Log.i("ClaimsDiag", "claims: callback err=$err result.error=${result?.error} result.claims=${result?.claims?.len()}")
                 if (!continuation.isActive) {
                     return@snClaims
                 }
                 when {
-                    err != null -> continuation.resume(Result.failure(err))
-                    result == null -> continuation.resume(Result.failure(IllegalStateException("empty claims")))
-                    result.error != null -> continuation.resume(Result.failure(result.error.toException()!!))
+                    err != null -> {
+                        Log.i("ClaimsDiag", "claims: err path: ${err.message}")
+                        continuation.resume(Result.failure(err))
+                    }
+                    result == null -> {
+                        Log.i("ClaimsDiag", "claims: null result")
+                        continuation.resume(Result.failure(IllegalStateException("empty claims")))
+                    }
+                    result.error != null -> {
+                        val code = result.error.code
+                        val msg = result.error.message
+                        Log.i("ClaimsDiag", "claims: result.error code=$code msg=$msg")
+                        continuation.resume(Result.failure(result.error.toException()!!))
+                    }
                     else -> {
                         val list = result.claims
                         val n = list?.len() ?: 0
