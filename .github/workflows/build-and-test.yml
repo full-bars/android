@@ -246,6 +246,14 @@ jobs:
             "$UR_CI_VERSION" "$UR_CI_VERSION_CODE" > android/app/local.properties
           cat android/app/local.properties
 
+      # This branch commits app/debug.keystore so every test APK is signed with
+      # the same key; that lets one test build update the previous one in place
+      # instead of forcing an uninstall between iterations.
+      - name: Use the repo's committed debug keystore
+        run: |
+          mkdir -p "$HOME/.android"
+          cp android/app/debug.keystore "$HOME/.android/debug.keystore"
+
       # The debug build type signs with signingConfigs.debug, whose storeFile is
       # the standard ~/.android/debug.keystore with the published
       # android/androiddebugkey constants. AGP normally creates it on demand;
@@ -289,6 +297,14 @@ jobs:
             :app:compileGithubReleaseKotlin \
             :app:compilePlayReleaseKotlin \
             :app:compileSolana_dappReleaseKotlin
+
+      - name: Upload the github debug APK
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: urnetwork-android-github-apk
+          path: android/app/app/build/outputs/apk/github/debug/*.apk
+          if-no-files-found: error
 
       # Keep the XML alongside the HTML report. The XML lets the acceptance
       # result normalizer identify the failing class and assertion without
