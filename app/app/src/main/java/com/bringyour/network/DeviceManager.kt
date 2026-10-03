@@ -1,5 +1,6 @@
 package com.bringyour.network
 
+import android.util.Log
 import com.bringyour.network.ui.shared.models.ProvideControlMode
 import com.bringyour.network.ui.shared.models.ProvideNetworkMode
 import com.bringyour.sdk.BlockActionOverrideList
@@ -75,6 +76,8 @@ class DeviceManager @Inject constructor(
 ) {
 
     companion object {
+        private const val TAG = "DeviceManager"
+
         // Per-device target passed at construction: DNS 2 parts, one shared
         // 13-part transfer/topology root with overlapping client/provider/NAT
         // children, and 5 parts for platform carriers. Process-level
@@ -405,6 +408,22 @@ class DeviceManager @Inject constructor(
                     closeDeviceSubscriptionsLocked()
                     device?.close()
                     device = newDevice
+
+                    // The sdk persists a device-side preference change (split
+                    // rules, app rules, dns resolver settings, blocker, ...)
+                    // only while auto save is enabled; it defaults off and its
+                    // Load never turns it on. Without this, every edit the app
+                    // routes to the live device is applied in memory and never
+                    // reaches the network space's local state, so the setting
+                    // is gone the moment the process dies. ios enables it the
+                    // same way in PacketTunnelProvider. Enable it before the
+                    // seeds below and before the device is exposed to input.
+                    if (runCatching { newDevice.setAutoSave(true) }.isFailure) {
+                        Log.e(
+                            TAG,
+                            "could not enable local state auto save; device preferences will not persist",
+                        )
+                    }
 
                     persistDeviceLocalKeyMaterial(localState, newDevice)
 
