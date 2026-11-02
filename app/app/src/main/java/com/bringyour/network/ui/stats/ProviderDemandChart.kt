@@ -96,11 +96,14 @@ fun ProviderStatusLineRow(
  * offered this device to clients in each minute of the last hour, as 60 bars
  * with the current minute on the right, and an expandable "Why?" with the
  * numbers the device is ranked by. Before or without a histogram the chart
- * area says loading or unavailable, so the layout does not jump.
+ * area says loading or unavailable, so the layout does not jump. Unavailable
+ * offers [onRetry], because the controller polls about once a minute and the
+ * section would otherwise stay blank until its next interval.
  */
 @Composable
 fun ProviderDemandChart(
     status: ProviderStatusUi,
+    onRetry: () -> Unit,
 ) {
     val display = providerStatusDisplay(status)
     val histogram = remember(status.appearancesPerMinute) {
@@ -157,8 +160,9 @@ fun ProviderDemandChart(
         ) {
             when (display.demand) {
                 ProviderDemandState.LOADING -> DemandChartNote(stringResource(id = R.string.loading))
-                ProviderDemandState.UNAVAILABLE -> DemandChartNote(
-                    stringResource(id = R.string.provider_status_unavailable)
+                ProviderDemandState.UNAVAILABLE -> DemandUnavailable(
+                    retryable = display.retryable,
+                    onRetry = onRetry,
                 )
                 ProviderDemandState.EMPTY, ProviderDemandState.BARS -> {
                     Canvas(
@@ -213,6 +217,34 @@ private fun DemandChartNote(text: String) {
         color = TextMuted,
         textAlign = TextAlign.Center
     )
+}
+
+/**
+ * The chart's box without a status, with Try again when asking again could
+ * help: the poll failed, or the server had no histogram for it. The controller
+ * polls about once a minute, so without this the section stays blank for the
+ * rest of the interval. Its own click wins over the provider card's.
+ */
+@Composable
+private fun DemandUnavailable(
+    retryable: Boolean,
+    onRetry: () -> Unit,
+) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        DemandChartNote(stringResource(id = R.string.provider_status_unavailable))
+        if (retryable) {
+            Text(
+                stringResource(id = R.string.try_again),
+                style = MaterialTheme.typography.bodySmall,
+                color = BlueMedium,
+                modifier = Modifier
+                    .clickable(onClick = onRetry)
+                    .padding(vertical = 4.dp)
+            )
+        }
+    }
 }
 
 /**

@@ -176,6 +176,13 @@ data class ProviderStatusDisplay(
      * the expandable "Why?" with the ranking numbers
      */
     val why: Boolean,
+    /**
+     * whether asking the server again could change the chart area: a failed
+     * poll can be retried at once, while this device missing from the server's
+     * provider clients is the server's answer for minutes (it caches the
+     * admission and the ranking for about five minutes)
+     */
+    val retryable: Boolean = false,
 )
 
 /**
@@ -187,15 +194,47 @@ fun providerStatusDisplay(status: ProviderStatusUi): ProviderStatusDisplay {
     return when {
         !status.loaded && status.lastFetchError.isEmpty() ->
             ProviderStatusDisplay(ProviderDemandState.LOADING, why = false)
-        !status.loaded || !status.hasStatus ->
+        !status.loaded ->
+            // the poll failed: another one now is the only way out before the
+            // controller's next interval
+            ProviderStatusDisplay(ProviderDemandState.UNAVAILABLE, why = false, retryable = true)
+        !status.hasStatus ->
+            // this device is not among the network's provider clients, so
+            // there is nothing to retry until the server answers differently
             ProviderStatusDisplay(ProviderDemandState.UNAVAILABLE, why = false)
         !status.hasAppearances ->
-            ProviderStatusDisplay(ProviderDemandState.UNAVAILABLE, why = true)
+            ProviderStatusDisplay(ProviderDemandState.UNAVAILABLE, why = true, retryable = true)
         status.appearancesPerMinute.all { it <= 0L } ->
             ProviderStatusDisplay(ProviderDemandState.EMPTY, why = true)
         else ->
             ProviderStatusDisplay(ProviderDemandState.BARS, why = true)
     }
+}
+
+/**
+ * How soon the view model asks again after a failed poll that has never
+ * loaded. The controller's own retry is its next interval, about a minute
+ * away.
+ */
+const val PROVIDER_STATUS_RETRY_DELAY_MILLIS = 5_000L
+
+/**
+ * How many of those retries one screen makes before it leaves the retry to the
+ * controller's interval, so a server that keeps failing is asked once a
+ * minute, not every few seconds.
+ */
+const val PROVIDER_STATUS_FIRST_LOAD_RETRIES = 6
+
+/**
+ * Whether a failed poll is asked again at once: only while nothing has loaded
+ * yet, so there is nothing on screen to keep, and the bounded retries are not
+ * spent. A failed poll after a load keeps its snapshot, so it has nothing to
+ * heal and waits for the controller's next interval.
+ */
+fun providerStatusRetryAfterFailure(status: ProviderStatusUi, retries: Int): Boolean {
+    return status.lastFetchError.isNotEmpty() &&
+        !status.loaded &&
+        retries < PROVIDER_STATUS_FIRST_LOAD_RETRIES
 }
 
 /**

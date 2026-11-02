@@ -407,22 +407,25 @@ class ProviderStatusPresentationTest {
             ProviderStatusDisplay(ProviderDemandState.LOADING, why = false),
             providerStatusDisplay(ProviderStatusUi.Empty),
         )
-        // for example before the server has the route
+        // a failed poll asks again at once: the controller otherwise waits its
+        // whole interval, so the section would stay blank with no way out
         assertEquals(
-            ProviderStatusDisplay(ProviderDemandState.UNAVAILABLE, why = false),
+            ProviderStatusDisplay(ProviderDemandState.UNAVAILABLE, why = false, retryable = true),
             providerStatusDisplay(ProviderStatusUi(lastFetchError = "404 Not Found")),
         )
-        // this device is not among the network's provider clients
+        // this device is not among the network's provider clients: the server
+        // caches that answer for minutes, so there is nothing to retry
         assertEquals(
-            ProviderStatusDisplay(ProviderDemandState.UNAVAILABLE, why = false),
+            ProviderStatusDisplay(ProviderDemandState.UNAVAILABLE, why = false, retryable = false),
             providerStatusDisplay(ProviderStatusUi(loaded = true)),
         )
     }
 
     @Test
     fun statesWithAStatus() {
+        // the server had no histogram for this device: asking again can help
         assertEquals(
-            ProviderStatusDisplay(ProviderDemandState.UNAVAILABLE, why = true),
+            ProviderStatusDisplay(ProviderDemandState.UNAVAILABLE, why = true, retryable = true),
             providerStatusDisplay(loadedStatus(appearancesPerMinute = null)),
         )
         assertEquals(
@@ -438,6 +441,39 @@ class ProviderStatusPresentationTest {
         assertEquals(
             ProviderStatusDisplay(ProviderDemandState.BARS, why = true),
             providerStatusDisplay(loadedStatus(appearancesPerMinute = counts).copy(lastFetchError = "timeout")),
+        )
+    }
+
+    // the fast retries of a poll that failed before anything loaded
+
+    @Test
+    fun aFailedFirstPollIsRetriedAtOnceABoundedNumberOfTimes() {
+        val failed = ProviderStatusUi(
+            lastFetchError = "503 Cached response is temporarily unavailable.",
+        )
+        assertTrue(providerStatusRetryAfterFailure(failed, 0))
+        assertTrue(providerStatusRetryAfterFailure(failed, PROVIDER_STATUS_FIRST_LOAD_RETRIES - 1))
+        // the retries are spent: the controller's interval asks from here
+        assertFalse(providerStatusRetryAfterFailure(failed, PROVIDER_STATUS_FIRST_LOAD_RETRIES))
+    }
+
+    @Test
+    fun onlyAFailedPollWithNothingLoadedIsRetriedAtOnce() {
+        // no poll has run yet, so nothing failed
+        assertFalse(providerStatusRetryAfterFailure(ProviderStatusUi.Empty, 0))
+        // a poll after a load keeps its snapshot; nothing is blank to heal
+        assertFalse(
+            providerStatusRetryAfterFailure(
+                ProviderStatusUi(loaded = true, lastFetchError = "timeout"),
+                0,
+            )
+        )
+        // a load with a status has its histogram and its "Why?"
+        assertFalse(
+            providerStatusRetryAfterFailure(
+                loadedStatus(appearancesPerMinute = listOf(1L)),
+                0,
+            )
         )
     }
 }
