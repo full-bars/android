@@ -71,6 +71,7 @@ import com.bringyour.network.ui.login.launchBittensorBridge
 import com.bringyour.network.ui.stats.ThroughputViewModel
 import com.bringyour.network.ui.shared.viewmodels.OverlayViewModel
 import com.bringyour.network.ui.stats.ProviderStatsSection
+import com.bringyour.network.ui.stats.ProviderStatusViewModel
 import com.bringyour.network.ui.theme.Amber
 import com.bringyour.network.ui.theme.Black
 import com.bringyour.network.ui.theme.BlueMedium
@@ -416,6 +417,11 @@ fun EarningsScreenContent(
     onSeeProtocolBoard: () -> Unit = {},
 ) {
     val refreshState = rememberPullToRefreshState()
+    // The demand chart's controller polls about once a minute on its own, so
+    // the screen's refresh polls it now: pull to refresh otherwise left the
+    // chart and its "Why?" blank until the next interval, with nothing on
+    // screen to retry.
+    val providerStatusViewModel: ProviderStatusViewModel = hiltViewModel()
     val top200BringIntoView = remember { BringIntoViewRequester() }
     LaunchedEffect(focusTop200, top200 is Top200TileState.Hidden) {
         if (focusTop200 && top200 !is Top200TileState.Hidden) {
@@ -452,7 +458,10 @@ fun EarningsScreenContent(
         PullToRefreshBox(
             isRefreshing = isRefreshing,
             state = refreshState,
-            onRefresh = refresh,
+            onRefresh = {
+                refresh()
+                providerStatusViewModel.refresh()
+            },
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
@@ -578,7 +587,8 @@ fun EarningsScreenContent(
 
                 ProviderStatsSection(
                     navController = navController,
-                    throughputViewModel = throughputViewModel
+                    throughputViewModel = throughputViewModel,
+                    providerStatusViewModel = providerStatusViewModel,
                 )
 
                 Spacer(modifier = Modifier.height(24.dp))

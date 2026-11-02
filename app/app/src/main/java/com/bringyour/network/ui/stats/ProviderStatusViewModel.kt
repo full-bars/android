@@ -15,6 +15,8 @@ import com.bringyour.sdk.DeviceLocal
 import com.bringyour.sdk.ProviderStatusViewController
 import com.bringyour.sdk.Sub
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
@@ -47,6 +49,10 @@ class ProviderStatusViewModel @Inject constructor(
 
     var status by mutableStateOf(ProviderStatusUi.Empty)
         private set
+
+    // the fast retries of a poll that failed before anything loaded
+    private var firstLoadRetries = 0
+    private var retryJob: Job? = null
 
     init {
         processLifecycle.addObserver(this)
@@ -86,6 +92,17 @@ class ProviderStatusViewModel @Inject constructor(
         controllerOwner.setVisible(visible)
     }
 
+    /**
+     * Polls now, instead of at the controller's next interval. This is what
+     * pull to refresh and the chart's Try again do, because the controller
+     * polls about once a minute: a failed poll, or a poll the server answered
+     * from a cold cache, otherwise leaves the demand chart and the "Why?"
+     * blank until the next interval.
+     */
+    fun refresh() {
+        statusVc?.refresh()
+    }
+
     /** Opens the device's controller and follows its polls. */
     private fun openProviderStatus(device: DeviceLocal): ProviderStatusViewController {
         val vc = device.openProviderStatusViewController()
@@ -104,6 +121,9 @@ class ProviderStatusViewModel @Inject constructor(
     private fun closeProviderStatus(device: DeviceLocal, vc: ProviderStatusViewController) {
         subs.forEach { it.close() }
         subs.clear()
+        retryJob?.cancel()
+        retryJob = null
+        firstLoadRetries = 0
         vc.stop()
         device.closeProviderStatusViewController(vc)
         if (statusVc === vc) {
@@ -116,6 +136,31 @@ class ProviderStatusViewModel @Inject constructor(
     private fun update() {
         val vc = statusVc ?: return
         status = ProviderStatusUi.fromSdk(vc)
+        scheduleFirstLoadRetry()
+    }
+
+    /**
+     * The controller retries a failed poll at its next interval, about a
+     * minute away, so one transient failure at screen open would leave the
+     * demand chart and its "Why?" blank that long with nothing on screen to
+     * heal them. Ask again after a few seconds, a bounded number of times; a
+     * poll after a load keeps its snapshot, so it waits for the controller.
+     */
+    private fun scheduleFirstLoadRetry() {
+        if (status.lastFetchError.isEmpty()) {
+            firstLoadRetries = 0
+        }
+        if (!providerStatusRetryAfterFailure(status, firstLoadRetries)) {
+            return
+        }
+        if (retryJob?.isActive == true) {
+            return
+        }
+        firstLoadRetries += 1
+        retryJob = viewModelScope.launch {
+            delay(PROVIDER_STATUS_RETRY_DELAY_MILLIS)
+            statusVc?.refresh()
+        }
     }
 
     override fun onCleared() {
