@@ -547,7 +547,7 @@ import kotlin.math.roundToInt
             tunnelRetryKind == TunnelRetryKind.CONFIGURATION &&
             tunnelRetryConfiguration != desired
         ) {
-            cancelTunnelRetry()
+            cancelTunnelRetry(resetFailureCount = false)
         }
         if (vpnPacketFlowNeedsRebuild(
                 packetFlow?.isActive() ?: false,
@@ -572,9 +572,8 @@ import kotlin.math.roundToInt
         val sameTarget =
             tunnelRetryKind == kind && tunnelRetryConfiguration == configuration
         if (!sameTarget) {
-            // A recovered loop can fail again shortly after we cleared the
-            // runnable. Keep its history until it has stayed up long enough.
-            cancelTunnelRetry(resetFailureCount = tunnelRetryKind != null)
+            // Keep failure history when a retry changes target or a loop flaps.
+            cancelTunnelRetry(resetFailureCount = false)
             tunnelRetryKind = kind
             tunnelRetryConfiguration = configuration
         }
@@ -609,7 +608,7 @@ import kotlin.math.roundToInt
                     }
                     val desired = desiredTunnelConfiguration()
                     if (desired != configuration) {
-                        cancelTunnelRetry()
+                        cancelTunnelRetry(resetFailureCount = false)
                         reconcilePfd()
                     } else {
                         updatePfd(configuration)
@@ -834,13 +833,14 @@ import kotlin.math.roundToInt
                 val flowStartedAt = SystemClock.elapsedRealtime()
                 val replacementPacketFlow = try {
                     createPacketFlow(device, descriptor, app.ioLoopDiagnostics) { endedPacketFlow ->
+                        val flowEndedAt = SystemClock.elapsedRealtime()
                         mainHandler.post {
                             if (packetFlow === endedPacketFlow) {
                                 packetFlow = null
                                 if (app.service?.get() == this@MainService) {
                                     tunnelRetryFailureCount = packetFlowRetryFailureCount(
                                         tunnelRetryFailureCount,
-                                        SystemClock.elapsedRealtime() - flowStartedAt,
+                                        flowEndedAt - flowStartedAt,
                                         retryPending = tunnelRetryRunnable != null,
                                     )
                                     device.tunnelStarted = false

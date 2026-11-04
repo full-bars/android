@@ -4,8 +4,8 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Whether this flavor's alert says to disconnect before paying: only where a held
- * tunnel stops the checkout. Play Billing runs in the Play Store and Play services, which the tunnel captures.
+ * Whether this flavor's alert can offer payment recovery advice while the tunnel
+ * holds traffic. Per-app routing can leave Play Store and Play services outside it.
  */
 class PlanCheckoutRouteTest {
 
