@@ -898,8 +898,8 @@ class InsufficientBalancePolicyTest {
         assertTrue(indicator.contains("dataLimitReached -> stringResource(id = R.string.data_limit_reached)"))
     }
 
-    // Where the store's traffic rides the tunnel (the Play flavor), a held tunnel stops
-    // the purchase, so the alert says to disconnect first, while it holds and only then.
+    // Play checkout may use a held tunnel, so the alert offers recovery advice
+    // if payment fails, while traffic is held and only then.
     @Test
     fun disconnectFirstOnlyWhereCheckoutRidesAHoldingTunnel() {
         for (status in requestedStatuses) {
@@ -962,10 +962,9 @@ class InsufficientBalancePolicyTest {
         assertFalse(body.contains("rovide"))
     }
 
-    // What each flavor's answer rests on. The tunnel leaves out this app's own uid, and
-    // the store apps are not among the other apps it leaves out, so Play Billing, which
-    // runs in the Play Store and Play services, rides it while the web view and the
-    // Stripe sheet, in this app, do not.
+    // The tunnel leaves out this app's own uid. Play Billing can use the tunnel
+    // through the Play Store and Play services, depending on per-app routing;
+    // the web view and Stripe sheet run in this app.
     @Test
     fun eachFlavorsCheckoutGoesWhereItsAnswerSays() {
         val service = mainSource("MainService.kt")
