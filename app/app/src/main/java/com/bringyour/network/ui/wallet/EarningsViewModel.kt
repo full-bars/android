@@ -1,7 +1,9 @@
 package com.bringyour.network.ui.wallet
 
+import com.bringyour.network.R
 import com.bringyour.network.ui.leaderboard.ProtocolTopMe
 
+import android.content.Context
 import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -14,6 +16,7 @@ import com.bringyour.sdk.DeviceLocal
 import com.bringyour.sdk.VerifySeekerNftHolderArgs
 import com.solana.publickey.SolanaPublicKey
 import dagger.hilt.android.lifecycle.HiltViewModel
+import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -21,7 +24,9 @@ import com.bringyour.network.ui.shared.models.SectionLoad
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import javax.inject.Inject
@@ -121,6 +126,7 @@ sealed class ClaimDialogState {
 @HiltViewModel
 class EarningsViewModel @Inject constructor(
     private val deviceManager: DeviceManager,
+    @ApplicationContext context: Context,
 ) : ViewModel() {
 
     private var byDevice: DeviceLocal? = null
@@ -213,6 +219,29 @@ class EarningsViewModel @Inject constructor(
     // the network's payout consent beside the v2 tile, signed through its own wallet sheets
     val consentFlow = SnConsentFlow(viewModelScope)
 
+    // the payout key on this device (BTEASY): the sdk's flow behind the payout card,
+    // fed the consent read above
+    val keyModel = BittensorKeyModel(
+        scope = viewModelScope,
+        store = AndroidBittensorLocalKeyStore.shared(context),
+        reminderNotice = BittensorKeyReminderNotice(context),
+    )
+
+    // what URnetwork's claim relay says of the network's v2 balance; null until
+    // read, or with nothing to ask
+    private val _claimStatus = MutableStateFlow<SnClaimStatusState?>(null)
+    val claimStatus: StateFlow<SnClaimStatusState?> = _claimStatus.asStateFlow()
+
+    // the claim relay's dialog, and its Claim now: null before a tap
+    var isPresentedRelayClaimDialog by mutableStateOf(false)
+        private set
+
+    private val _claimNowOutcome = MutableStateFlow<SnClaimNowOutcome?>(null)
+    val claimNowOutcome: StateFlow<SnClaimNowOutcome?> = _claimNowOutcome.asStateFlow()
+
+    private val _isClaimingNow = MutableStateFlow(false)
+    val isClaimingNow: StateFlow<Boolean> = _isClaimingNow.asStateFlow()
+
     var isRefreshing by mutableStateOf(false)
         private set
 
@@ -236,6 +265,25 @@ class EarningsViewModel @Inject constructor(
         viewModelScope.launch {
             EarningsDebugFlags.version.drop(1).collect {
                 setupDevice(byDevice)
+            }
+        }
+        // the payout key's flow works from the same consent read as the consent block
+        viewModelScope.launch {
+            consentFlow.state.map { it.load }.distinctUntilChanged().collect {
+                keyModel.consentRead(it)
+            }
+        }
+        // the key is the signed-in network's, whose id comes with the jwt, which
+        // can settle after the device does
+        viewModelScope.launch {
+            deviceManager.jwtFlow.map { it?.networkId?.toString().orEmpty() }.distinctUntilChanged().drop(1).collect {
+                resetKeyModel(byDevice)
+            }
+        }
+        // a consent the key's flow got accepted: read it again, with everything it changes
+        keyModel.onLinked = {
+            viewModelScope.launch {
+                refreshAll(userInitiated = false)
             }
         }
     }
@@ -273,6 +321,9 @@ class EarningsViewModel @Inject constructor(
             if (_wallet.value != null) {
                 refreshSettlements()
             }
+            // what URnetwork's claim relay says, with or without a wallet on this device
+            refreshClaimStatus()
+            syncKeyModelWithEarnings()
         } finally {
             if (userInitiated) {
                 isRefreshing = false
@@ -334,7 +385,7 @@ class EarningsViewModel @Inject constructor(
             }
             .onFailure {
                 Log.i(TAG, "claims: ${it.message}")
-                _claimsError.value = it.message
+                _claimsError.value = claimsReadFailureMessage(it)
             }
     }
 
@@ -342,6 +393,70 @@ class EarningsViewModel @Inject constructor(
     private suspend fun refreshSettlements() = coroutineScope {
         launch { ledgerFlow.refresh() }
         refreshClaims()
+    }
+
+    // ---- claims through URnetwork's claim relay (SnClaimStatus)
+
+    private suspend fun refreshClaimStatus() {
+        val s = source
+        val status = s.claimStatus()
+        if (s === source) {
+            _claimStatus.value = status
+        }
+    }
+
+    /** Claim now, from the v2 tile: the relay's dialog, with nothing tapped yet. */
+    fun openRelayClaimDialog() {
+        _claimNowOutcome.value = null
+        isPresentedRelayClaimDialog = true
+    }
+
+    fun closeRelayClaimDialog() {
+        isPresentedRelayClaimDialog = false
+    }
+
+    /**
+     * Claim now: URnetwork claims the relay's coldkey now, at most once in
+     * the period, and pays the gas. The sdk answers what came of the tap, and
+     * the status is read again.
+     */
+    fun claimNow() {
+        val status = _claimStatus.value ?: return
+        if (!status.claimNowAvailable || _isClaimingNow.value) {
+            return
+        }
+        val s = source
+        _isClaimingNow.value = true
+        viewModelScope.launch {
+            val outcome = s.claimNow(status.coldkeySs58)
+            if (s !== source) {
+                return@launch
+            }
+            _claimNowOutcome.value = outcome
+            _isClaimingNow.value = false
+            refreshClaimStatus()
+        }
+    }
+
+    // ---- the payout key
+
+    private fun resetKeyModel(device: DeviceLocal?) {
+        val networkId = deviceManager.jwtFlow.value?.networkId?.toString()
+        // no device, no session to sign the consent with: no key's flow
+        keyModel.reset(device?.api, if (device == null) null else networkId)
+    }
+
+    /**
+     * What the key's flow decides from the earnings: "Payouts start next
+     * epoch", the Top 200 warning, and the one reminder.
+     */
+    private fun syncKeyModelWithEarnings() {
+        keyModel.setTop200Registered(_top.value?.me?.row?.fleets?.isNotEmpty() == true)
+        val ledgerClaimableRao = (ledgerFlow.load.value as? SnLedgerLoad.Loaded)?.accounts?.sumOf { it.claimableRao } ?: 0L
+        keyModel.earningsRead(
+            schedule = _schedule.value,
+            claimable = 0 < _totalClaimableRao.value || 0 < ledgerClaimableRao || 0 < (_claimStatus.value?.claimableRao ?: 0L),
+        )
     }
 
     // ---- wallet connect: the coldkey proves itself by signing a challenge
@@ -427,6 +542,8 @@ class EarningsViewModel @Inject constructor(
     fun onScreenResumed() {
         proofFlow.onResumed()
         consentFlow.onResumed()
+        // each visit reads the store again: a key returns here after a logout or a reinstall
+        keyModel.visit()
         val s = _connectState.value
         if (s is WalletConnectState.AwaitingSignature || s is WalletConnectState.RequestingChallenge) {
             _connectState.value = WalletConnectState.Idle
@@ -750,6 +867,11 @@ class EarningsViewModel @Inject constructor(
         source = if (device == null) NoProtocolSource else createProtocolSource(device)
         ledgerFlow.reset(source)
         consentFlow.reset(source)
+        resetKeyModel(device)
+        _claimStatus.value = null
+        _claimNowOutcome.value = null
+        _isClaimingNow.value = false
+        isPresentedRelayClaimDialog = false
 
         _wallet.value = null
         _walletLoaded.value = false
@@ -802,6 +924,7 @@ class EarningsViewModel @Inject constructor(
         removeWalletListener?.invoke()
         removeWalletListener = null
         byDevice = null
+        keyModel.close()
         super.onCleared()
     }
 
@@ -813,7 +936,12 @@ class EarningsViewModel @Inject constructor(
         const val SN_CODE_EXPIRED = "claims_for_epoch_expired"
         const val SN_CODE_ALREADY_CLAIMED = "already_claimed"
         const val SN_CODE_RPC_UNREACHABLE = "chain_rpc_unreachable"
+        const val SN_CODE_RPC_ERROR = "chain_rpc_error"
         const val SN_CODE_CHAIN_NOT_CONFIGURED = "chain_not_configured"
+        const val SN_CODE_ARTIFACT_UNAVAILABLE = "artifact_unavailable"
+        const val SN_CODE_LEDGER_UNAVAILABLE = "ledger_unavailable"
+        const val SN_CODE_CONNECT_WALLET_FIRST = "connect_wallet_first"
+        const val SN_CODE_LOCAL_STATE_UNAVAILABLE = "local_state_unavailable"
         // POST /sn/wallet: the signature is not from the entered address (bittensor_error_signature_mismatch)
         const val SN_CODE_SIGNATURE_MISMATCH = "signature_mismatch"
         // the payout consent's refusals in the SDK's "code: message" form (sn_consent_owner_only,
@@ -833,6 +961,36 @@ class EarningsViewModel @Inject constructor(
 
         // what the funding hint suggests sending to the mirror address: a claim's gas up to about 6.7 gwei
         const val SUGGESTED_GAS_TAO = 0.02
+    }
+}
+
+/**
+ * A failed claims read as the view model keeps it: the SDK's "<code>: <reason>",
+ * the form a claim's own failure arrives in, so the screen can tell failures apart.
+ */
+fun claimsReadFailureMessage(error: Throwable): String? {
+    val code = (error as? SnProtocolException)?.code
+    return if (code != null) "$code: ${error.message}" else error.message
+}
+
+/**
+ * The string a failed claims read says, for the codes that have one; null for the
+ * others, which show the SDK's detail. The chain and its artifacts being out of
+ * reach all ask for a retry, the same grouping as iOS's SnLedgerClaimFailure.
+ */
+fun claimsReadFailureRes(message: String?): Int? {
+    if (message.isNullOrBlank()) {
+        return R.string.chain_rpc_unreachable
+    }
+    return when (EarningsViewModel.claimFailureCode(message)) {
+        EarningsViewModel.SN_CODE_RPC_UNREACHABLE,
+        EarningsViewModel.SN_CODE_RPC_ERROR,
+        EarningsViewModel.SN_CODE_CHAIN_NOT_CONFIGURED,
+        EarningsViewModel.SN_CODE_ARTIFACT_UNAVAILABLE,
+        EarningsViewModel.SN_CODE_LEDGER_UNAVAILABLE -> R.string.chain_rpc_unreachable
+        EarningsViewModel.SN_CODE_CONNECT_WALLET_FIRST,
+        EarningsViewModel.SN_CODE_LOCAL_STATE_UNAVAILABLE -> R.string.connect_wallet_first
+        else -> null
     }
 }
 

@@ -131,6 +131,15 @@ internal fun tunnelRetryDelayMillis(settings: VpnTunnelTimingSettings, failureCo
     return delays[failureCount.coerceIn(0, delays.lastIndex)]
 }
 
+internal const val PACKET_FLOW_STABLE_MILLIS = 30_000L
+
+/** A briefly established loop has not recovered; keep its retry history. */
+internal fun packetFlowRetryFailureCount(
+    failureCount: Int,
+    activeMillis: Long,
+    retryPending: Boolean,
+): Int = if (!retryPending && activeMillis >= PACKET_FLOW_STABLE_MILLIS) 0 else failureCount
+
 /**
  * A new process starts with MainApplication.serviceActive=false even when
  * Android is redelivering the start intent for a VPN it killed. In that case

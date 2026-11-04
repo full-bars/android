@@ -572,7 +572,9 @@ import kotlin.math.roundToInt
         val sameTarget =
             tunnelRetryKind == kind && tunnelRetryConfiguration == configuration
         if (!sameTarget) {
-            cancelTunnelRetry()
+            // A recovered loop can fail again shortly after we cleared the
+            // runnable. Keep its history until it has stayed up long enough.
+            cancelTunnelRetry(resetFailureCount = tunnelRetryKind != null)
             tunnelRetryKind = kind
             tunnelRetryConfiguration = configuration
         }
@@ -829,12 +831,18 @@ import kotlin.math.roundToInt
             pfd?.let { descriptor ->
                 // cancel the previous packet flow after the new fd is in place, to avoid leaking packets
                 val replacedPacketFlow = packetFlow
+                val flowStartedAt = SystemClock.elapsedRealtime()
                 val replacementPacketFlow = try {
                     createPacketFlow(device, descriptor, app.ioLoopDiagnostics) { endedPacketFlow ->
                         mainHandler.post {
                             if (packetFlow === endedPacketFlow) {
                                 packetFlow = null
                                 if (app.service?.get() == this@MainService) {
+                                    tunnelRetryFailureCount = packetFlowRetryFailureCount(
+                                        tunnelRetryFailureCount,
+                                        SystemClock.elapsedRealtime() - flowStartedAt,
+                                        retryPending = tunnelRetryRunnable != null,
+                                    )
                                     device.tunnelStarted = false
                                     scheduleTunnelRetry(
                                         TunnelRetryKind.CONFIGURATION,
@@ -856,7 +864,7 @@ import kotlin.math.roundToInt
                     return
                 }
                 packetFlow = replacementPacketFlow
-                cancelTunnelRetry()
+                cancelTunnelRetry(resetFailureCount = false)
                 appliedTunnelConfiguration = configuration
                 val replacedGuard = alwaysOnGuardPfd
                 alwaysOnGuardPfd = null
