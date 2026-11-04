@@ -285,6 +285,29 @@ class VpnServiceStartPolicyTest {
     }
 
     @Test
+    fun shortLivedPacketFlowsKeepBackoffButStableFlowsResetIt() {
+        assertEquals(3, packetFlowRetryFailureCount(3, 29_999L, retryPending = false))
+        assertEquals(0, packetFlowRetryFailureCount(3, 30_000L, retryPending = false))
+        assertEquals(3, packetFlowRetryFailureCount(3, 60_000L, retryPending = true))
+        assertEquals(3, packetFlowRetryFailureCount(3, -1L, retryPending = false))
+    }
+
+    @Test
+    fun repeatedShortLivedFlowsBackOffAndAStableFlowStartsFresh() {
+        val settings = VpnTunnelTimingSettings()
+        var failures = 0
+        val delays = mutableListOf<Long>()
+        repeat(8) {
+            failures = packetFlowRetryFailureCount(failures, 100L, retryPending = false)
+            delays += tunnelRetryDelayMillis(settings, failures)
+            failures++
+        }
+        assertEquals(listOf(250L, 1_000L, 2_000L, 5_000L, 10_000L, 30_000L, 30_000L, 30_000L), delays)
+        failures = packetFlowRetryFailureCount(failures, 30_000L, retryPending = false)
+        assertEquals(250L, tunnelRetryDelayMillis(settings, failures))
+    }
+
+    @Test
     fun nonDefaultTunnelRetryDelaysAreHonored() {
         val settings = VpnTunnelTimingSettings(tunnelRetryDelaysMillis = listOf(5L, 7L))
 
