@@ -208,19 +208,19 @@ private fun DeveloperContent(developerViewModel: DeveloperViewModel) {
         while (true) {
             lifecycleLog = withContext(Dispatchers.IO) {
                 runCatching { VpnLifecycleLog.read(context.createDeviceProtectedStorageContext().filesDir).joinToString("\n") }
-                    .getOrElse { "Unable to read VPN lifecycle log" }
+                    .getOrElse { context.getString(R.string.vpn_lifecycle_log_read_failed) }
             }
             delay(DeveloperViewModel.REFRESH_POLL_MILLIS)
         }
     }
-    URTextInputLabel(text = "VPN lifecycle log (newest first)")
-    Text(lifecycleLog.ifEmpty { "No events recorded" }, style = MaterialTheme.typography.bodySmall, color = TextMuted)
-    DeveloperAction(label = "Share VPN lifecycle log", enabled = lifecycleLog.isNotEmpty()) {
+    URTextInputLabel(text = stringResource(R.string.vpn_lifecycle_log_title))
+    Text(lifecycleLog.ifEmpty { stringResource(R.string.vpn_lifecycle_log_empty) }, style = MaterialTheme.typography.bodySmall, color = TextMuted)
+    DeveloperAction(label = stringResource(R.string.vpn_lifecycle_log_share), enabled = lifecycleLog.isNotEmpty()) {
         val intent = Intent(Intent.ACTION_SEND).apply {
             type = "text/plain"
             putExtra(Intent.EXTRA_TEXT, lifecycleLog)
         }
-        context.startActivity(Intent.createChooser(intent, "Share VPN lifecycle log"))
+        context.startActivity(Intent.createChooser(intent, context.getString(R.string.vpn_lifecycle_log_share)))
     }
     val shareBundle: (File) -> Unit = { file ->
         val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
