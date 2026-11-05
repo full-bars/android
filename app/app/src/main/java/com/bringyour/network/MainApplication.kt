@@ -2819,15 +2819,20 @@ class MainApplication : Application() {
             if (vpnStartRetryRunnable !== retry) return@Runnable
             vpnStartRetryRunnable = null
             val retryListener = vpnRequestStartListener
+            val vpnRequired = systemAlwaysOnVpn || restoredVpnServiceRequired()
             if (
                 !vpnServiceStartRetryEligible(
                     retryRequested = vpnRequestStart,
-                    vpnRequired = systemAlwaysOnVpn || restoredVpnServiceRequired(),
+                    vpnRequired = vpnRequired,
                     serviceActive = serviceActive,
                     startPending = vpnStartPending,
                     foregroundActivityAvailable = retryListener != null,
                 )
             ) {
+                VpnLifecycleLog.record(
+                    { createDeviceProtectedStorageContext().filesDir }, "retry refused",
+                    "kind=foreground requested=$vpnRequestStart required=$vpnRequired active=$serviceActive pending=$vpnStartPending activity=${retryListener != null}",
+                )
                 return@Runnable
             }
             Log.i(
@@ -2842,6 +2847,7 @@ class MainApplication : Application() {
                 }
         }
         vpnStartRetryRunnable = retry
+        VpnLifecycleLog.record({ createDeviceProtectedStorageContext().filesDir }, "retry scheduled", "kind=foreground delayMillis=$delayMillis")
         mainHandler.postDelayed(retry, delayMillis)
     }
 
@@ -2944,6 +2950,7 @@ class MainApplication : Application() {
 
         // on the connect command queue, after the commands made before it;
         // a failure is logged there (connectCommands)
+        VpnLifecycleLog.record({ createDeviceProtectedStorageContext().filesDir }, "disconnect requested", "source=$source")
         Log.i(TAG, "Disconnecting VPN connection from $source")
         connectCommands.runOnDevice(connectDevice, connect = false)
         updateVpnService()
@@ -3100,7 +3107,12 @@ class MainApplication : Application() {
                 alwaysOnConnectRequestedDevice = null
                 ensureAlwaysOnConnected()
             }
-        }, vpnTunnelTimingSettings.alwaysOnConnectRetryMillis)
+        }, vpnTunnelTimingSettings.alwaysOnConnectRetryMillis.also { delay ->
+            VpnLifecycleLog.record(
+                { createDeviceProtectedStorageContext().filesDir }, "retry scheduled",
+                "kind=always-on-connect delayMillis=$delay",
+            )
+        })
     }
 
     fun restoredVpnServiceRequired(): Boolean {
@@ -3157,7 +3169,7 @@ class MainApplication : Application() {
 
         if (serviceActive) {
             serviceActive = false
-            service?.get()?.stop()
+            service?.get()?.stop("app no longer requires VPN")
             synchronized(serviceActiveMonitor) {
                 serviceActiveMonitor.notifyAll()
             }

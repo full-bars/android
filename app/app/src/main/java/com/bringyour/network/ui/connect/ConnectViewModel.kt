@@ -619,6 +619,7 @@ internal constructor(
     val disconnect: () -> Unit = {
         // the user's disconnect: nothing is reconnected by itself after it,
         // and a start still waiting on its balance does not connect
+        com.bringyour.network.VpnLifecycleLog.record({ appContext.createDeviceProtectedStorageContext().filesDir }, "disconnect requested", "connect screen")
         (appContext as? com.bringyour.network.MainApplication)?.clearBalanceRecovery()
         startConnect.cancel()
         runCommand(connect = false) { it.disconnect() }

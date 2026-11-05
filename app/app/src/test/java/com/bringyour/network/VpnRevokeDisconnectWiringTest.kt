@@ -36,7 +36,7 @@ class VpnRevokeDisconnectWiringTest {
         val onRevoke = function(source("MainService.kt"), "    override fun onRevoke(")
         val revoked = onRevoke.indexOf("vpnServiceRevoked()")
         assertTrue("onRevoke does not disconnect the connection", 0 <= revoked)
-        assertTrue("onRevoke stops before it disconnects", revoked < onRevoke.indexOf("stop()"))
+        assertTrue("onRevoke stops before it disconnects", revoked < onRevoke.indexOf("stop(\"revoke\")"))
     }
 
     @Test
