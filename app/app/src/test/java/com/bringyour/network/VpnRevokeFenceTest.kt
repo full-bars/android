@@ -312,8 +312,9 @@ class VpnRevokeFenceTest {
     fun replacementAndDestroyStillTearDown() {
         val service = source("MainService.kt")
         val start = function(service, "    override fun onStartCommand(")
-        assertTrue("a replaced owner is stopped", start.contains("currentService?.stop()"))
-        assertTrue(function(service, "    override fun onDestroy(").contains("stop()"))
+        assertTrue("a replaced owner is stopped", Regex("""currentService\?\.stop\(""").containsMatchIn(start))
+        val destroy = function(service, "    override fun onDestroy(")
+        assertTrue(Regex("""\bstop\(""").containsMatchIn(destroy))
     }
 
     @Test

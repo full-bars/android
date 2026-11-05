@@ -78,7 +78,7 @@ class VpnInternalStopKeepaliveTest {
         assertTrue("obsolete flow does not consult the keepalive", 0 <= held)
         val line = start.substring(start.lastIndexOf("val obsoleteFlow", held), held)
         assertTrue(line.contains("!stop") && line.contains("!revokeFenced") && line.contains("commandCompatible"))
-        assertTrue("the held stop must precede stop()", held < start.indexOf("stop()", held))
+        assertTrue("the held stop must precede stop()", Regex("""\bstop\(""").find(start, held)?.let { it.range.first > held } == true)
     }
 
     @Test
@@ -87,10 +87,11 @@ class VpnInternalStopKeepaliveTest {
         val monitorFrom = service.indexOf("private fun startCloseMonitor(")
         assertTrue("missing startCloseMonitor", 0 <= monitorFrom)
         val monitor = service.substring(monitorFrom)
-        assertTrue(monitor.contains("if (!keepRequiredVpnUp(\"close-monitor\")) stop()"))
+        assertTrue(Regex("""if \(!keepRequiredVpnUp\("close-monitor"\)\) stop\("[^"]*"\)""").containsMatchIn(monitor))
         val start = function(service, "    override fun onStartCommand(")
         val init = start.substring(start.indexOf("application initialization failed"))
-        assertTrue(init.indexOf("keepRequiredVpnUp(\"application-init-failure\")") in 0 until init.indexOf("stop()"))
+        val initStop = Regex("""\bstop\(""").find(init)?.range?.first ?: init.length
+        assertTrue(init.indexOf("keepRequiredVpnUp(\"application-init-failure\")") in 0 until initStop)
     }
 
     @Test
