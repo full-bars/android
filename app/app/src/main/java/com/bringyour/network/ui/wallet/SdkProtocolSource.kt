@@ -373,10 +373,13 @@ class SdkProtocolSource private constructor(
 
     override suspend fun claimStatus(): SnClaimStatusState? =
         suspendCancellableCoroutine { continuation ->
-            device.snClaimStatus { result, _ ->
+            device.snClaimStatus { result, err ->
                 // copied off the gomobile objects here: an exception thrown out
                 // of the callback cannot cross JNI and aborts the process
-                val status = runCatching { result?.let { snClaimStatusOf(it) } }.getOrNull()
+                val status = runCatching {
+                    if (err != null) snClaimStatusUnavailable()
+                    else result?.let { snClaimStatusOf(it) }
+                }.getOrElse { snClaimStatusUnavailable() }
                 if (continuation.isActive) {
                     continuation.resume(status)
                 }
