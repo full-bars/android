@@ -15,6 +15,8 @@ internal data class VpnServiceStartFacts(
     val redelivered: Boolean,
     val systemStart: Boolean,
     val commandCompatible: Boolean = true,
+    /** The user revoked the VPN in system settings and has not connected since. */
+    val revokeFenced: Boolean = false,
 )
 
 internal enum class VpnServiceStartDecision {
@@ -77,8 +79,10 @@ internal fun vpnServiceStartRetryEligible(
     serviceActive: Boolean,
     startPending: Boolean,
     foregroundActivityAvailable: Boolean,
+    revokeFenced: Boolean = false,
 ): Boolean =
-    retryRequested &&
+    !revokeFenced &&
+        retryRequested &&
         vpnRequired &&
         !serviceActive &&
         !startPending &&
@@ -147,7 +151,7 @@ internal fun packetFlowRetryFailureCount(
  * is the authority. An ordinary stale app intent still cannot resurrect a VPN.
  */
 internal fun decideVpnServiceStart(facts: VpnServiceStartFacts): VpnServiceStartDecision {
-    if (!facts.commandCompatible || facts.stopRequested || !facts.startRequested) {
+    if (facts.revokeFenced || !facts.commandCompatible || facts.stopRequested || !facts.startRequested) {
         return VpnServiceStartDecision.STOP
     }
     // Android's Settings > Always-on VPN selection is an explicit system
@@ -167,6 +171,18 @@ internal fun decideVpnServiceStart(facts: VpnServiceStartFacts): VpnServiceStart
 }
 
 internal const val VPN_SERVICE_COMMAND_VERSION = 1
+
+/** Intent extra: the revoke-fence epoch the app admitted this start under. */
+internal const val VPN_START_FENCE_EPOCH_EXTRA = "fence_epoch"
+
+/**
+ * Whether a start intent was admitted after the last revoke. An intent that
+ * carries an epoch (the app's own start) must still match it; one that carries
+ * none (the system's Always-on start, a redelivery from an older build) has
+ * nothing to compare and is judged by the fence's current value alone.
+ */
+internal fun vpnStartEpochAdmitted(carried: Long?, admits: (Long) -> Boolean): Boolean =
+    carried == null || admits(carried)
 
 /**
  * Explicit app commands are versioned because Android can redeliver an Intent
@@ -201,3 +217,62 @@ internal fun vpnAlwaysOnGuardRequired(
     deviceAvailable: Boolean,
     wouldEscape: Boolean,
 ): Boolean = systemAlwaysOn && (!deviceAvailable || wouldEscape)
+
+/**
+ * Every path that can bring the VPN back without the user asking. A revoke
+ * (the user turned the VPN off in system settings, or another VPN replaced
+ * ours) leaves provide enabled, so reconcile would otherwise restart the
+ * service at once; the fence holds all of these until [USER_CONNECT].
+ */
+internal enum class VpnReconnectEntry {
+    RECONCILE,
+    START_SERVICE,
+    FOREGROUND_RETRY,
+    RESTORE,
+    SYSTEM_START,
+    ALWAYS_ON_GUARD,
+    ALWAYS_ON_CONNECT,
+    BALANCE_RECOVERY,
+    /** ConnectViewModel, QuickConnect and the reconnect-tunnel action. */
+    USER_CONNECT,
+}
+
+/** Whether `entry` may reconnect while the revoke fence is [raised]. */
+internal fun vpnReconnectAllowed(entry: VpnReconnectEntry, raised: Boolean): Boolean =
+    !raised || entry == VpnReconnectEntry.USER_CONNECT
+
+internal enum class VpnInternalStopDecision {
+    STOP,
+    /** Tear the flow down, keep the service and its notification, retry the TUN. */
+    KEEP_AND_RETRY,
+}
+
+/**
+ * Whether a promoted service stops itself or stays up and retries the TUN.
+ * A required VPN (provide, connect or the kill switch) must not lose its
+ * foreground service to an internal stop while the app is backgrounded: the
+ * app cannot start it again from there. Not covered, and not asked here:
+ * replacement, onDestroy, the user's disconnect, the revoke fence, and a
+ * missing device (nothing to run, and the retry needs an adopted
+ * service with a configuration).
+ */
+internal fun decideInternalStop(
+    foregroundPromoted: Boolean,
+    ownsService: Boolean,
+    deviceBound: Boolean,
+    revokeFenced: Boolean,
+    provideEnabled: Boolean,
+    connectEnabled: Boolean,
+    routeLocal: Boolean,
+): VpnInternalStopDecision =
+    if (
+        foregroundPromoted &&
+        ownsService &&
+        deviceBound &&
+        !revokeFenced &&
+        vpnServiceRequired(provideEnabled, connectEnabled, routeLocal)
+    ) {
+        VpnInternalStopDecision.KEEP_AND_RETRY
+    } else {
+        VpnInternalStopDecision.STOP
+    }

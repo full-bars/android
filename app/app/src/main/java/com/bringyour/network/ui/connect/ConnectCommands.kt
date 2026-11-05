@@ -113,8 +113,13 @@ internal class ConnectCommands(
      * out started for by then. True when it is queued; a connect of a device
      * signed out is refused.
      */
-    fun run(device: Any, connect: Boolean, command: () -> Unit): Boolean {
-        if (connect && signedOut(device)) {
+    fun run(
+        device: Any,
+        connect: Boolean,
+        admit: () -> Boolean = { true },
+        command: () -> Unit,
+    ): Boolean {
+        if (connect && (signedOut(device) || !admit())) {
             return false
         }
         val pending = Pending(device, connect)
@@ -126,7 +131,9 @@ internal class ConnectCommands(
             postMain(Runnable { started(pending) })
             try {
                 // a disconnect always runs
-                if (!connect || !signedOut(device)) {
+                // an automatic connect asks `admit` again here: the revoke
+                // fence can rise while it waits on the queue
+                if (!connect || (!signedOut(device) && admit())) {
                     command()
                 }
             } catch (e: Exception) {
@@ -220,13 +227,15 @@ internal const val CONNECT_COMMAND_STALL_MILLIS = 10_000L
  * it on the queue and closed after. A connect goes to what `location` gives,
  * read with the command on the queue, so it sees what the commands before it
  * left (the saved connection's location by default); null is the best
- * available provider. True when it is queued.
+ * available provider. A connect is `admit`ted when queued and again when it
+ * runs (an automatic one passes the revoke fence). True when it is queued.
  */
 internal fun ConnectCommands.runOnDevice(
     device: ConnectDevice,
     connect: Boolean,
     location: (ConnectDevice) -> com.bringyour.sdk.ConnectLocation? = { it.connectLocation },
-): Boolean = run(device.identity, connect) {
+    admit: () -> Boolean = { true },
+): Boolean = run(device.identity, connect, admit) {
     val vc = device.openConnectViewController()
     try {
         if (connect) {

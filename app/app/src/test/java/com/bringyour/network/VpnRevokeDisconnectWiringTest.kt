@@ -32,6 +32,17 @@ class VpnRevokeDisconnectWiringTest {
     }
 
     @Test
+    fun foregroundPromotionFailureStopsImmediately() {
+        val onCreate = function(source("MainService.kt"), "    override fun onCreate(")
+        val failure = onCreate.substring(onCreate.indexOf("catch (e: Exception)"))
+        val report = failure.indexOf("vpnServiceDidNotStart(this)")
+        val stop = failure.indexOf("stopSelf()")
+        assertTrue("promotion failure must be reported", report >= 0)
+        assertTrue("promotion failure must stop immediately", stop > report)
+        assertTrue("promotion must be marked unsuccessful", failure.indexOf("false", stop) > stop)
+    }
+
+    @Test
     fun theSystemsRevokeDisconnectsBeforeTheServiceStops() {
         val onRevoke = function(source("MainService.kt"), "    override fun onRevoke(")
         val revoked = onRevoke.indexOf("vpnServiceRevoked()")

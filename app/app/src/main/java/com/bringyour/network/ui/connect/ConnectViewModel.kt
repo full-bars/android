@@ -339,6 +339,8 @@ internal constructor(
                             app?.startConnectBlocked(location)
                         } else {
                             app?.clearBalanceRecovery()
+                            // the user's own connect lifts the revoke fence
+                            app?.clearVpnRevokeFence()
                             runCommand(connect = true) { vc ->
                                 if (location != null) vc.connect(location) else vc.connectBestAvailable()
                             }

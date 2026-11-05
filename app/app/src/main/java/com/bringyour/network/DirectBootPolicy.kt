@@ -21,7 +21,12 @@ internal fun decideDirectBootServiceStart(
     startRequested: Boolean,
     systemStart: Boolean,
     commandCompatible: Boolean,
+    revokeFenced: Boolean = false,
 ): DirectBootServiceDecision {
+    // The fence is device-protected state, so it holds before first unlock too.
+    if (revokeFenced) {
+        return DirectBootServiceDecision.STOP
+    }
     if (credentialStorageUnlocked) {
         return DirectBootServiceDecision.USE_CREDENTIAL_STATE
     }
