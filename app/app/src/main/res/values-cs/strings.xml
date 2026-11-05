@@ -113,7 +113,7 @@
     <string name="bittensor_key_card_short">URnetwork není peněženka. „Nastavit výplaty“ vytvoří na tomto zařízení klíč Bittensor a na něj se bude vyplácet SN25α celé vaší sítě. Zálohujte obnovovací frázi klíče: pokud toto zařízení ztratíte dřív, než ji uložíte, k vašemu SN25α se nebude možné dostat.</string>
     <string name="bittensor_key_change_wallet_body">Vyberte, kam se budou od příští epochy vyplácet výdělky této sítě. Dřívější výdělky zůstanou tam, kam byly vyplaceny.</string>
     <string name="bittensor_key_confirm_top200">Odstraněním tohoto klíče se také vzdáte možnosti zajistit si místo v Top 200 jedním klepnutím. Místo si můžete i nadále zajistit z peněženky Bittensor s touto obnovovací frází.</string>
-    <string name="bittensor_key_copy_warning_2">Jiné aplikace možná dokážou schránku přečíst. Kopie zůstává na tomto zařízení a po 60 s se vymaže.</string>
+    <string name="bittensor_key_copy_warning_2">Jiné aplikace mohou být schopné číst schránku. Tato aplikace se pokusí kopii po 60 s vymazat, ale nemůže to zaručit. Zkontrolujte schránku a vymažte ji sami.</string>
     <string name="bittensor_key_create_here">Vytvořit klíč na tomto zařízení</string>
     <string name="bittensor_key_create_here_body">URnetwork není peněženka. Jedním klepnutím se na tomto zařízení vytvoří klíč Bittensor; potom zálohujte jeho obnovovací frázi.</string>
     <string name="bittensor_key_delete_account_message_2">Váš klíč Bittensor není zálohovaný. Odstraněním účtu se odstraní i z tohoto zařízení a URnetwork ho nedokáže získat zpět.</string>
@@ -170,7 +170,7 @@
     <string name="bittensor_key_set_up">Nastavit výplaty</string>
     <string name="bittensor_key_setting_up">Ukládání klíče na tomto zařízení a jeho zpětné načtení, potom podepsání.</string>
     <string name="bittensor_key_sign_out_message">Vaše obnovovací fráze Bittensor ještě není uložená. Klíč zůstane na tomto zařízení a vrátí se, až se tato síť znovu přihlásí. Pokud toto zařízení ztratíte dřív, než ji uložíte, k vašemu SN25α se nebude možné dostat.</string>
-    <string name="bittensor_key_sign_out_message_2">Zůstane na tomto zařízení a vrátí se, až se k této síti znovu přihlásíte. Pokud toto zařízení ztratíte dřív, než ho uložíte, k vašemu SN25α se nebude možné dostat.</string>
+    <string name="bittensor_key_sign_out_message_2">Klíč zůstane na tomto zařízení a vrátí se, až se k této síti znovu přihlásíte. Pokud toto zařízení ztratíte dřív, než zálohujete obnovovací frázi, k vašemu SN25α se nebude možné dostat.</string>
     <string name="bittensor_key_sign_out_title_2">Váš klíč Bittensor není zálohovaný</string>
     <string name="bittensor_key_signing">Nastavování výplat: podepisování souhlasu s výplatami vaší sítě tímto klíčem.</string>
     <string name="bittensor_key_status_saved">Klíč je na tomto zařízení, obnovovací fráze je uložená</string>
@@ -669,6 +669,7 @@
     <string name="insufficient_balance_disconnect_first_kill_switch">Pro přechod na vyšší tarif nejprve zvolte „Odpojení“ a vypněte Kill switch, pokud je zapnutý. Do té doby platba neprojde.</string>
     <string name="insufficient_balance_exhausted">Došla vám data až do bezplatného obnovení nebo přechodu na vyšší tarif.</string>
     <string name="insufficient_balance_held_notice">Váš provoz zůstává zadržen v tunelu, dokud nepřejdete na vyšší tarif nebo se neodpojíte.</string>
+    <string name="insufficient_balance_always_on_vpn">Pokud je pro tuto aplikaci v Androidu nastavena trvalá síť VPN („Always-on VPN“), vypněte ji také v nastavení VPN v Androidu. Platbu blokuje i po odpojení.</string>
     <string name="insufficient_balance_reconnecting">Data jsou opět k dispozici. Znovu se připojuje…</string>
     <string name="insufficient_balance_refreshes_in">Data zdarma se obnoví za %1$s.</string>
     <string name="insufficient_balance_reserved">%1$s je rezervováno pro vaše otevřená připojení. Co nevyužijí, se vrátí, až se ukončí.</string>

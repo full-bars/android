@@ -113,7 +113,7 @@
     <string name="bittensor_key_card_short">URnetwork वॉलेट नहीं है। “भुगतान सेट करें” इस डिवाइस पर एक Bittensor कुंजी बनाता है, और आपके पूरे नेटवर्क के SN25α का भुगतान उसी कुंजी पर होता है। कुंजी के रिकवरी फ़्रेज़ का बैकअप लें: अगर आप फ़्रेज़ सहेजने से पहले यह डिवाइस खो देते हैं, तो आपके SN25α तक पहुँचा नहीं जा सकेगा।</string>
     <string name="bittensor_key_change_wallet_body">चुनें कि अगले एपोक से इस नेटवर्क की कमाई का भुगतान कहाँ हो। पिछली कमाई वहीं रहेगी जहाँ उसका भुगतान हुआ था।</string>
     <string name="bittensor_key_confirm_top200">इस कुंजी को डिलीट करने से एक टैप में टॉप 200 की जगह पक्की करने का विकल्प भी चला जाता है। आप फिर भी इस रिकवरी फ़्रेज़ वाले किसी Bittensor वॉलेट से जगह पक्की कर सकते हैं।</string>
-    <string name="bittensor_key_copy_warning_2">हो सकता है कि दूसरे ऐप क्लिपबोर्ड पढ़ सकें। कॉपी इसी डिवाइस पर रहती है और 60 सेकंड बाद साफ़ कर दी जाती है।</string>
+    <string name="bittensor_key_copy_warning_2">अन्य ऐप्स क्लिपबोर्ड पढ़ सकते हैं। यह ऐप 60 सेकंड बाद कॉपी हटाने की कोशिश करता है, पर इसकी गारंटी नहीं दे सकता। क्लिपबोर्ड जाँचें और उसे खुद साफ़ करें।</string>
     <string name="bittensor_key_create_here">इस डिवाइस पर कुंजी बनाएं</string>
     <string name="bittensor_key_create_here_body">URnetwork वॉलेट नहीं है। एक टैप से इस डिवाइस पर एक Bittensor कुंजी बन जाती है। उसके बाद उसके रिकवरी फ़्रेज़ का बैकअप लें।</string>
     <string name="bittensor_key_delete_account_message_2">आपकी Bittensor कुंजी का बैकअप नहीं लिया गया है। अकाउंट डिलीट करने पर यह इस डिवाइस से भी डिलीट हो जाएगी, और URnetwork इसे वापस नहीं ला सकता।</string>
@@ -170,7 +170,7 @@
     <string name="bittensor_key_set_up">भुगतान सेट करें</string>
     <string name="bittensor_key_setting_up">इस डिवाइस पर कुंजी सहेजी जा रही है और दोबारा पढ़ी जा रही है, फिर साइन किया जाएगा।</string>
     <string name="bittensor_key_sign_out_message">आपका Bittensor रिकवरी फ़्रेज़ अभी सहेजा नहीं गया है। कुंजी इसी डिवाइस पर रहती है और जब यह नेटवर्क फिर से साइन इन करता है तो वापस आ जाती है। अगर आप फ़्रेज़ सहेजने से पहले यह डिवाइस खो देते हैं, तो आपके SN25α तक पहुँचा नहीं जा सकेगा।</string>
-    <string name="bittensor_key_sign_out_message_2">कुंजी इसी डिवाइस पर रहती है और जब आप इस नेटवर्क में फिर से साइन इन करते हैं तो वापस आ जाती है। अगर आप इसे सहेजने से पहले यह डिवाइस खो देते हैं, तो आपके SN25α तक पहुँचा नहीं जा सकेगा।</string>
+    <string name="bittensor_key_sign_out_message_2">कुंजी इसी डिवाइस पर रहती है और जब आप इस नेटवर्क में फिर से साइन इन करते हैं तो वापस आ जाती है। अगर आप रिकवरी फ़्रेज़ का बैकअप लेने से पहले यह डिवाइस खो देते हैं, तो आपके SN25α तक पहुँचा नहीं जा सकेगा।</string>
     <string name="bittensor_key_sign_out_title_2">आपकी Bittensor कुंजी का बैकअप नहीं लिया गया है</string>
     <string name="bittensor_key_signing">भुगतान सेट किए जा रहे हैं: इस कुंजी से आपके नेटवर्क की पेआउट सहमति पर साइन किया जा रहा है।</string>
     <string name="bittensor_key_status_saved">कुंजी इस डिवाइस पर है, रिकवरी फ़्रेज़ सहेज लिया गया</string>
@@ -669,6 +669,7 @@
     <string name="insufficient_balance_disconnect_first_kill_switch">अपग्रेड करने के लिए पहले \"डिस्कनेक्ट करें\" चुनें, और किल स्विच चालू हो तो उसे बंद करें। तब तक भुगतान पूरा नहीं हो पाएगा।</string>
     <string name="insufficient_balance_exhausted">निःशुल्क रीफ़्रेश या अपग्रेड तक आपका डेटा खत्म हो गया है।</string>
     <string name="insufficient_balance_held_notice">जब तक आप अपग्रेड या डिस्कनेक्ट नहीं करते, आपका ट्रैफ़िक टनल में रोका रहता है।</string>
+    <string name="insufficient_balance_always_on_vpn">अगर इस ऐप के लिए Android का Always-on VPN चालू है, तो उसे Android की VPN सेटिंग में भी बंद करें। यह डिस्कनेक्ट करने के बाद भी भुगतान रोके रखता है।</string>
     <string name="insufficient_balance_reconnecting">डेटा फिर से उपलब्ध है। दोबारा कनेक्ट हो रहा है…</string>
     <string name="insufficient_balance_refreshes_in">निःशुल्क डेटा %1$s में रीफ़्रेश होगा।</string>
     <string name="insufficient_balance_reserved">%1$s आपके खुले कनेक्शनों के लिए आरक्षित है। वे जो उपयोग नहीं करते, वह उनके बंद होने पर वापस मिल जाता है।</string>

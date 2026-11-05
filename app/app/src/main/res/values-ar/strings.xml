@@ -113,7 +113,7 @@
     <string name="bittensor_key_card_short">URnetwork ليس محفظة. يُنشئ «إعداد المدفوعات» مفتاح Bittensor على هذا الجهاز، ويُدفع إليه SN25α الخاص بشبكتك بأكملها. احفظ عبارة النسخ الاحتياطي الخاصة بالمفتاح: إذا فقدت هذا الجهاز قبل حفظها، فلن يمكن الوصول إلى SN25α الخاص بك.</string>
     <string name="bittensor_key_change_wallet_body">اختر أين تُدفع أرباح هذه الشبكة بدءًا من الفترة التالية. تبقى الأرباح السابقة حيث دُفعت.</string>
     <string name="bittensor_key_confirm_top200">يعني حذف هذا المفتاح أيضًا التخلي عن حجز مكان في أفضل 200 بنقرة واحدة. سيظل بإمكانك الحجز من محفظة Bittensor تحتوي على عبارة النسخ الاحتياطي هذه.</string>
-    <string name="bittensor_key_copy_warning_2">قد تتمكن تطبيقات أخرى من قراءة الحافظة. تبقى النسخة على هذا الجهاز وتُمسح بعد 60 ث.</string>
+    <string name="bittensor_key_copy_warning_2">قد تتمكن تطبيقات أخرى من قراءة الحافظة. يحاول هذا التطبيق مسح النسخة بعد 60 ث، لكنه لا يضمن ذلك. تحقق من الحافظة وامسحها بنفسك.</string>
     <string name="bittensor_key_create_here">إنشاء مفتاح على هذا الجهاز</string>
     <string name="bittensor_key_create_here_body">URnetwork ليس محفظة. تنشئ نقرة واحدة مفتاح Bittensor على هذا الجهاز؛ احفظ عبارة النسخ الاحتياطي الخاصة به بعد ذلك.</string>
     <string name="bittensor_key_delete_account_message_2">لم يتم نسخ مفتاح Bittensor الخاص بك احتياطيًا. حذف حسابك يحذفه أيضًا من هذا الجهاز، ولا يستطيع URnetwork استعادته.</string>
@@ -170,7 +170,7 @@
     <string name="bittensor_key_set_up">إعداد المدفوعات</string>
     <string name="bittensor_key_setting_up">جارٍ حفظ المفتاح على هذا الجهاز وإعادة قراءته، ثم التوقيع.</string>
     <string name="bittensor_key_sign_out_message">لم يتم حفظ عبارة النسخ الاحتياطي الخاصة بك لـ Bittensor بعد. يبقى المفتاح على هذا الجهاز ويعود عندما تسجّل هذه الشبكة الدخول مرة أخرى. إذا فقدت هذا الجهاز قبل حفظها، فلن يمكن الوصول إلى SN25α الخاص بك.</string>
-    <string name="bittensor_key_sign_out_message_2">يبقى المفتاح على هذا الجهاز ويعود عندما تسجّل الدخول إلى هذه الشبكة مرة أخرى. إذا فقدت هذا الجهاز قبل حفظه، فلن يمكن الوصول إلى SN25α الخاص بك.</string>
+    <string name="bittensor_key_sign_out_message_2">يبقى المفتاح على هذا الجهاز ويعود عندما تسجّل الدخول إلى هذه الشبكة مرة أخرى. إذا فقدت هذا الجهاز قبل نسخ عبارة الاسترداد احتياطيًا، فلن يمكن الوصول إلى SN25α الخاص بك.</string>
     <string name="bittensor_key_sign_out_title_2">لم يتم نسخ مفتاح Bittensor الخاص بك احتياطيًا</string>
     <string name="bittensor_key_signing">جارٍ إعداد المدفوعات: توقيع موافقة الدفع الخاصة بشبكتك باستخدام هذا المفتاح.</string>
     <string name="bittensor_key_status_saved">المفتاح على هذا الجهاز، وتم حفظ عبارة النسخ الاحتياطي</string>
@@ -669,6 +669,7 @@
     <string name="insufficient_balance_disconnect_first_kill_switch">للترقية، اختر «قطع الاتصال» أولًا، وأوقف «مفتاح القتل» إن كان مفعّلًا. لا يمكن إتمام الدفع قبل ذلك.</string>
     <string name="insufficient_balance_exhausted">نفدت بياناتك حتى التجديد المجاني أو الترقية.</string>
     <string name="insufficient_balance_held_notice">تبقى حركة بياناتك محتجزة داخل النفق حتى تقوم بالترقية أو قطع الاتصال.</string>
+    <string name="insufficient_balance_always_on_vpn">إذا كان «VPN الدائم التشغيل» في Android مفعّلًا لهذا التطبيق، فأوقفه أيضًا من إعدادات VPN في Android. يستمر في منع الدفع بعد قطع الاتصال.</string>
     <string name="insufficient_balance_reconnecting">البيانات متاحة مجددًا. جارٍ إعادة الاتصال…</string>
     <string name="insufficient_balance_refreshes_in">تتجدد البيانات المجانية بعد %1$s.</string>
     <string name="insufficient_balance_reserved">%1$s محجوزة لاتصالاتك المفتوحة. ما لا تستخدمه منها يُعاد عند إغلاقها.</string>

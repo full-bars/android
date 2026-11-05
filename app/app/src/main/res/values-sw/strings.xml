@@ -113,7 +113,7 @@
     <string name="bittensor_key_card_short">URnetwork si pochi. “Sanidi malipo” inaunda ufunguo wa Bittensor kwenye kifaa hiki, na SN25α ya mtandao wako wote inalipwa kwenye ufunguo huo. Hifadhi nakala ya kifungu cha urejeshaji cha ufunguo huo: ukipoteza kifaa hiki kabla ya kuhifadhi kifungu hicho, SN25α yako haitaweza kufikiwa.</string>
     <string name="bittensor_key_change_wallet_body">Chagua mahali ambapo mapato ya mtandao huu yatalipwa kuanzia kipindi kijacho. Mapato ya awali yanabaki pale yalipolipwa.</string>
     <string name="bittensor_key_confirm_top200">Kufuta ufunguo huu pia kunamaanisha kuacha kupata nafasi ya Top 200 kwa mguso mmoja. Bado unaweza kuipata kutoka kwenye pochi ya Bittensor iliyo na kifungu hiki cha urejeshaji.</string>
-    <string name="bittensor_key_copy_warning_2">Programu nyingine zinaweza kusoma ubao wa kunakili. Nakala inabaki kwenye kifaa hiki na inafutwa baada ya sekunde 60.</string>
+    <string name="bittensor_key_copy_warning_2">Programu nyingine zinaweza kusoma ubao wa kunakili. Programu hii hujaribu kufuta nakala baada ya sekunde 60, lakini haiwezi kuhakikisha hilo. Angalia ubao wa kunakili na uufute mwenyewe.</string>
     <string name="bittensor_key_create_here">Unda ufunguo kwenye kifaa hiki</string>
     <string name="bittensor_key_create_here_body">URnetwork si pochi. Mguso mmoja unaunda ufunguo wa Bittensor kwenye kifaa hiki; baadaye hifadhi nakala ya kifungu chake cha urejeshaji.</string>
     <string name="bittensor_key_delete_account_message_2">Ufunguo wako wa Bittensor haujahifadhiwa nakala. Kufuta akaunti yako pia kunaufuta kwenye kifaa hiki, na URnetwork haiwezi kuurudisha.</string>
@@ -170,7 +170,7 @@
     <string name="bittensor_key_set_up">Sanidi malipo</string>
     <string name="bittensor_key_setting_up">Inahifadhi ufunguo kwenye kifaa hiki na kuusoma tena, kisha inatia sahihi.</string>
     <string name="bittensor_key_sign_out_message">Kifungu chako cha urejeshaji cha Bittensor bado hakijahifadhiwa. Ufunguo unabaki kwenye kifaa hiki na unarudi mtandao huu unapoingia tena. Ukipoteza kifaa hiki kabla ya kuhifadhi kifungu hicho, SN25α yako haitaweza kufikiwa.</string>
-    <string name="bittensor_key_sign_out_message_2">Ufunguo unabaki kwenye kifaa hiki na unarudi unapoingia tena kwenye mtandao huu. Ukipoteza kifaa hiki kabla ya kuuhifadhi, SN25α yako haitaweza kufikiwa.</string>
+    <string name="bittensor_key_sign_out_message_2">Ufunguo unabaki kwenye kifaa hiki na unarudi unapoingia tena kwenye mtandao huu. Ukipoteza kifaa hiki kabla ya kuhifadhi nakala rudufu ya kifungu cha urejeshaji, SN25α yako haitaweza kufikiwa.</string>
     <string name="bittensor_key_sign_out_title_2">Ufunguo wako wa Bittensor haujahifadhiwa nakala</string>
     <string name="bittensor_key_signing">Inasanidi malipo: inatia sahihi idhini ya malipo ya mtandao wako kwa ufunguo huu.</string>
     <string name="bittensor_key_status_saved">Ufunguo upo kwenye kifaa hiki, kifungu cha urejeshaji kimehifadhiwa</string>
@@ -669,6 +669,7 @@
     <string name="insufficient_balance_disconnect_first_kill_switch">Ili kupandisha kiwango, chagua kwanza \"Tenganisha\" na uzime Kill switch ikiwa imewashwa. Malipo hayawezi kukamilika kabla ya hapo.</string>
     <string name="insufficient_balance_exhausted">Data yako imeisha hadi usasishaji wa bure au hadi upandishe kiwango.</string>
     <string name="insufficient_balance_held_notice">Trafiki yako imeshikiliwa ndani ya handaki hadi upandishe kiwango au utenganishe.</string>
+    <string name="insufficient_balance_always_on_vpn">Ikiwa VPN ya Android ya Always-on imewekwa kwa programu hii, izime pia katika mipangilio ya VPN ya Android. Inaendelea kuzuia malipo baada ya kukata muunganisho.</string>
     <string name="insufficient_balance_reconnecting">Data inapatikana tena. Inaunganisha upya…</string>
     <string name="insufficient_balance_refreshes_in">Data ya bure itasasishwa baada ya %1$s.</string>
     <string name="insufficient_balance_reserved">%1$s imehifadhiwa kwa ajili ya miunganisho yako iliyo wazi. Isiyotumika hurejeshwa miunganisho hiyo inapofungwa.</string>
