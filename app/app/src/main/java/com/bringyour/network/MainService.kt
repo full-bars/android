@@ -1294,6 +1294,11 @@ import kotlin.math.roundToInt
         )
         if (decision != VpnInternalStopDecision.KEEP_AND_RETRY || device == null) return false
         Log.i(TAG, "[service]internal stop ($reason) held: VPN still required; retrying TUN")
+        // Known gap: the TUN fd is detached into the native io loop, so closing
+        // the flow closes the interface and there is no handle to keep it up
+        // across the retry (the packet-flow-ended retry has the same shape).
+        // Traffic is on the native network until updatePfd re-establishes, so
+        // kill-switch continuity is not guaranteed in that window.
         val endedPacketFlow = packetFlow
         packetFlow = null
         appliedTunnelConfiguration = null

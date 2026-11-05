@@ -12,6 +12,13 @@ import org.junit.Test
  * again at once. The fence holds every automatic reconnect path until the user
  * connects. Policy is tested directly; MainApplication and MainService need a
  * device, so which call sites consult the fence is read from the source.
+ *
+ * Not covered here, on purpose: behavioural race tests need the Android
+ * runtime. A device run must prove (1) a revoke during a pending TUN retry
+ * leaves no interface behind, (2) a revoke during a queued Always-on connect
+ * or balance-recovery connect leaves the device disconnected, and (3) what
+ * kill-switch continuity a held internal stop actually gives (see the gap
+ * noted in MainService.keepRequiredVpnUp).
  */
 class VpnRevokeFenceTest {
 
