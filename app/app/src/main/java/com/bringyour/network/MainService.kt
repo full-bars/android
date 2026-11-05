@@ -194,17 +194,25 @@ import kotlin.math.roundToInt
         private var offline: Boolean = false
 
 
+    private fun lifecycle(event: String, detail: String = "") {
+        VpnLifecycleLog.record({ createDeviceProtectedStorageContext().filesDir }, event, detail)
+    }
+
     override fun onCreate() {
         super.onCreate()
+        lifecycle("service created")
         // startForegroundService() gives the service only a few seconds to
         // promote. Do it at the first service lifecycle callback, before SDK
         // admission, device attachment, TUN construction, or OEM scheduling
         // can consume that deadline.
         foregroundPromotionSucceeded = try {
             promoteToForeground("Starting…")
+            lifecycle("foreground promoted")
             (application as MainApplication).vpnServiceDidEnterForeground()
             true
         } catch (e: Exception) {
+            lifecycle("foreground promotion failed", e.javaClass.name)
+            lifecycle("service stop", "promotion failure")
             Log.e(TAG, "[service] foreground promotion failed: ${e.message}", e)
             (application as MainApplication).vpnServiceDidNotStart(this)
             stopSelf()
@@ -255,7 +263,7 @@ import kotlin.math.roundToInt
                         "systemStart=$systemStart commandCompatible=$commandCompatible",
                 )
                 app.vpnServiceDidNotStart(this, retryRequested = false)
-                stop()
+                stop(if (stop) "user disconnect" else "obsolete flow")
                 return START_NOT_STICKY
             }
             DirectBootServiceDecision.HOLD_ALWAYS_ON_GUARD -> {
@@ -273,7 +281,7 @@ import kotlin.math.roundToInt
             Log.e(TAG, "[service] application initialization failed after promotion: ${e.message}", e)
             if (keepRequiredVpnUp("application-init-failure")) return START_REDELIVER_INTENT
             app.vpnServiceDidNotStart(this)
-            stop()
+            stop("command failure: ${e.javaClass.name}")
             return START_NOT_STICKY
         }
         // Read restored SDK state once. A listener can change the device state
@@ -307,7 +315,7 @@ import kotlin.math.roundToInt
             if (app.service?.get() !== this) {
                 app.vpnServiceDidNotStart(this, retryRequested = false)
             }
-            stop()
+            stop(if (stop) "user disconnect" else "obsolete flow")
             // A stop/stale intent must not itself be retained for another
             // redelivery. START_REDELIVER_INTENT is only for a service we
             // actually accepted and intend Android to restore.
@@ -317,7 +325,7 @@ import kotlin.math.roundToInt
         if (app.service?.get() != this) {
             app.service?.get().let { currentService ->
                 if (currentService != this) {
-                    currentService?.stop()
+                    currentService?.stop("replacement")
                 }
             }
             app.vpnServiceDidStart(this, systemStart)
@@ -362,7 +370,7 @@ import kotlin.math.roundToInt
         val newlyAdopted = app.service?.get() !== this
         if (newlyAdopted) {
             app.service?.get()?.let { currentService ->
-                if (currentService !== this) currentService.stop()
+                if (currentService !== this) currentService.stop("replacement")
             }
         }
         app.vpnServiceDidStartDirectBoot(this)
@@ -542,7 +550,7 @@ import kotlin.math.roundToInt
         if (app.vpnRevokeFenced()) {
             // the user revoked the VPN: neither a tunnel nor the guard comes back
             Log.i(TAG, "[service]revoke fence raised; stopping")
-            stop()
+            stop("revoke fence")
             return
         }
         // null exactly when no device is bound
@@ -560,7 +568,7 @@ import kotlin.math.roundToInt
         if (tunnelRetryKind == TunnelRetryKind.ALWAYS_ON_GUARD) cancelTunnelRetry()
         if (desired == null) {
             Log.i(TAG, "[service]device unavailable outside Always-on; stopping")
-            stop()
+            stop("missing device")
             return
         }
         if (
@@ -588,7 +596,10 @@ import kotlin.math.roundToInt
         configuration: VpnPacketFlowConfiguration? = null,
         reason: String,
     ) {
-        if (stopping) return
+        if (stopping) {
+            lifecycle("retry refused", "kind=$kind reason=service stopping")
+            return
+        }
         val sameTarget =
             tunnelRetryKind == kind && tunnelRetryConfiguration == configuration
         if (!sameTarget) {
@@ -648,6 +659,7 @@ import kotlin.math.roundToInt
             }
         }
         tunnelRetryRunnable = runnable
+        lifecycle("retry scheduled", "kind=$kind delayMillis=$delayMillis reason=$reason")
         Log.i(
             TAG,
             "[service] scheduling TUN retry kind=$kind failure=$tunnelRetryFailureCount " +
@@ -864,7 +876,7 @@ import kotlin.math.roundToInt
             if (app.vpnRevokeFenced() || !app.vpnFenceAdmits(admission)) {
                 Log.i(TAG, "[service]revoke fence raised before establish; stopping")
                 cancelTunnelRetry()
-                stop()
+                stop("revoke fence")
                 return
             }
             // Uploaded logs then show whether strict Private DNS (DoT) was in
@@ -890,6 +902,7 @@ import kotlin.math.roundToInt
                     createPacketFlow(device, descriptor, app.ioLoopDiagnostics) { endedPacketFlow ->
                         mainHandler.post {
                             if (packetFlow === endedPacketFlow) {
+                                lifecycle("tunnel loop end", "active flow")
                                 packetFlow = null
                                 if (app.service?.get() == this@MainService) {
                                     tunnelRetryFailureCount = packetFlowRetryFailureCount(
@@ -934,7 +947,7 @@ import kotlin.math.roundToInt
                 if (app.service?.get() == this@MainService) {
                     device.tunnelStarted = true
                 } else {
-                    stop()
+                    stop("obsolete flow")
                 }
             } ?: run {
                 Log.i(TAG, "[service]WARNING tunnel was not started. Another existing tunnel may be blocking the start.")
@@ -949,7 +962,7 @@ import kotlin.math.roundToInt
                 Log.i(TAG, "[service]device disappeared during tunnel handover; retaining Always-on guard")
                 establishAlwaysOnGuard()
             } else {
-                stop()
+                stop("missing device")
             }
         }
     }
@@ -1004,9 +1017,11 @@ import kotlin.math.roundToInt
         val established = try {
             builder.establish()
         } catch (e: Exception) {
+            lifecycle("always-on guard failed", e.javaClass.name)
             Log.i(TAG, "[service]could not establish Always-on authentication guard: ${e.message}")
             null
         } ?: run {
+            lifecycle("always-on guard failed", "establish returned null or threw")
             scheduleTunnelRetry(
                 TunnelRetryKind.ALWAYS_ON_GUARD,
                 reason = "always-on-guard-establish-failed",
@@ -1022,6 +1037,7 @@ import kotlin.math.roundToInt
         appliedTunnelConfiguration = null
         previous?.close()
         replacedPacketFlow?.close()
+        lifecycle("always-on guard applied")
         Log.i(TAG, "[service]Always-on authentication guard established")
         return true
     }
@@ -1281,7 +1297,8 @@ import kotlin.math.roundToInt
     }
 
     override fun onDestroy() {
-        stop()
+        lifecycle("service destroyed", "onDestroy")
+        stop("onDestroy")
         super.onDestroy()
     }
 
@@ -1289,13 +1306,14 @@ import kotlin.math.roundToInt
         // The user disconnected the VPN in the system settings, or another VPN
         // took its place: the connection is disconnected first, so the service
         // stop below does not restart it (support inbox 8018)
+        lifecycle("vpn revoked", "onRevoke")
         (application as MainApplication).vpnServiceRevoked()
         // The framework does not guarantee this callback on our main-looper
         // state owner. Serialize teardown with listener and TUN callbacks.
         if (Looper.myLooper() == mainLooper) {
-            stop()
+            stop("revoke")
         } else {
-            mainHandler.post { stop() }
+            mainHandler.post { stop("revoke") }
         }
     }
 
@@ -1317,14 +1335,18 @@ import kotlin.math.roundToInt
     private fun keepRequiredVpnUp(reason: String): Boolean {
         val app = application as MainApplication
         val device = boundDevice
+        // the same intent the reconcile path uses: the provide MODE, not the
+        // provider pointer, and the pending connect request rather than the raw
+        // flag, so the stop path and the restart path cannot disagree
+        val inputs = device?.let { app.vpnRequirementInputs(it) }
         val decision = decideInternalStop(
             foregroundPromoted = foregroundPromotionSucceeded,
             ownsService = !stopping && app.service?.get() === this,
             deviceBound = device != null,
             revokeFenced = app.vpnRevokeFenced(),
-            provideEnabled = device?.provideEnabled ?: false,
-            connectEnabled = device?.connectEnabled ?: false,
-            routeLocal = device?.routeLocal ?: true,
+            provideEnabled = inputs?.let { it.provideMode != it.provideModeNone } ?: false,
+            connectEnabled = inputs?.connectRequested ?: false,
+            routeLocal = inputs?.routeLocal ?: true,
         )
         if (decision != VpnInternalStopDecision.KEEP_AND_RETRY || device == null) return false
         Log.i(TAG, "[service]internal stop ($reason) held: VPN still required; retrying TUN")
@@ -1346,12 +1368,13 @@ import kotlin.math.roundToInt
         return true
     }
 
-    fun stop() {
+    fun stop(reason: String = "unspecified") {
         if (Looper.myLooper() != mainLooper) {
-            mainHandler.post { stop() }
+            mainHandler.post { stop(reason) }
             return
         }
         if (stopping) return
+        lifecycle("service stop", reason)
         stopping = true
         val app = application as MainApplication
 
@@ -1607,7 +1630,7 @@ import kotlin.math.roundToInt
                 Handler(mainLooper).post {
                     // Only stop if no newer monitor has been started since this one.
                     if (closeMonitorGeneration.get() == generation) {
-                        if (!keepRequiredVpnUp("close-monitor")) stop()
+                        if (!keepRequiredVpnUp("close-monitor")) stop("close monitor")
                         closeMonitorStarted = false
                     }
                 }

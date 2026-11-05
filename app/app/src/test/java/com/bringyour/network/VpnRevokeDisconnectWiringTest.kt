@@ -47,7 +47,7 @@ class VpnRevokeDisconnectWiringTest {
         val onRevoke = function(source("MainService.kt"), "    override fun onRevoke(")
         val revoked = onRevoke.indexOf("vpnServiceRevoked()")
         assertTrue("onRevoke does not disconnect the connection", 0 <= revoked)
-        assertTrue("onRevoke stops before it disconnects", revoked < onRevoke.indexOf("stop()"))
+        assertTrue("onRevoke stops before it disconnects", revoked < onRevoke.indexOf("stop(\"revoke\")"))
     }
 
     @Test
@@ -60,8 +60,14 @@ class VpnRevokeDisconnectWiringTest {
 
     @Test
     fun theReconcileCountsAQueuedDisconnect() {
-        val reconcile = function(source("MainApplication.kt"), "    private fun reconcileVpnService(")
-        assertTrue(reconcile.contains("connectCommands.connectRequested("))
+        // the queued disconnect must still count; the reconcile now decides
+        // through the shared snapshot, so the pending request is read there
+        val app = source("MainApplication.kt")
+        val inputs = function(app, "    internal fun vpnRequirementInputs(")
+        assertTrue(inputs.contains("connectCommands.connectRequested("))
+        val predicate = source("VpnRequirementInputs.kt")
+        assertTrue("the decision uses the pending request", predicate.contains("connectEnabled = connectRequested"))
+        val reconcile = function(app, "    private fun reconcileVpnService(")
         assertFalse("the reconcile reads only the device", reconcile.contains("device.connectEnabled"))
     }
 }

@@ -44,6 +44,9 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.navigation.NavController
 import com.bringyour.network.R
 import com.bringyour.network.BuildConfig
+import com.bringyour.network.VpnLifecycleLog
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import com.bringyour.network.ui.wallet.EarningsDebugFlags
 import androidx.compose.runtime.collectAsState
 import com.bringyour.network.ui.components.URSwitch
@@ -200,6 +203,25 @@ private fun DeveloperContent(developerViewModel: DeveloperViewModel) {
     }
 
     val context = LocalContext.current
+    var lifecycleLog by remember { mutableStateOf("") }
+    LaunchedEffect(context) {
+        while (true) {
+            lifecycleLog = withContext(Dispatchers.IO) {
+                runCatching { VpnLifecycleLog.read(context.createDeviceProtectedStorageContext().filesDir).joinToString("\n") }
+                    .getOrElse { context.getString(R.string.vpn_lifecycle_log_read_failed) }
+            }
+            delay(DeveloperViewModel.REFRESH_POLL_MILLIS)
+        }
+    }
+    URTextInputLabel(text = stringResource(R.string.vpn_lifecycle_log_title))
+    Text(lifecycleLog.ifEmpty { stringResource(R.string.vpn_lifecycle_log_empty) }, style = MaterialTheme.typography.bodySmall, color = TextMuted)
+    DeveloperAction(label = stringResource(R.string.vpn_lifecycle_log_share), enabled = lifecycleLog.isNotEmpty()) {
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_TEXT, lifecycleLog)
+        }
+        context.startActivity(Intent.createChooser(intent, context.getString(R.string.vpn_lifecycle_log_share)))
+    }
     val shareBundle: (File) -> Unit = { file ->
         val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
         val intent = Intent(Intent.ACTION_SEND).apply {

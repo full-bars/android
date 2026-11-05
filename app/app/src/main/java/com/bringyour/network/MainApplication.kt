@@ -203,6 +203,9 @@ class MainApplication : Application() {
 
 //    var byDevice: BringYourDevice? = null
     var deviceProvideSub: Sub? = null
+    var deviceProvideModeSub: Sub? = null
+    /** True while the operator's intent says provide and no provider is up. */
+    var provideIntentWithoutProvider: Boolean = false
     var deviceProvidePausedSub: Sub? = null
 
     var deviceProvideNetworkSub: Sub? = null
@@ -2484,8 +2487,12 @@ class MainApplication : Application() {
         // down the device; it must not restart the service after logout.
         vpnServiceUpdateGeneration += 1
         vpnServiceUpdatePosted = false
+        // a new session starts without a remembered provide edge: a stale true
+        // here would either write a false "provider restored" or swallow the
+        // next session's "without provider" edge
+        provideIntentWithoutProvider = false
         resetTunnelRecoveryState()
-        stopVpnService()
+        stopVpnService("logout")
 
         removeNetworkCallback()
         removeOfflineCallback()
@@ -2498,6 +2505,8 @@ class MainApplication : Application() {
 //        router = null
         deviceProvideSub?.close()
         deviceProvideSub = null
+        deviceProvideModeSub?.close()
+        deviceProvideModeSub = null
         deviceProvidePausedSub?.close()
         deviceProvidePausedSub = null
         deviceProvideNetworkSub?.close()
@@ -2592,6 +2601,14 @@ class MainApplication : Application() {
             }
         }
         deviceProvideSub = device?.addProvideChangeListener {
+            Handler(mainLooper).post {
+                updateVpnService()
+            }
+        }
+        // the SDK does fire provideChanged on a mode change (applyProvideModeWithLock
+        // publishes both events), so this subscription is a safeguard rather than
+        // the only trigger: it keeps the reconcile independent of that detail
+        deviceProvideModeSub = device?.addProvideModeChangeListener {
             Handler(mainLooper).post {
                 updateVpnService()
             }
@@ -2736,7 +2753,7 @@ class MainApplication : Application() {
 
         if (!vpnReconnectPermitted(VpnReconnectEntry.RECONCILE)) {
             // revoke leaves provide enabled; do not let it restart the service
-            stopVpnService(ignoreAlwaysOn = true)
+            stopVpnService("revoke fence", ignoreAlwaysOn = true)
             return
         }
         if (systemAlwaysOnVpn) {
@@ -2745,20 +2762,37 @@ class MainApplication : Application() {
 
         // the vpn service is the packet router: it must run whenever the device
         // is connected, providing (any mode — including Network, which relays
-        // for same-network peers), or routing remotely
-        val provideEnabled = device.provideEnabled
-        // a disconnect queued and not yet run counts (ConnectCommands), so a
-        // reconcile between the system's revoke and its disconnect does not
-        // start the tunnel again
-        val connectEnabled = connectCommands.connectRequested(
-            com.bringyour.network.ui.connect.SdkConnectDevice(device),
+        // for same-network peers), or routing remotely.
+        //
+        // The requirement follows the provide MODE, not the provider pointer:
+        // a provider rotation or a memory-budget wait briefly detaches the
+        // remote-user NAT while the operator's intent is unchanged, and reading
+        // the pointer there stopped a VPN nobody asked to turn off.
+        val inputs = vpnRequirementInputs(device)
+        // when the intent says provide and nothing is providing, the VPN is still
+        // required but the operator should be able to see why: one ring entry per
+        // edge, so the next capture separates a rotation from a permanent refusal
+        val edge = provideEdge(
+            previous = provideIntentWithoutProvider,
+            provideMode = inputs.provideMode,
+            provideModeNone = inputs.provideModeNone,
+            provideEnabled = inputs.provideEnabled,
         )
-        val routeLocal = device.routeLocal
-
-        if (systemAlwaysOnVpn || vpnServiceRequired(provideEnabled, connectEnabled, routeLocal)) {
+        if (edge.event != null) {
+            provideIntentWithoutProvider = edge.intentWithoutProvider
+            VpnLifecycleLog.record(
+                { createDeviceProtectedStorageContext().filesDir },
+                edge.event,
+                "inputs=$inputs",
+            )
+        } else {
+            provideIntentWithoutProvider = edge.intentWithoutProvider
+        }
+        if (systemAlwaysOnVpn || inputs.required()) {
             startVpnService()
         } else {
-            stopVpnService()
+            Log.i(TAG, "[service] app no longer requires VPN: $inputs")
+            stopVpnService("not required: $inputs")
         }
     }
 
@@ -2891,10 +2925,11 @@ class MainApplication : Application() {
             if (vpnStartRetryRunnable !== retry) return@Runnable
             vpnStartRetryRunnable = null
             val retryListener = vpnRequestStartListener
+            val vpnRequired = systemAlwaysOnVpn || restoredVpnServiceRequired()
             if (
                 !vpnServiceStartRetryEligible(
                     retryRequested = vpnRequestStart,
-                    vpnRequired = systemAlwaysOnVpn || restoredVpnServiceRequired(),
+                    vpnRequired = vpnRequired,
                     serviceActive = serviceActive,
                     startPending = vpnStartPending,
                     foregroundActivityAvailable = retryListener != null,
@@ -2902,6 +2937,10 @@ class MainApplication : Application() {
                         !vpnFenceAdmits(admission),
                 )
             ) {
+                VpnLifecycleLog.record(
+                    { createDeviceProtectedStorageContext().filesDir }, "retry refused",
+                    "kind=foreground requested=$vpnRequestStart required=$vpnRequired active=$serviceActive pending=$vpnStartPending activity=${retryListener != null}",
+                )
                 return@Runnable
             }
             Log.i(
@@ -2916,6 +2955,7 @@ class MainApplication : Application() {
                 }
         }
         vpnStartRetryRunnable = retry
+        VpnLifecycleLog.record({ createDeviceProtectedStorageContext().filesDir }, "retry scheduled", "kind=foreground delayMillis=$delayMillis")
         mainHandler.postDelayed(retry, delayMillis)
     }
 
@@ -3018,6 +3058,7 @@ class MainApplication : Application() {
 
         // on the connect command queue, after the commands made before it;
         // a failure is logged there (connectCommands)
+        VpnLifecycleLog.record({ createDeviceProtectedStorageContext().filesDir }, "disconnect requested", "source=$source")
         Log.i(TAG, "Disconnecting VPN connection from $source")
         connectCommands.runOnDevice(connectDevice, connect = false)
         updateVpnService()
@@ -3208,16 +3249,28 @@ class MainApplication : Application() {
                 alwaysOnConnectRequestedDevice = null
                 ensureAlwaysOnConnected()
             }
-        }, vpnTunnelTimingSettings.alwaysOnConnectRetryMillis)
+        }, vpnTunnelTimingSettings.alwaysOnConnectRetryMillis.also { delay ->
+            VpnLifecycleLog.record(
+                { createDeviceProtectedStorageContext().filesDir }, "retry scheduled",
+                "kind=always-on-connect delayMillis=$delay",
+            )
+        })
     }
+
+    internal fun vpnRequirementInputs(current: DeviceLocal): VpnRequirementInputs = VpnRequirementInputs(
+        provideMode = current.provideMode,
+        provideModeNone = Sdk.ProvideModeNone,
+        provideEnabled = current.provideEnabled,
+        connectRequested = connectCommands.connectRequested(
+            com.bringyour.network.ui.connect.SdkConnectDevice(current),
+        ),
+        connectEnabled = current.connectEnabled,
+        routeLocal = current.routeLocal,
+    )
 
     fun restoredVpnServiceRequired(): Boolean {
         val current = device ?: return false
-        return vpnServiceRequired(
-            provideEnabled = current.provideEnabled,
-            connectEnabled = current.connectEnabled,
-            routeLocal = current.routeLocal,
-        )
+        return vpnRequirementInputs(current).required()
     }
 
     fun restoreVpnServiceFromSystemEvent(source: String?) {
@@ -3239,7 +3292,7 @@ class MainApplication : Application() {
         }
     }
 
-    private fun stopVpnService(ignoreAlwaysOn: Boolean = false) {
+    private fun stopVpnService(reason: String = "app no longer requires VPN", ignoreAlwaysOn: Boolean = false) {
         cancelVpnStartAdoptionWatchdog()
         cancelVpnStartRetry()
         vpnRequestStart = false
@@ -3265,7 +3318,7 @@ class MainApplication : Application() {
 
         if (serviceActive) {
             serviceActive = false
-            service?.get()?.stop()
+            service?.get()?.stop(reason)
             synchronized(serviceActiveMonitor) {
                 serviceActiveMonitor.notifyAll()
             }
@@ -3310,6 +3363,6 @@ class MainApplication : Application() {
         vpnIntent.putExtra("start", false)
         stopService(vpnIntent)
 
-        stopVpnService()
+        stopVpnService("force stop")
     }
 }
