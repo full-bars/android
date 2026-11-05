@@ -464,6 +464,50 @@ class MainApplication : Application() {
     private var processLifecycleObserver: DefaultLifecycleObserver? = null
     private var userUnlockReceiver: BroadcastReceiver? = null
     private val directBootState by lazy(LazyThreadSafetyMode.NONE) { DirectBootState(this) }
+    private val revokeFence by lazy { VpnRevokeFence(this) }
+
+    /** Whether `entry` may bring the VPN back now (see [VpnReconnectEntry]). */
+    internal fun vpnReconnectPermitted(entry: VpnReconnectEntry): Boolean =
+        vpnReconnectAllowed(entry, revokeFence.raised)
+
+    internal fun vpnRevokeFenced(): Boolean = revokeFence.raised
+
+    /**
+     * The fence epoch to admit deferred automatic work under (a start intent in
+     * flight, a queued connect, a scheduled retry), null while the fence is
+     * raised. Ask [vpnFenceAdmits] with it when the work runs: a revoke since
+     * then, even one the user's connect has already lifted, fails it.
+     */
+    internal fun vpnFenceAdmission(): Long? = revokeFence.admission()
+
+    internal fun vpnFenceAdmits(admission: Long?): Boolean = revokeFence.admits(admission)
+
+    /**
+     * Set when a clear did not reach the disk. The fence stays raised then
+     * (fail closed), so the user's connect starts nothing until a later one
+     * lands; the UI can show this instead of a connect that silently does not
+     * come up.
+     */
+    val vpnRevokeFenceClearFailed = kotlinx.coroutines.flow.MutableStateFlow(false)
+
+    /**
+     * The user's explicit connect: the only thing that clears the revoke fence.
+     * False when the clear did not land: the fence is still raised.
+     */
+    fun clearVpnRevokeFence(): Boolean {
+        val cleared = revokeFence.clear()
+        vpnRevokeFenceClearFailed.value = !cleared
+        if (!cleared) {
+            Log.e(TAG, "revoke fence clear did not reach disk; the fence stays raised")
+        }
+        return cleared
+    }
+
+    /** The reconnect-tunnel action: clears the fence, then starts the service. */
+    fun userRequestedVpnConnect() {
+        clearVpnRevokeFence()
+        startVpnService()
+    }
     @Volatile
     private var applicationStateInitialized = false
     private var applicationStateInitializing = false
@@ -659,6 +703,8 @@ class MainApplication : Application() {
             return false
         }
         val current = device ?: return false
+        if (!vpnReconnectPermitted(VpnReconnectEntry.BALANCE_RECOVERY)) return false
+        val admission = vpnFenceAdmission() ?: return false
         // the gate is not asked again: the recovery decided on a fresh balance,
         // and a held connection still reports insufficient balance until the
         // rebuild replaces it. On the connect command queue, after the
@@ -673,6 +719,10 @@ class MainApplication : Application() {
                     is com.bringyour.network.ui.connect.BalanceRecoveryStep.Start -> step.target
                     else -> connectDevice.connectLocation
                 }
+            },
+            // asked again when the command runs, not only when queued
+            admit = {
+                vpnReconnectPermitted(VpnReconnectEntry.BALANCE_RECOVERY) && vpnFenceAdmits(admission)
             },
         )
     }
@@ -2684,6 +2734,11 @@ class MainApplication : Application() {
     private fun reconcileVpnService() {
         val device = device ?: return
 
+        if (!vpnReconnectPermitted(VpnReconnectEntry.RECONCILE)) {
+            // revoke leaves provide enabled; do not let it restart the service
+            stopVpnService(ignoreAlwaysOn = true)
+            return
+        }
         if (systemAlwaysOnVpn) {
             ensureAlwaysOnConnected()
         }
@@ -2715,6 +2770,13 @@ class MainApplication : Application() {
             return
         }
         if (device == null) return
+        // taken here, carried by the start intent, asked again by the service
+        val admission = vpnFenceAdmission()
+        if (!vpnReconnectPermitted(VpnReconnectEntry.START_SERVICE) || admission == null) {
+            cancelVpnStartRetry()
+            vpnRequestStart = false
+            return
+        }
 
         try {
             val alreadyStartingOrRunning = serviceActive || vpnStartPending
@@ -2747,6 +2809,9 @@ class MainApplication : Application() {
                         putExtra("command_version", VPN_SERVICE_COMMAND_VERSION)
                         putExtra("stop", false)
                         putExtra("start", true)
+                        // a revoke after this point makes the service refuse
+                        // the intent even if the user has connected again
+                        putExtra(VPN_START_FENCE_EPOCH_EXTRA, admission)
                         // Retained for redelivery compatibility with older APKs.
                         putExtra("foreground", true)
                     }
@@ -2812,6 +2877,13 @@ class MainApplication : Application() {
      */
     private fun scheduleVpnStartRetry() {
         vpnStartRetryRunnable?.let(mainHandler::removeCallbacks)
+        // admitted now; a revoke before the retry runs fails it for good
+        val admission = vpnFenceAdmission()
+        if (admission == null) {
+            vpnStartRetryRunnable = null
+            vpnRequestStart = false
+            return
+        }
         val delayMillis = vpnServiceStartRetryDelayMillis(vpnStartFailureCount)
         if (vpnStartFailureCount < Int.MAX_VALUE) vpnStartFailureCount += 1
         lateinit var retry: Runnable
@@ -2827,6 +2899,8 @@ class MainApplication : Application() {
                     serviceActive = serviceActive,
                     startPending = vpnStartPending,
                     foregroundActivityAvailable = retryListener != null,
+                    revokeFenced = !vpnReconnectPermitted(VpnReconnectEntry.FOREGROUND_RETRY) ||
+                        !vpnFenceAdmits(admission),
                 )
             ) {
                 VpnLifecycleLog.record(
@@ -2966,17 +3040,43 @@ class MainApplication : Application() {
      */
     fun vpnServiceRevoked() {
         if (android.os.Looper.myLooper() != mainLooper) {
+            // raise on this thread first: durable before the posted work runs
+            revokeFence.raise()
             mainHandler.post { vpnServiceRevoked() }
             return
         }
+        // before any early return: the revoke can arrive with no device yet
+        // or with nothing connected, and still must hold off every restart
+        revokeFence.raise()
+        // a blocked balance recovery is waiting on no connection at all, so
+        // drop it before any early return; a recovery connect already queued
+        // is denied by the fence when it runs
+        clearBalanceRecovery()
+        invalidatePendingVpnStarts()
         val current = device ?: return
         val connectDevice = com.bringyour.network.ui.connect.SdkConnectDevice(current)
         if (!connectCommands.connectRequested(connectDevice)) return
-        clearBalanceRecovery()
 
         Log.i(TAG, "Disconnecting VPN connection after the system revoked the VPN")
         connectCommands.runOnDevice(connectDevice, connect = false)
         updateVpnService()
+    }
+
+    /**
+     * The raise moved the fence epoch, which already fails every start intent,
+     * queued connect and scheduled retry admitted before it (each asks
+     * [vpnFenceAdmits] when it runs). This drops the state that waits on them,
+     * so none of it survives to look like a start in progress: the foreground
+     * retry timer, the adoption watchdog, the "start pending" flags, and the
+     * Always-on connect dedupe (its queued connect is gone, so a later one must
+     * not be suppressed by it). Main thread.
+     */
+    private fun invalidatePendingVpnStarts() {
+        cancelVpnStartRetry()
+        cancelVpnStartAdoptionWatchdog()
+        vpnRequestStart = false
+        vpnStartPending = false
+        alwaysOnConnectRequestedDevice = null
     }
 
     /**
@@ -3092,6 +3192,8 @@ class MainApplication : Application() {
             return
         }
         val current = device ?: return
+        if (!vpnReconnectPermitted(VpnReconnectEntry.ALWAYS_ON_CONNECT)) return
+        val admission = vpnFenceAdmission() ?: return
         if (current.connectEnabled) {
             alwaysOnConnectRequestedDevice = null
             return
@@ -3101,7 +3203,13 @@ class MainApplication : Application() {
         // on the connect command queue, to the saved location (read there),
         // else the best available provider; a failure is logged there, and
         // the retry below asks again while the device is not connected
-        connectCommands.runOnDevice(com.bringyour.network.ui.connect.SdkConnectDevice(current), connect = true)
+        connectCommands.runOnDevice(
+            com.bringyour.network.ui.connect.SdkConnectDevice(current),
+            connect = true,
+            admit = {
+                vpnReconnectPermitted(VpnReconnectEntry.ALWAYS_ON_CONNECT) && vpnFenceAdmits(admission)
+            },
+        )
         Handler(mainLooper).postDelayed({
             if (systemAlwaysOnVpn && device === current && !current.connectEnabled) {
                 alwaysOnConnectRequestedDevice = null
@@ -3135,7 +3243,7 @@ class MainApplication : Application() {
         }
         ensureApplicationStateInitialized()
         directBootState.markCredentialRestoreComplete()
-        if (restoredVpnServiceRequired()) {
+        if (restoredVpnServiceRequired() && vpnReconnectPermitted(VpnReconnectEntry.RESTORE)) {
             Log.i(TAG, "restoring VPN service after system event=$source")
             startVpnService()
         } else {
@@ -3143,13 +3251,13 @@ class MainApplication : Application() {
         }
     }
 
-    private fun stopVpnService() {
+    private fun stopVpnService(ignoreAlwaysOn: Boolean = false) {
         cancelVpnStartAdoptionWatchdog()
         cancelVpnStartRetry()
         vpnRequestStart = false
         vpnStartPending = false
 
-        if (serviceActive && systemAlwaysOnVpn) {
+        if (!ignoreAlwaysOn && serviceActive && systemAlwaysOnVpn) {
             val activeService = service?.get()
             if (activeService != null && activeService.retainAlwaysOnWithoutDevice()) {
                 serviceActive = true
@@ -3189,7 +3297,8 @@ class MainApplication : Application() {
         // OEM can destroy an adopted service before a PacketFlow ever flips
         // tunnelStarted, so relying only on that SDK listener leaves no event
         // to recover the foreground service while the activity stays open.
-        val restartRequired = restoredVpnServiceRequired()
+        val restartRequired = restoredVpnServiceRequired() &&
+            vpnReconnectPermitted(VpnReconnectEntry.FOREGROUND_RETRY)
         service = null
         cancelVpnStartAdoptionWatchdog()
         serviceActive = false

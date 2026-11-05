@@ -230,6 +230,13 @@ import kotlin.math.roundToInt
 
         val stop = intent?.getBooleanExtra("stop", false) ?: false
         val start = intent?.getBooleanExtra("start", true) ?: false
+        // an intent the app sent before a revoke is refused even when the user
+        // has connected since (the fence is down again, its epoch is not)
+        val carriedEpoch = intent
+            ?.takeIf { it.hasExtra(VPN_START_FENCE_EPOCH_EXTRA) }
+            ?.getLongExtra(VPN_START_FENCE_EPOCH_EXTRA, 0L)
+        val revokeFenced = !app.vpnReconnectPermitted(VpnReconnectEntry.SYSTEM_START) ||
+            !vpnStartEpochAdmitted(carriedEpoch) { app.vpnFenceAdmits(it) }
         val redelivered =
             flags and android.app.Service.START_FLAG_REDELIVERY != 0 ||
                 flags and android.app.Service.START_FLAG_RETRY != 0
@@ -246,6 +253,7 @@ import kotlin.math.roundToInt
                 startRequested = start,
                 systemStart = systemStart,
                 commandCompatible = commandCompatible,
+                revokeFenced = revokeFenced,
             )
         ) {
             DirectBootServiceDecision.STOP -> {
@@ -271,6 +279,7 @@ import kotlin.math.roundToInt
             app.ensureApplicationStateInitialized()
         } catch (e: Exception) {
             Log.e(TAG, "[service] application initialization failed after promotion: ${e.message}", e)
+            if (keepRequiredVpnUp("application-init-failure")) return START_REDELIVER_INTENT
             app.vpnServiceDidNotStart(this)
             stop("command failure: ${e.javaClass.name}")
             return START_NOT_STICKY
@@ -288,6 +297,7 @@ import kotlin.math.roundToInt
                 redelivered = redelivered,
                 systemStart = systemStart,
                 commandCompatible = commandCompatible,
+                revokeFenced = revokeFenced,
             ),
         )
 
@@ -298,6 +308,10 @@ import kotlin.math.roundToInt
                     "systemStart=$systemStart appActive=${app.serviceActive} " +
                     "deviceRequiresVpn=$deviceRequiresVpn",
             )
+            // Only a stale intent ("obsolete flow") may be held; the user's stop,
+            // an incompatible command and the revoke fence always stop.
+            val obsoleteFlow = !stop && start && commandCompatible && !revokeFenced
+            if (obsoleteFlow && keepRequiredVpnUp("obsolete-flow")) return START_REDELIVER_INTENT
             if (app.service?.get() !== this) {
                 app.vpnServiceDidNotStart(this, retryRequested = false)
             }
@@ -533,6 +547,12 @@ import kotlin.math.roundToInt
 
     private fun reconcilePfd() {
         val app = application as MainApplication
+        if (app.vpnRevokeFenced()) {
+            // the user revoked the VPN: neither a tunnel nor the guard comes back
+            Log.i(TAG, "[service]revoke fence raised; stopping")
+            stop()
+            return
+        }
         // null exactly when no device is bound
         val desired = boundDevice?.let { desiredTunnelConfiguration() }
         if (alwaysOnGuardRequired(app, desired)) {
@@ -597,12 +617,22 @@ import kotlin.math.roundToInt
         )
         if (tunnelRetryFailureCount < Int.MAX_VALUE) tunnelRetryFailureCount += 1
         val retryDevice = boundDevice
+        // admitted when scheduled; a revoke before it runs fails it for good,
+        // even if the user's connect has lowered the fence again
+        val admission = (application as MainApplication).vpnFenceAdmission()
         lateinit var runnable: Runnable
         runnable = Runnable {
             if (tunnelRetryRunnable !== runnable) return@Runnable
             tunnelRetryRunnable = null
             val app = application as MainApplication
             if (stopping || app.service?.get() !== this) return@Runnable
+            // asked again at execution: an off-main revoke can raise the fence
+            // while this retry waits, and reconcilePfd stops on a raised fence
+            if (app.vpnRevokeFenced() || !app.vpnFenceAdmits(admission)) {
+                cancelTunnelRetry()
+                reconcilePfd()
+                return@Runnable
+            }
             when (kind) {
                 TunnelRetryKind.ALWAYS_ON_GUARD -> {
                     if (alwaysOnGuardRequired(app, boundDevice?.let { desiredTunnelConfiguration() })) {
@@ -648,6 +678,8 @@ import kotlin.math.roundToInt
 
     private fun updatePfd(configuration: VpnPacketFlowConfiguration) {
         val app = application as MainApplication
+        // admitted on entry; the check before establish() asks for this epoch
+        val admission = app.vpnFenceAdmission()
 
         val builder = Builder()
         builder.setSession("URnetwork")
@@ -825,6 +857,28 @@ import kotlin.math.roundToInt
             }
             }
         app.device?.let { device ->
+            // the last check before the interface is built: a revoke on the
+            // binder thread can land during the configuration above
+            //
+            // ACCEPTED RISK, deliberately not closed: a revoke can still land
+            // between this check and builder.establish() below. Closing it
+            // needs a lock held across establish(), and establish() is a
+            // blocking system call on the main thread (an ANR if the system
+            // is slow); the fence's own lock cannot be held across it. What it
+            // costs: a window of microseconds in which one tunnel can be built
+            // after a revoke. It is not left standing: onRevoke posts stop()
+            // to the main thread, which runs after this call returns and tears
+            // the interface down, and any later reconcilePfd sees the raised
+            // fence and stops too.
+            // A device run must show that (1) a revoke fired during an
+            // updatePfd leaves no interface up once the main looper is idle,
+            // and (2) establish() itself stays well under the ANR budget.
+            if (app.vpnRevokeFenced() || !app.vpnFenceAdmits(admission)) {
+                Log.i(TAG, "[service]revoke fence raised before establish; stopping")
+                cancelTunnelRetry()
+                stop()
+                return
+            }
             // Uploaded logs then show whether strict Private DNS (DoT) was in
             // force for a "connected but no DNS" report (see PrivateDnsMode).
             // Written to the sdk log too, which is what feedback uploads.
@@ -921,6 +975,9 @@ import kotlin.math.roundToInt
      * provider discovery can recover the session.
      */
     private fun establishAlwaysOnGuard(): Boolean {
+        if (!(application as MainApplication).vpnReconnectPermitted(VpnReconnectEntry.ALWAYS_ON_GUARD)) {
+            return false
+        }
         if (alwaysOnGuardPfd != null) {
             if (tunnelRetryKind == TunnelRetryKind.ALWAYS_ON_GUARD) cancelTunnelRetry()
             packetFlow?.close()
@@ -948,6 +1005,15 @@ import kotlin.math.roundToInt
         // logcat only: the guard also runs before first unlock, where no SDK
         // object may be loaded (see holdDirectBootAlwaysOnGuard)
         Log.i(TAG, privateDnsModeLogLine((application as MainApplication).privateDnsMode.value))
+        // ACCEPTED RISK, deliberately not closed: the fence is asked once at
+        // the top of this function and not again before establish(), so a
+        // revoke landing in between still builds the guard interface. Same
+        // trade as in updatePfd: a lock held across establish() would turn a
+        // microsecond window into main-thread ANR exposure, so there is none.
+        // The guard is the fail-closed interface (it blackholes traffic, it
+        // does not route it), and onRevoke's stop() on the main thread runs
+        // after this call returns and tears it down. A device run must show that a revoke during guard setup leaves no
+        // guard interface up once the main looper is idle.
         val established = try {
             builder.establish()
         } catch (e: Exception) {
@@ -1257,6 +1323,47 @@ import kotlin.math.roundToInt
 //        Sdk.freeMemory()
 //    }
 
+    /**
+     * An internal stop of a promoted service (a stale start, the close monitor,
+     * an init failure) must not end a required VPN while the app is in the
+     * background: nothing can start the service again from there. Tear the flow
+     * down and schedule the bounded CONFIGURATION retry, keeping the service
+     * and its foreground notification. Returns false when the service should
+     * stop as before (not required, no device, not the adopted service, revoke
+     * fence). Main thread only.
+     */
+    private fun keepRequiredVpnUp(reason: String): Boolean {
+        val app = application as MainApplication
+        val device = boundDevice
+        val decision = decideInternalStop(
+            foregroundPromoted = foregroundPromotionSucceeded,
+            ownsService = !stopping && app.service?.get() === this,
+            deviceBound = device != null,
+            revokeFenced = app.vpnRevokeFenced(),
+            provideEnabled = device?.provideEnabled ?: false,
+            connectEnabled = device?.connectEnabled ?: false,
+            routeLocal = device?.routeLocal ?: true,
+        )
+        if (decision != VpnInternalStopDecision.KEEP_AND_RETRY || device == null) return false
+        Log.i(TAG, "[service]internal stop ($reason) held: VPN still required; retrying TUN")
+        // Known gap: the TUN fd is detached into the native io loop, so closing
+        // the flow closes the interface and there is no handle to keep it up
+        // across the retry (the packet-flow-ended retry has the same shape).
+        // Traffic is on the native network until updatePfd re-establishes, so
+        // kill-switch continuity is not guaranteed in that window.
+        val endedPacketFlow = packetFlow
+        packetFlow = null
+        appliedTunnelConfiguration = null
+        endedPacketFlow?.close()
+        device.tunnelStarted = false
+        scheduleTunnelRetry(
+            TunnelRetryKind.CONFIGURATION,
+            desiredTunnelConfiguration(),
+            "internal-stop-$reason",
+        )
+        return true
+    }
+
     fun stop(reason: String = "unspecified") {
         if (Looper.myLooper() != mainLooper) {
             mainHandler.post { stop(reason) }
@@ -1519,7 +1626,7 @@ import kotlin.math.roundToInt
                 Handler(mainLooper).post {
                     // Only stop if no newer monitor has been started since this one.
                     if (closeMonitorGeneration.get() == generation) {
-                        stop("close monitor")
+                        if (!keepRequiredVpnUp("close-monitor")) stop("close monitor")
                         closeMonitorStarted = false
                     }
                 }

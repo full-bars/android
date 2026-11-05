@@ -120,6 +120,38 @@ class ConnectCommandsTest {
     }
 
     @Test
+    fun aConnectIsAdmittedAgainWhenItRunsNotOnlyWhenQueued() {
+        // an automatic connect queued while the fence was down, then the fence
+        // rises before the queue gets to it: it must not reach the sdk
+        val queue = HeldQueue()
+        val commands = ConnectCommands(execute = queue::execute, postMain = { it.run() })
+        val device = Any()
+        var fenced = false
+        val ran = mutableListOf<String>()
+        assertEquals(true, commands.run(device, connect = true, admit = { !fenced }) { ran.add("connect") })
+        assertEquals(true, commands.run(device, connect = false, admit = { !fenced }) { ran.add("disconnect") })
+        fenced = true
+        queue.runAll()
+        assertEquals("the disconnect always runs", listOf("disconnect"), ran)
+        assertNull(commands.pending(device))
+    }
+
+    @Test
+    fun aConnectAdmittedAtBothChecksRunsAndARefusedOneIsNotQueued() {
+        val queue = HeldQueue()
+        val commands = ConnectCommands(execute = queue::execute, postMain = { it.run() })
+        val device = Any()
+        val ran = mutableListOf<String>()
+        assertEquals(true, commands.run(device, connect = true, admit = { true }) { ran.add("connect") })
+        queue.runAll()
+        assertEquals(listOf("connect"), ran)
+        assertEquals(false, commands.run(device, connect = true, admit = { false }) { ran.add("refused") })
+        assertNull(commands.pending(device))
+        queue.runAll()
+        assertEquals(listOf("connect"), ran)
+    }
+
+    @Test
     fun aSignOutSkipsItsQueuedConnectsAndRunsItsDisconnects() {
         // a connect tapped while the queue was busy, then the sign out: the
         // connect never reaches the sdk, a disconnect after it still does
