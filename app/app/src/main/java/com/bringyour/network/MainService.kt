@@ -1335,14 +1335,18 @@ import kotlin.math.roundToInt
     private fun keepRequiredVpnUp(reason: String): Boolean {
         val app = application as MainApplication
         val device = boundDevice
+        // the same intent the reconcile path uses: the provide MODE, not the
+        // provider pointer, and the pending connect request rather than the raw
+        // flag, so the stop path and the restart path cannot disagree
+        val inputs = device?.let { app.vpnRequirementInputs(it) }
         val decision = decideInternalStop(
             foregroundPromoted = foregroundPromotionSucceeded,
             ownsService = !stopping && app.service?.get() === this,
             deviceBound = device != null,
             revokeFenced = app.vpnRevokeFenced(),
-            provideEnabled = device?.provideEnabled ?: false,
-            connectEnabled = device?.connectEnabled ?: false,
-            routeLocal = device?.routeLocal ?: true,
+            provideEnabled = inputs?.let { it.provideMode != it.provideModeNone } ?: false,
+            connectEnabled = inputs?.connectRequested ?: false,
+            routeLocal = inputs?.routeLocal ?: true,
         )
         if (decision != VpnInternalStopDecision.KEEP_AND_RETRY || device == null) return false
         Log.i(TAG, "[service]internal stop ($reason) held: VPN still required; retrying TUN")

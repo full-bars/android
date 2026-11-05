@@ -2745,19 +2745,17 @@ class MainApplication : Application() {
 
         // the vpn service is the packet router: it must run whenever the device
         // is connected, providing (any mode — including Network, which relays
-        // for same-network peers), or routing remotely
-        val provideEnabled = device.provideEnabled
-        // a disconnect queued and not yet run counts (ConnectCommands), so a
-        // reconcile between the system's revoke and its disconnect does not
-        // start the tunnel again
-        val connectEnabled = connectCommands.connectRequested(
-            com.bringyour.network.ui.connect.SdkConnectDevice(device),
-        )
-        val routeLocal = device.routeLocal
-
-        if (systemAlwaysOnVpn || vpnServiceRequired(provideEnabled, connectEnabled, routeLocal)) {
+        // for same-network peers), or routing remotely.
+        //
+        // The requirement follows the provide MODE, not the provider pointer:
+        // a provider rotation or a memory-budget wait briefly detaches the
+        // remote-user NAT while the operator's intent is unchanged, and reading
+        // the pointer there stopped a VPN nobody asked to turn off.
+        val inputs = vpnRequirementInputs(device)
+        if (systemAlwaysOnVpn || inputs.required()) {
             startVpnService()
         } else {
+            Log.i(TAG, "[service] app no longer requires VPN: $inputs")
             stopVpnService()
         }
     }
@@ -3223,13 +3221,20 @@ class MainApplication : Application() {
         })
     }
 
+    internal fun vpnRequirementInputs(current: DeviceLocal): VpnRequirementInputs = VpnRequirementInputs(
+        provideMode = current.provideMode,
+        provideModeNone = Sdk.ProvideModeNone,
+        provideEnabled = current.provideEnabled,
+        connectRequested = connectCommands.connectRequested(
+            com.bringyour.network.ui.connect.SdkConnectDevice(current),
+        ),
+        connectEnabled = current.connectEnabled,
+        routeLocal = current.routeLocal,
+    )
+
     fun restoredVpnServiceRequired(): Boolean {
         val current = device ?: return false
-        return vpnServiceRequired(
-            provideEnabled = current.provideEnabled,
-            connectEnabled = current.connectEnabled,
-            routeLocal = current.routeLocal,
-        )
+        return vpnRequirementInputs(current).required()
     }
 
     fun restoreVpnServiceFromSystemEvent(source: String?) {
