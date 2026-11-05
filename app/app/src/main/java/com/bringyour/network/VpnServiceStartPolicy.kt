@@ -15,6 +15,8 @@ internal data class VpnServiceStartFacts(
     val redelivered: Boolean,
     val systemStart: Boolean,
     val commandCompatible: Boolean = true,
+    /** The user revoked the VPN in system settings and has not connected since. */
+    val revokeFenced: Boolean = false,
 )
 
 internal enum class VpnServiceStartDecision {
@@ -77,8 +79,10 @@ internal fun vpnServiceStartRetryEligible(
     serviceActive: Boolean,
     startPending: Boolean,
     foregroundActivityAvailable: Boolean,
+    revokeFenced: Boolean = false,
 ): Boolean =
-    retryRequested &&
+    !revokeFenced &&
+        retryRequested &&
         vpnRequired &&
         !serviceActive &&
         !startPending &&
@@ -147,7 +151,7 @@ internal fun packetFlowRetryFailureCount(
  * is the authority. An ordinary stale app intent still cannot resurrect a VPN.
  */
 internal fun decideVpnServiceStart(facts: VpnServiceStartFacts): VpnServiceStartDecision {
-    if (!facts.commandCompatible || facts.stopRequested || !facts.startRequested) {
+    if (facts.revokeFenced || !facts.commandCompatible || facts.stopRequested || !facts.startRequested) {
         return VpnServiceStartDecision.STOP
     }
     // Android's Settings > Always-on VPN selection is an explicit system
@@ -201,3 +205,25 @@ internal fun vpnAlwaysOnGuardRequired(
     deviceAvailable: Boolean,
     wouldEscape: Boolean,
 ): Boolean = systemAlwaysOn && (!deviceAvailable || wouldEscape)
+
+/**
+ * Every path that can bring the VPN back without the user asking. A revoke
+ * (the user turned the VPN off in system settings, or another VPN replaced
+ * ours) leaves provide enabled, so reconcile would otherwise restart the
+ * service at once; the fence holds all of these until [USER_CONNECT].
+ */
+internal enum class VpnReconnectEntry {
+    RECONCILE,
+    START_SERVICE,
+    FOREGROUND_RETRY,
+    RESTORE,
+    SYSTEM_START,
+    ALWAYS_ON_GUARD,
+    ALWAYS_ON_CONNECT,
+    /** ConnectViewModel, QuickConnect and the reconnect-tunnel action. */
+    USER_CONNECT,
+}
+
+/** Whether `entry` may reconnect while the revoke fence is [raised]. */
+internal fun vpnReconnectAllowed(entry: VpnReconnectEntry, raised: Boolean): Boolean =
+    !raised || entry == VpnReconnectEntry.USER_CONNECT

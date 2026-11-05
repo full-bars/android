@@ -142,6 +142,8 @@ object QuickConnect {
         }
         // to the saved location, else the best available provider, read with
         // the command on the queue
+        // the user's own connect lifts the revoke fence
+        if (connect) app.clearVpnRevokeFence()
         app.connectCommands.runOnDevice(connectDevice, connect)
         android.util.Log.i("QuickConnect", "${if (connect) "connect" else "disconnect"} from $source")
         if (connect && VpnService.prepare(app) != null) {

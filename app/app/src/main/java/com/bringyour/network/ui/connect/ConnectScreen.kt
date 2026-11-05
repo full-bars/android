@@ -394,7 +394,7 @@ fun ConnectScreen(
     }
 
     val connect = { connectViewModel.connect(connectViewModel.selectedLocation) }
-    val reconnectTunnel = { application?.startVpnService(); Unit }
+    val reconnectTunnel = { application?.userRequestedVpnConnect(); Unit }
     val actionButtons = connectActionButtons(
         insufficientBalance = displayInsufficientBalance,
         currentPlan = currentPlan,

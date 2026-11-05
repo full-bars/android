@@ -222,6 +222,7 @@ import kotlin.math.roundToInt
 
         val stop = intent?.getBooleanExtra("stop", false) ?: false
         val start = intent?.getBooleanExtra("start", true) ?: false
+        val revokeFenced = !app.vpnReconnectPermitted(VpnReconnectEntry.SYSTEM_START)
         val redelivered =
             flags and android.app.Service.START_FLAG_REDELIVERY != 0 ||
                 flags and android.app.Service.START_FLAG_RETRY != 0
@@ -238,6 +239,7 @@ import kotlin.math.roundToInt
                 startRequested = start,
                 systemStart = systemStart,
                 commandCompatible = commandCompatible,
+                revokeFenced = revokeFenced,
             )
         ) {
             DirectBootServiceDecision.STOP -> {
@@ -280,6 +282,7 @@ import kotlin.math.roundToInt
                 redelivered = redelivered,
                 systemStart = systemStart,
                 commandCompatible = commandCompatible,
+                revokeFenced = revokeFenced,
             ),
         )
 
@@ -525,6 +528,12 @@ import kotlin.math.roundToInt
 
     private fun reconcilePfd() {
         val app = application as MainApplication
+        if (app.vpnRevokeFenced()) {
+            // the user revoked the VPN: neither a tunnel nor the guard comes back
+            Log.i(TAG, "[service]revoke fence raised; stopping")
+            stop()
+            return
+        }
         // null exactly when no device is bound
         val desired = boundDevice?.let { desiredTunnelConfiguration() }
         if (alwaysOnGuardRequired(app, desired)) {
@@ -908,6 +917,9 @@ import kotlin.math.roundToInt
      * provider discovery can recover the session.
      */
     private fun establishAlwaysOnGuard(): Boolean {
+        if (!(application as MainApplication).vpnReconnectPermitted(VpnReconnectEntry.ALWAYS_ON_GUARD)) {
+            return false
+        }
         if (alwaysOnGuardPfd != null) {
             if (tunnelRetryKind == TunnelRetryKind.ALWAYS_ON_GUARD) cancelTunnelRetry()
             packetFlow?.close()
