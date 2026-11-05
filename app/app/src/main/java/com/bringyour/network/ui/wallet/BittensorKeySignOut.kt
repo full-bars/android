@@ -56,6 +56,11 @@ object BittensorKeyScreenRequests {
         _navigation.value = false
     }
 
+    fun clear() {
+        _screen.value = false
+        _navigation.value = false
+    }
+
     /** The waiting request for the Key screen, taken once. */
     fun take(): Boolean {
         val requested = _screen.value

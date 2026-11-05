@@ -45,6 +45,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavController
+import com.bringyour.network.MainApplication
 import com.bringyour.network.R
 import com.bringyour.network.ui.Route
 import com.bringyour.network.ui.components.ButtonStyle
@@ -566,6 +567,24 @@ internal fun ConnectActionNotices(
                     .fillMaxWidth()
                     .padding(horizontal = 4.dp)
                     .testTag("acceptance.insufficient_balance_disconnect_first")
+            )
+        }
+
+        // Android's Always-on VPN keeps a fail-closed guard up after Disconnect, and
+        // the guard still captures the store's traffic, so the steps above are not
+        // enough: the system setting has to be turned off too
+        val systemAlwaysOn =
+            (LocalContext.current.applicationContext as? MainApplication)?.isSystemAlwaysOnVpnActive() == true
+        if (alwaysOnRecoveryShown(outOfBalanceNotice.disconnectFirst, systemAlwaysOn)) {
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                stringResource(id = R.string.insufficient_balance_always_on_vpn),
+                style = MaterialTheme.typography.bodyMedium,
+                color = TextMuted,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 4.dp)
+                    .testTag("acceptance.insufficient_balance_always_on_vpn")
             )
         }
 
@@ -1108,3 +1127,7 @@ fun WindowTypeButtonText(windowType: WindowType) {
 
     Text(displayName)
 }
+
+/** The Always-on VPN line goes with the disconnect-first line, only while the system setting is on. */
+internal fun alwaysOnRecoveryShown(disconnectFirst: Boolean, systemAlwaysOn: Boolean): Boolean =
+    disconnectFirst && systemAlwaysOn

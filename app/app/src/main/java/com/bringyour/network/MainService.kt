@@ -121,6 +121,7 @@ import kotlin.math.roundToInt
 
     //    private var pfd: ParcelFileDescriptor? = null
     private var packetFlow: PacketFlow? = null
+    private var packetFlowStartedAt: Long = 0L
 
     // Called on the main thread at explicit diagnostic begin/end only.
     internal fun hasPacketFlowForDiagnostic(): Boolean = packetFlow != null
@@ -863,7 +864,15 @@ import kotlin.math.roundToInt
                     )
                     return
                 }
+                if (replacedPacketFlow?.isActive() == true) {
+                    tunnelRetryFailureCount = packetFlowRetryFailureCount(
+                        tunnelRetryFailureCount,
+                        flowStartedAt - packetFlowStartedAt,
+                        retryPending = false,
+                    )
+                }
                 packetFlow = replacementPacketFlow
+                packetFlowStartedAt = flowStartedAt
                 cancelTunnelRetry(resetFailureCount = false)
                 appliedTunnelConfiguration = configuration
                 val replacedGuard = alwaysOnGuardPfd

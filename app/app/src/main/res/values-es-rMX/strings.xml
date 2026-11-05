@@ -113,7 +113,7 @@
     <string name="bittensor_key_card_short">URnetwork no es una cartera. \"Configurar pagos\" crea una clave de Bittensor en este dispositivo, y el SN25α de toda tu red se paga en ella. Haz una copia de seguridad de la frase de recuperación de la clave: si pierdes este dispositivo antes de guardarla, no se podrá acceder a tu SN25α.</string>
     <string name="bittensor_key_change_wallet_body">Elige dónde se pagan las ganancias de esta red a partir de la próxima época. Las ganancias anteriores se quedan donde se pagaron.</string>
     <string name="bittensor_key_confirm_top200">Eliminar esta clave también implica renunciar a reclamar un lugar en el Top 200 con un toque. Todavía podrías reclamarlo desde una cartera de Bittensor que tenga esta frase de recuperación.</string>
-    <string name="bittensor_key_copy_warning_2">Es posible que otras aplicaciones puedan leer el portapapeles. La copia se queda en este dispositivo y se borra después de 60 s.</string>
+    <string name="bittensor_key_copy_warning_2">Otras aplicaciones podrían leer el portapapeles. Esta aplicación intenta borrar la copia a los 60 s, pero no puede garantizarlo. Revisa el portapapeles y bórralo tú mismo.</string>
     <string name="bittensor_key_create_here">Crear una clave en este dispositivo</string>
     <string name="bittensor_key_create_here_body">URnetwork no es una cartera. Con un toque se crea una clave de Bittensor en este dispositivo; después, haz una copia de seguridad de su frase de recuperación.</string>
     <string name="bittensor_key_delete_account_message_2">Tu clave de Bittensor no tiene copia de seguridad. Al eliminar tu cuenta también se elimina de este dispositivo, y URnetwork no puede recuperarla.</string>
@@ -170,7 +170,7 @@
     <string name="bittensor_key_set_up">Configurar pagos</string>
     <string name="bittensor_key_setting_up">Guardando la clave en este dispositivo y leyéndola de nuevo; después, firmando.</string>
     <string name="bittensor_key_sign_out_message">Tu frase de recuperación de Bittensor todavía no está guardada. La clave se queda en este dispositivo y vuelve cuando esta red inicie sesión de nuevo. Si pierdes este dispositivo antes de guardarla, no se podrá acceder a tu SN25α.</string>
-    <string name="bittensor_key_sign_out_message_2">Se queda en este dispositivo y vuelve cuando inicias sesión de nuevo en esta red. Si pierdes este dispositivo antes de guardarla, no se podrá acceder a tu SN25α.</string>
+    <string name="bittensor_key_sign_out_message_2">La clave se queda en este dispositivo y vuelve cuando inicies sesión de nuevo en esta red. Si pierdes este dispositivo antes de respaldar la frase de recuperación, no se podrá acceder a tus SN25α.</string>
     <string name="bittensor_key_sign_out_title_2">Tu clave de Bittensor no tiene copia de seguridad</string>
     <string name="bittensor_key_signing">Configurando pagos: firmando el consentimiento de pago de tu red con esta clave.</string>
     <string name="bittensor_key_status_saved">Clave en este dispositivo, frase de recuperación guardada</string>
@@ -669,6 +669,7 @@
     <string name="insufficient_balance_disconnect_first_kill_switch">Para mejorar tu plan, elige primero \"Desconectar\" y desactiva el Kill switch si está activado. Hasta entonces, el pago no podrá completarse.</string>
     <string name="insufficient_balance_exhausted">Te quedaste sin datos hasta la renovación gratis o hasta que mejores tu plan.</string>
     <string name="insufficient_balance_held_notice">Tu tráfico se mantiene en el túnel hasta que mejores tu plan o te desconectes.</string>
+    <string name="insufficient_balance_always_on_vpn">Si la VPN siempre activa de Android está configurada para esta aplicación, desactívala también en los ajustes de VPN de Android. Sigue bloqueando el pago después de desconectar.</string>
     <string name="insufficient_balance_reconnecting">Vuelve a haber datos disponibles. Reconectando…</string>
     <string name="insufficient_balance_refreshes_in">Los datos gratis se renuevan en %1$s.</string>
     <string name="insufficient_balance_reserved">%1$s están reservados para tus conexiones abiertas. Lo que no usen se devuelve a medida que se cierran.</string>

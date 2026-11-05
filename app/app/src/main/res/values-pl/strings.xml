@@ -113,7 +113,7 @@
     <string name="bittensor_key_card_short">URnetwork nie jest portfelem. „Skonfiguruj wypłaty” tworzy na tym urządzeniu klucz Bittensor, a SN25α całej twojej sieci są na niego wypłacane. Utwórz kopię zapasową frazy odzyskiwania klucza: jeśli stracisz to urządzenie, zanim ją zapiszesz, do twoich SN25α nie będzie można się dostać.</string>
     <string name="bittensor_key_change_wallet_body">Wybierz, dokąd od następnej epoki będą wypłacane zarobki tej sieci. Wcześniejsze zarobki pozostaną tam, gdzie zostały wypłacone.</string>
     <string name="bittensor_key_confirm_top200">Usunięcie tego klucza oznacza też rezygnację z zajęcia miejsca w Top 200 jednym dotknięciem. Nadal możesz je zająć z portfela Bittensor zawierającego tę frazę odzyskiwania.</string>
-    <string name="bittensor_key_copy_warning_2">Inne aplikacje mogą odczytać schowek. Kopia pozostaje na tym urządzeniu i jest usuwana po 60 s.</string>
+    <string name="bittensor_key_copy_warning_2">Inne aplikacje mogą odczytywać schowek. Ta aplikacja próbuje wyczyścić kopię po 60 s, ale nie może tego zagwarantować. Sprawdź schowek i wyczyść go samodzielnie.</string>
     <string name="bittensor_key_create_here">Utwórz klucz na tym urządzeniu</string>
     <string name="bittensor_key_create_here_body">URnetwork nie jest portfelem. Jedno dotknięcie tworzy klucz Bittensor na tym urządzeniu; potem utwórz kopię zapasową jego frazy odzyskiwania.</string>
     <string name="bittensor_key_delete_account_message_2">Twój klucz Bittensor nie ma kopii zapasowej. Usunięcie konta usuwa go też z tego urządzenia, a URnetwork nie może go odzyskać.</string>
@@ -170,7 +170,7 @@
     <string name="bittensor_key_set_up">Skonfiguruj wypłaty</string>
     <string name="bittensor_key_setting_up">Zapisywanie klucza na tym urządzeniu i ponowne odczytywanie, potem podpisywanie.</string>
     <string name="bittensor_key_sign_out_message">Twoja fraza odzyskiwania Bittensor nie jest jeszcze zapisana. Klucz pozostaje na tym urządzeniu i wróci, gdy ta sieć zaloguje się ponownie. Jeśli stracisz to urządzenie, zanim ją zapiszesz, do twoich SN25α nie będzie można się dostać.</string>
-    <string name="bittensor_key_sign_out_message_2">Pozostaje na tym urządzeniu i wróci, gdy ponownie zalogujesz się do tej sieci. Jeśli stracisz to urządzenie, zanim go zapiszesz, do twoich SN25α nie będzie można się dostać.</string>
+    <string name="bittensor_key_sign_out_message_2">Klucz pozostaje na tym urządzeniu i wróci, gdy ponownie zalogujesz się do tej sieci. Jeśli stracisz to urządzenie, zanim wykonasz kopię zapasową frazy odzyskiwania, do twoich SN25α nie będzie dostępu.</string>
     <string name="bittensor_key_sign_out_title_2">Twój klucz Bittensor nie ma kopii zapasowej</string>
     <string name="bittensor_key_signing">Konfigurowanie wypłat: podpisywanie zgody na wypłaty twojej sieci tym kluczem.</string>
     <string name="bittensor_key_status_saved">Klucz na tym urządzeniu, fraza odzyskiwania zapisana</string>
@@ -669,6 +669,7 @@
     <string name="insufficient_balance_disconnect_first_kill_switch">Aby przejść na wyższy plan, najpierw wybierz „Rozłącz” i wyłącz Kill switch, jeśli jest włączony. Do tego czasu płatność nie przejdzie.</string>
     <string name="insufficient_balance_exhausted">Skończyły Ci się dane do darmowego odnowienia lub przejścia na wyższy plan.</string>
     <string name="insufficient_balance_held_notice">Twój ruch jest zatrzymany w tunelu, dopóki nie przejdziesz na wyższy plan lub się nie rozłączysz.</string>
+    <string name="insufficient_balance_always_on_vpn">Jeśli dla tej aplikacji ustawiono w Androidzie stały VPN (Always-on VPN), wyłącz go także w ustawieniach VPN Androida. Nadal blokuje płatność po rozłączeniu.</string>
     <string name="insufficient_balance_reconnecting">Dane są znów dostępne. Ponowne łączenie…</string>
     <string name="insufficient_balance_refreshes_in">Darmowe dane odnowią się za %1$s.</string>
     <string name="insufficient_balance_reserved">%1$s jest zarezerwowane dla Twoich otwartych połączeń. To, czego nie wykorzystają, wraca w miarę ich zamykania.</string>

@@ -5,6 +5,7 @@ import com.bringyour.network.ui.settings.BittensorAddSignInReturns
 import com.bringyour.network.ui.settings.SsoAddSignInReturns
 import com.bringyour.network.ui.shared.viewmodels.PendingSolanaPaymentStore
 import com.bringyour.network.ui.wallet.BittensorBridgeReturns
+import com.bringyour.network.ui.wallet.BittensorKeyScreenRequests
 import com.bringyour.network.ui.wallet.SnConsentReturns
 
 /**
@@ -35,6 +36,7 @@ internal fun clearSignedOutNetworkState(
     SsoAddSignInReturns.take()
     BittensorAddSignInReturns.take()
     SnConsentReturns.take()
+    BittensorKeyScreenRequests.clear()
     bittensorBridgeReturns.cancel()
     pendingSolanaPayment.clear()
 }

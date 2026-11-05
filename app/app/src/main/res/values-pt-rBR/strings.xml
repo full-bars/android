@@ -113,7 +113,7 @@
     <string name="bittensor_key_card_short">O URnetwork não é uma carteira. \"Configurar pagamentos\" cria uma chave Bittensor neste dispositivo, e o SN25α de toda a sua rede é pago nela. Faça backup da frase de recuperação da chave: se você perder este dispositivo antes de salvá-la, não será possível acessar seu SN25α.</string>
     <string name="bittensor_key_change_wallet_body">Escolha para onde os ganhos desta rede são pagos a partir da próxima época. Os ganhos anteriores ficam onde foram pagos.</string>
     <string name="bittensor_key_confirm_top200">Excluir esta chave também significa abrir mão de garantir uma vaga no Top 200 com um toque. Você ainda poderia garanti-la a partir de uma carteira Bittensor que tenha esta frase de recuperação.</string>
-    <string name="bittensor_key_copy_warning_2">Outros apps podem conseguir ler a área de transferência. A cópia fica neste dispositivo e é apagada após 60 s.</string>
+    <string name="bittensor_key_copy_warning_2">Outros apps podem conseguir ler a área de transferência. Este app tenta limpar a cópia após 60 s, mas não pode garantir isso. Confira a área de transferência e limpe você mesmo.</string>
     <string name="bittensor_key_create_here">Criar uma chave neste dispositivo</string>
     <string name="bittensor_key_create_here_body">O URnetwork não é uma carteira. Um toque cria uma chave Bittensor neste dispositivo; depois, faça backup da frase de recuperação dela.</string>
     <string name="bittensor_key_delete_account_message_2">Sua chave Bittensor não tem backup. Excluir sua conta também a exclui deste dispositivo, e o URnetwork não consegue recuperá-la.</string>
@@ -170,7 +170,7 @@
     <string name="bittensor_key_set_up">Configurar pagamentos</string>
     <string name="bittensor_key_setting_up">Salvando a chave neste dispositivo e lendo-a de novo; depois, assinando.</string>
     <string name="bittensor_key_sign_out_message">Sua frase de recuperação Bittensor ainda não está salva. A chave fica neste dispositivo e volta quando esta rede entrar novamente. Se você perder este dispositivo antes de salvá-la, não será possível acessar seu SN25α.</string>
-    <string name="bittensor_key_sign_out_message_2">Ela fica neste dispositivo e volta quando você entrar novamente nesta rede. Se você perder este dispositivo antes de salvá-la, não será possível acessar seu SN25α.</string>
+    <string name="bittensor_key_sign_out_message_2">A chave fica neste dispositivo e volta quando você entrar novamente nesta rede. Se você perder este dispositivo antes de fazer backup da frase de recuperação, não será possível acessar seus SN25α.</string>
     <string name="bittensor_key_sign_out_title_2">Sua chave Bittensor não tem backup</string>
     <string name="bittensor_key_signing">Configurando pagamentos: assinando o consentimento de pagamento da sua rede com esta chave.</string>
     <string name="bittensor_key_status_saved">Chave neste dispositivo, frase de recuperação salva</string>
@@ -669,6 +669,7 @@
     <string name="insufficient_balance_disconnect_first_kill_switch">Para fazer upgrade, escolha primeiro \"Desconectar\" e desative o Kill switch se estiver ativado. Até lá, o pagamento não será concluído.</string>
     <string name="insufficient_balance_exhausted">Seus dados acabaram até a renovação grátis ou um upgrade.</string>
     <string name="insufficient_balance_held_notice">Seu tráfego fica retido no túnel até você fazer upgrade ou desconectar.</string>
+    <string name="insufficient_balance_always_on_vpn">Se a VPN sempre ativa do Android estiver definida para este app, desative-a também nas configurações de VPN do Android. Ela continua bloqueando o pagamento depois de desconectar.</string>
     <string name="insufficient_balance_reconnecting">Há dados disponíveis novamente. Reconectando…</string>
     <string name="insufficient_balance_refreshes_in">Os dados grátis são renovados em %1$s.</string>
     <string name="insufficient_balance_reserved">%1$s estão reservados para suas conexões abertas. O que elas não usarem é devolvido à medida que forem fechadas.</string>

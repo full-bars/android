@@ -113,7 +113,7 @@
     <string name="bittensor_key_card_short">O URnetwork não é uma carteira. \"Configurar pagamentos\" cria uma chave Bittensor neste dispositivo, e o SN25α de toda a sua rede é pago nela. Faça uma cópia de segurança da frase de recuperação da chave: se perder este dispositivo antes de a guardar, não será possível aceder ao seu SN25α.</string>
     <string name="bittensor_key_change_wallet_body">Escolha para onde são pagos os ganhos desta rede a partir da próxima época. Os ganhos anteriores ficam onde foram pagos.</string>
     <string name="bittensor_key_confirm_top200">Eliminar esta chave também significa abdicar de garantir um lugar no Top 200 com um toque. Ainda poderá garanti-lo a partir de uma carteira Bittensor que contenha esta frase de recuperação.</string>
-    <string name="bittensor_key_copy_warning_2">Outras apps podem conseguir ler a área de transferência. A cópia fica neste dispositivo e é apagada após 60 s.</string>
+    <string name="bittensor_key_copy_warning_2">Outras aplicações podem conseguir ler a área de transferência. Esta aplicação tenta limpar a cópia após 60 s, mas não o pode garantir. Verifique a área de transferência e limpe-a você mesmo.</string>
     <string name="bittensor_key_create_here">Criar uma chave neste dispositivo</string>
     <string name="bittensor_key_create_here_body">O URnetwork não é uma carteira. Um toque cria uma chave Bittensor neste dispositivo; depois, faça uma cópia de segurança da frase de recuperação da chave.</string>
     <string name="bittensor_key_delete_account_message_2">A sua chave Bittensor não tem cópia de segurança. Eliminar a sua conta também a elimina deste dispositivo, e o URnetwork não a consegue recuperar.</string>
@@ -170,7 +170,7 @@
     <string name="bittensor_key_set_up">Configurar pagamentos</string>
     <string name="bittensor_key_setting_up">A guardar a chave neste dispositivo e a lê-la de novo; depois, a assinar.</string>
     <string name="bittensor_key_sign_out_message">A sua frase de recuperação Bittensor ainda não está guardada. A chave fica neste dispositivo e volta quando esta rede iniciar sessão novamente. Se perder este dispositivo antes de a guardar, não será possível aceder ao seu SN25α.</string>
-    <string name="bittensor_key_sign_out_message_2">Fica neste dispositivo e volta quando iniciar sessão novamente nesta rede. Se perder este dispositivo antes de a guardar, não será possível aceder ao seu SN25α.</string>
+    <string name="bittensor_key_sign_out_message_2">A chave fica neste dispositivo e volta quando iniciar sessão novamente nesta rede. Se perder este dispositivo antes de fazer uma cópia de segurança da frase de recuperação, não será possível aceder aos seus SN25α.</string>
     <string name="bittensor_key_sign_out_title_2">A sua chave Bittensor não tem cópia de segurança</string>
     <string name="bittensor_key_signing">A configurar pagamentos: a assinar o consentimento de pagamento da sua rede com esta chave.</string>
     <string name="bittensor_key_status_saved">Chave neste dispositivo, frase de recuperação guardada</string>
@@ -669,6 +669,7 @@
     <string name="insufficient_balance_disconnect_first_kill_switch">Para fazer upgrade, escolha primeiro \"Desconectar\" e desative o Kill switch se estiver ativado. Até lá, o pagamento não será concluído.</string>
     <string name="insufficient_balance_exhausted">Seus dados acabaram até a renovação grátis ou um upgrade.</string>
     <string name="insufficient_balance_held_notice">Seu tráfego fica retido no túnel até você fazer upgrade ou desconectar.</string>
+    <string name="insufficient_balance_always_on_vpn">Se a VPN sempre ativa do Android estiver definida para esta aplicação, desative-a também nas definições de VPN do Android. Continua a bloquear o pagamento após desligar.</string>
     <string name="insufficient_balance_reconnecting">Há dados disponíveis novamente. Reconectando…</string>
     <string name="insufficient_balance_refreshes_in">Os dados grátis são renovados em %1$s.</string>
     <string name="insufficient_balance_reserved">%1$s estão reservados para suas conexões abertas. O que elas não usarem é devolvido à medida que forem fechadas.</string>

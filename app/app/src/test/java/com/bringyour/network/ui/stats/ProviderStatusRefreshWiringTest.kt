@@ -41,6 +41,13 @@ class ProviderStatusRefreshWiringTest {
     }
 
     @Test
+    fun unavailableChartCanGrowWhileBarsKeepTheirFixedHeight() {
+        val chart = source("ui/stats/ProviderDemandChart.kt")
+        assertTrue(chart.contains("if (display.demand == ProviderDemandState.UNAVAILABLE) Modifier.heightIn(min = DEMAND_CHART_HEIGHT)"))
+        assertTrue(chart.contains("else Modifier.height(DEMAND_CHART_HEIGHT)"))
+    }
+
+    @Test
     fun theChartsRetryIsWired() {
         val section = source("ui/stats/ProviderStatsSection.kt")
         assertTrue(section.contains("onRetry = providerStatusViewModel::refresh"))
