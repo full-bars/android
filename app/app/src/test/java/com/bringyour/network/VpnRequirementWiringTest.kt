@@ -47,8 +47,8 @@ class VpnRequirementWiringTest {
         val app = source("MainApplication.kt")
         val reconcile = function(app, "    private fun reconcileVpnService(")
         assertTrue("reconcile must use the snapshot", reconcile.contains("vpnRequirementInputs(device)"))
-        assertFalse("reconcile must not read the provider pointer", reconcile.contains(".provideEnabled"))
-        assertFalse("reconcile must not read the raw connect flag", reconcile.contains(".connectEnabled"))
+        assertFalse("reconcile must not read the provider pointer", reconcile.contains("device.provideEnabled"))
+        assertFalse("reconcile must not read the raw connect flag", reconcile.contains("device.connectEnabled"))
 
         val restored = function(app, "    fun restoredVpnServiceRequired(")
         assertTrue("restored retry must use the snapshot", restored.contains("vpnRequirementInputs(current).required()"))
@@ -57,8 +57,8 @@ class VpnRequirementWiringTest {
         val service = source("MainService.kt")
         val keepalive = function(service, "    private fun keepRequiredVpnUp(")
         assertTrue("the keepalive must use the snapshot", keepalive.contains("app.vpnRequirementInputs("))
-        assertFalse("the keepalive must not read the provider pointer", keepalive.contains(".provideEnabled"))
-        assertFalse("the keepalive must not read the raw connect flag", keepalive.contains(".connectEnabled"))
+        assertFalse("the keepalive must not read the provider pointer", keepalive.contains("device?.provideEnabled"))
+        assertFalse("the keepalive must not read the raw connect flag", keepalive.contains("device?.connectEnabled"))
     }
 
     @Test

@@ -65,7 +65,8 @@ class VpnRevokeDisconnectWiringTest {
         val app = source("MainApplication.kt")
         val inputs = function(app, "    internal fun vpnRequirementInputs(")
         assertTrue(inputs.contains("connectCommands.connectRequested("))
-        assertFalse("the snapshot reads only the device", inputs.contains("current.connectEnabled"))
+        val predicate = source("VpnRequirementInputs.kt")
+        assertTrue("the decision uses the pending request", predicate.contains("connectEnabled = connectRequested"))
         val reconcile = function(app, "    private fun reconcileVpnService(")
         assertFalse("the reconcile reads only the device", reconcile.contains("device.connectEnabled"))
     }
