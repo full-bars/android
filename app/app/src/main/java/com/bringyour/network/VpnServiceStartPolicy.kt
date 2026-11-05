@@ -220,6 +220,7 @@ internal enum class VpnReconnectEntry {
     SYSTEM_START,
     ALWAYS_ON_GUARD,
     ALWAYS_ON_CONNECT,
+    BALANCE_RECOVERY,
     /** ConnectViewModel, QuickConnect and the reconnect-tunnel action. */
     USER_CONNECT,
 }

@@ -677,6 +677,7 @@ class MainApplication : Application() {
             return false
         }
         val current = device ?: return false
+        if (!vpnReconnectPermitted(VpnReconnectEntry.BALANCE_RECOVERY)) return false
         // the gate is not asked again: the recovery decided on a fresh balance,
         // and a held connection still reports insufficient balance until the
         // rebuild replaces it. On the connect command queue, after the
@@ -692,6 +693,8 @@ class MainApplication : Application() {
                     else -> connectDevice.connectLocation
                 }
             },
+            // asked again when the command runs, not only when queued
+            admit = { vpnReconnectPermitted(VpnReconnectEntry.BALANCE_RECOVERY) },
         )
     }
 
@@ -3129,7 +3132,11 @@ class MainApplication : Application() {
         // on the connect command queue, to the saved location (read there),
         // else the best available provider; a failure is logged there, and
         // the retry below asks again while the device is not connected
-        connectCommands.runOnDevice(com.bringyour.network.ui.connect.SdkConnectDevice(current), connect = true)
+        connectCommands.runOnDevice(
+            com.bringyour.network.ui.connect.SdkConnectDevice(current),
+            connect = true,
+            admit = { vpnReconnectPermitted(VpnReconnectEntry.ALWAYS_ON_CONNECT) },
+        )
         Handler(mainLooper).postDelayed({
             if (systemAlwaysOnVpn && device === current && !current.connectEnabled) {
                 alwaysOnConnectRequestedDevice = null

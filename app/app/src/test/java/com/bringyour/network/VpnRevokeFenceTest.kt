@@ -52,6 +52,7 @@ class VpnRevokeFenceTest {
             VpnReconnectEntry.SYSTEM_START,
             VpnReconnectEntry.ALWAYS_ON_GUARD,
             VpnReconnectEntry.ALWAYS_ON_CONNECT,
+            VpnReconnectEntry.BALANCE_RECOVERY,
         )
         assertEquals(VpnReconnectEntry.values().size - 1, automatic.size)
         automatic.forEach { assertFalse("$it", vpnReconnectAllowed(it, raised = true)) }
@@ -141,6 +142,17 @@ class VpnRevokeFenceTest {
         assertTrue(consults(function(service, "    override fun onStartCommand("), VpnReconnectEntry.SYSTEM_START))
         assertTrue(consults(function(service, "    private fun establishAlwaysOnGuard("), VpnReconnectEntry.ALWAYS_ON_GUARD))
         assertTrue(function(service, "    private fun reconcilePfd(").contains("vpnRevokeFenced()"))
+    }
+
+    @Test
+    fun queuedAutomaticConnectsAskTheFenceWhenTheyRunToo() {
+        val app = source("MainApplication.kt")
+        val recovery = function(app, "    fun observeBalanceRecovery(")
+        // once before queueing, once more as the admit check at execution
+        assertEquals(2, Regex("VpnReconnectEntry\\.BALANCE_RECOVERY").findAll(recovery).count())
+        assertTrue(recovery.contains("admit ="))
+        val alwaysOn = function(app, "    private fun ensureAlwaysOnConnected(")
+        assertTrue(alwaysOn.contains("admit = { vpnReconnectPermitted(VpnReconnectEntry.ALWAYS_ON_CONNECT) }"))
     }
 
     @Test
