@@ -166,6 +166,17 @@ class VpnRevokeFenceTest {
     }
 
     @Test
+    fun aRevokeDropsTheBalanceRecoveryBeforeAnyEarlyReturn() {
+        val revoked = function(source("MainApplication.kt"), "    fun vpnServiceRevoked(")
+        val clear = revoked.indexOf("clearBalanceRecovery()")
+        assertTrue(0 <= clear)
+        // the not-connected and no-device returns must not skip it
+        assertTrue(clear < revoked.indexOf("device ?: return"))
+        assertTrue(clear < revoked.indexOf("connectRequested(connectDevice)) return"))
+        assertTrue(revoked.indexOf("revokeFence.raise()") < clear)
+    }
+
+    @Test
     fun onlyExplicitUserConnectsClearTheFence() {
         val clearing = listOf(
             "MainApplication.kt",

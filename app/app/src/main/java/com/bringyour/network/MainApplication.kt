@@ -2999,10 +2999,13 @@ class MainApplication : Application() {
         // before any early return: the revoke can arrive with no device yet
         // or with nothing connected, and still must hold off every restart
         revokeFence.raise()
+        // a blocked balance recovery is waiting on no connection at all, so
+        // drop it before any early return; a recovery connect already queued
+        // is denied by the fence when it runs
+        clearBalanceRecovery()
         val current = device ?: return
         val connectDevice = com.bringyour.network.ui.connect.SdkConnectDevice(current)
         if (!connectCommands.connectRequested(connectDevice)) return
-        clearBalanceRecovery()
 
         Log.i(TAG, "Disconnecting VPN connection after the system revoked the VPN")
         connectCommands.runOnDevice(connectDevice, connect = false)
