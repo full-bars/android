@@ -172,6 +172,18 @@ internal fun decideVpnServiceStart(facts: VpnServiceStartFacts): VpnServiceStart
 
 internal const val VPN_SERVICE_COMMAND_VERSION = 1
 
+/** Intent extra: the revoke-fence epoch the app admitted this start under. */
+internal const val VPN_START_FENCE_EPOCH_EXTRA = "fence_epoch"
+
+/**
+ * Whether a start intent was admitted after the last revoke. An intent that
+ * carries an epoch (the app's own start) must still match it; one that carries
+ * none (the system's Always-on start, a redelivery from an older build) has
+ * nothing to compare and is judged by the fence's current value alone.
+ */
+internal fun vpnStartEpochAdmitted(carried: Long?, admits: (Long) -> Boolean): Boolean =
+    carried == null || admits(carried)
+
 /**
  * Explicit app commands are versioned because Android can redeliver an Intent
  * across an APK replacement (or a downgrade). Legacy v0 commands remain

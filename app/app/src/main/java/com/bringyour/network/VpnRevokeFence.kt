@@ -18,9 +18,9 @@ internal fun VpnRevokeFence(context: Context): VpnRevokeFence {
     return VpnRevokeFence(object : VpnRevokeFenceStorage {
         override fun read() = file.read()
 
-        override fun write(raised: Boolean): Boolean {
-            val landed = file.write(raised)
-            if (!landed) Log.e("VpnRevokeFence", "durable write of raised=$raised failed")
+        override fun write(record: VpnRevokeFenceRecord): Boolean {
+            val landed = file.write(record)
+            if (!landed) Log.e("VpnRevokeFence", "durable write of $record failed")
             return landed
         }
     })

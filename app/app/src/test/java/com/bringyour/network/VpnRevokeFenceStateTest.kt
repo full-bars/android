@@ -13,19 +13,21 @@ class VpnRevokeFenceStateTest {
 
     private class FakeStorage(
         var disk: Boolean = false,
+        var diskEpoch: Long = 0,
         var failWrites: Boolean = false,
         // a write that reports failure after the bit reached the disk
         var landsEvenWhenFailing: Boolean = false,
     ) : VpnRevokeFenceStorage {
         val writes = mutableListOf<Boolean>()
-        override fun read() = disk
-        override fun write(raised: Boolean): Boolean {
-            writes.add(raised)
+        override fun read() = VpnRevokeFenceRecord(disk, diskEpoch)
+        override fun write(record: VpnRevokeFenceRecord): Boolean {
+            writes.add(record.raised)
             if (failWrites) {
-                if (landsEvenWhenFailing) disk = raised
+                if (landsEvenWhenFailing) { disk = record.raised; diskEpoch = record.epoch }
                 return false
             }
-            disk = raised
+            disk = record.raised
+            diskEpoch = record.epoch
             return true
         }
     }
@@ -160,5 +162,97 @@ class VpnRevokeFenceStateTest {
             pool.shutdown()
             assertEquals("disk matches memory", fence.raised, storage.disk)
         }
+    }
+
+    // ---- epoch: work admitted before a revoke cannot ride a later clear
+
+    @Test
+    fun anAdmissionIsRefusedWhileRaisedAndTakenOtherwise() {
+        val fence = VpnRevokeFence(FakeStorage())
+        val admitted = fence.admission()
+        assertTrue(admitted != null && fence.admits(admitted))
+        fence.raise()
+        assertEquals(null, fence.admission())
+        assertFalse("raised: nothing is admitted", fence.admits(admitted))
+        assertFalse(fence.admits(null))
+    }
+
+    /** The case a current-value check misses: revoke, then the user connects, then the old work runs. */
+    @Test
+    fun aClearedFenceDoesNotReadmitAnOlderPendingStart() {
+        val fence = VpnRevokeFence(FakeStorage())
+        val pending = fence.admission() // a start admitted before the revoke
+        fence.raise()
+        assertTrue(fence.clear()) // the user connects: fence is down again
+        assertFalse("the fence is down but the epoch moved", fence.raised)
+        assertFalse("the older start is refused", fence.admits(pending))
+        val fresh = fence.admission()
+        assertTrue("work admitted after the clear is admitted", fence.admits(fresh))
+        assertTrue(fresh != pending)
+    }
+
+    @Test
+    fun everyRevokeInvalidatesEveryEarlierAdmission() {
+        val fence = VpnRevokeFence(FakeStorage())
+        val tokens = mutableListOf<Long>()
+        repeat(5) {
+            tokens.add(fence.admission()!!)
+            fence.raise(); fence.clear()
+        }
+        val live = fence.admission()
+        assertEquals("no epoch is ever reused", tokens.size, tokens.toSet().size)
+        assertTrue(tokens.none { fence.admits(it) })
+        assertTrue(fence.admits(live))
+    }
+
+    @Test
+    fun aClearOfALoweredFenceKeepsPendingWorkAdmitted() {
+        val fence = VpnRevokeFence(FakeStorage())
+        val pending = fence.admission()
+        assertTrue(fence.clear()) // a user connect with no revoke before it
+        assertTrue(fence.admits(pending))
+    }
+
+    @Test
+    fun aRedundantRaiseDoesNotMoveTheEpochAgain() {
+        val fence = VpnRevokeFence(FakeStorage())
+        fence.raise()
+        val raisedAt = fence.epoch
+        fence.raise()
+        assertEquals(raisedAt, fence.epoch)
+    }
+
+    @Test
+    fun aClearThatDidNotLandDoesNotReadmitOlderWork() {
+        val storage = FakeStorage()
+        val fence = VpnRevokeFence(storage)
+        val pending = fence.admission()
+        fence.raise()
+        storage.failWrites = true
+        assertFalse(fence.clear())
+        assertFalse(fence.admits(pending))
+        assertEquals("no admission while still raised", null, fence.admission())
+    }
+
+    @Test
+    fun theEpochSurvivesARestart() {
+        val storage = FakeStorage()
+        val first = VpnRevokeFence(storage)
+        val pending = first.admission()
+        first.raise(); first.clear()
+        val restarted = VpnRevokeFence(storage) // a new process reads the disk
+        assertEquals(first.epoch, restarted.epoch)
+        assertFalse("an intent from before the revoke dies with its epoch", restarted.admits(pending))
+    }
+
+    @Test
+    fun aStartIntentWithNoEpochIsJudgedByTheCurrentValueOnly() {
+        val fence = VpnRevokeFence(FakeStorage())
+        assertTrue(vpnStartEpochAdmitted(null) { fence.admits(it) })
+        val carried = fence.admission()!!
+        assertTrue(vpnStartEpochAdmitted(carried) { fence.admits(it) })
+        fence.raise(); fence.clear()
+        assertFalse(vpnStartEpochAdmitted(carried) { fence.admits(it) })
+        assertTrue("no epoch carried: current value only", vpnStartEpochAdmitted(null) { fence.admits(it) })
     }
 }

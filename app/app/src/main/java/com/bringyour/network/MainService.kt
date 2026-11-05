@@ -222,7 +222,13 @@ import kotlin.math.roundToInt
 
         val stop = intent?.getBooleanExtra("stop", false) ?: false
         val start = intent?.getBooleanExtra("start", true) ?: false
-        val revokeFenced = !app.vpnReconnectPermitted(VpnReconnectEntry.SYSTEM_START)
+        // an intent the app sent before a revoke is refused even when the user
+        // has connected since (the fence is down again, its epoch is not)
+        val carriedEpoch = intent
+            ?.takeIf { it.hasExtra(VPN_START_FENCE_EPOCH_EXTRA) }
+            ?.getLongExtra(VPN_START_FENCE_EPOCH_EXTRA, 0L)
+        val revokeFenced = !app.vpnReconnectPermitted(VpnReconnectEntry.SYSTEM_START) ||
+            !vpnStartEpochAdmitted(carriedEpoch) { app.vpnFenceAdmits(it) }
         val redelivered =
             flags and android.app.Service.START_FLAG_REDELIVERY != 0 ||
                 flags and android.app.Service.START_FLAG_RETRY != 0
@@ -600,6 +606,9 @@ import kotlin.math.roundToInt
         )
         if (tunnelRetryFailureCount < Int.MAX_VALUE) tunnelRetryFailureCount += 1
         val retryDevice = boundDevice
+        // admitted when scheduled; a revoke before it runs fails it for good,
+        // even if the user's connect has lowered the fence again
+        val admission = (application as MainApplication).vpnFenceAdmission()
         lateinit var runnable: Runnable
         runnable = Runnable {
             if (tunnelRetryRunnable !== runnable) return@Runnable
@@ -608,7 +617,7 @@ import kotlin.math.roundToInt
             if (stopping || app.service?.get() !== this) return@Runnable
             // asked again at execution: an off-main revoke can raise the fence
             // while this retry waits, and reconcilePfd stops on a raised fence
-            if (app.vpnRevokeFenced()) {
+            if (app.vpnRevokeFenced() || !app.vpnFenceAdmits(admission)) {
                 cancelTunnelRetry()
                 reconcilePfd()
                 return@Runnable
@@ -657,6 +666,8 @@ import kotlin.math.roundToInt
 
     private fun updatePfd(configuration: VpnPacketFlowConfiguration) {
         val app = application as MainApplication
+        // admitted on entry; the check before establish() asks for this epoch
+        val admission = app.vpnFenceAdmission()
 
         val builder = Builder()
         builder.setSession("URnetwork")
@@ -836,7 +847,7 @@ import kotlin.math.roundToInt
         app.device?.let { device ->
             // the last check before the interface is built: a revoke on the
             // binder thread can land during the configuration above
-            if (app.vpnRevokeFenced()) {
+            if (app.vpnRevokeFenced() || !app.vpnFenceAdmits(admission)) {
                 Log.i(TAG, "[service]revoke fence raised before establish; stopping")
                 cancelTunnelRetry()
                 stop()

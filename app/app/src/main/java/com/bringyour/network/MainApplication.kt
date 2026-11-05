@@ -473,6 +473,16 @@ class MainApplication : Application() {
     internal fun vpnRevokeFenced(): Boolean = revokeFence.raised
 
     /**
+     * The fence epoch to admit deferred automatic work under (a start intent in
+     * flight, a queued connect, a scheduled retry), null while the fence is
+     * raised. Ask [vpnFenceAdmits] with it when the work runs: a revoke since
+     * then, even one the user's connect has already lifted, fails it.
+     */
+    internal fun vpnFenceAdmission(): Long? = revokeFence.admission()
+
+    internal fun vpnFenceAdmits(admission: Long?): Boolean = revokeFence.admits(admission)
+
+    /**
      * Set when a clear did not reach the disk. The fence stays raised then
      * (fail closed), so the user's connect starts nothing until a later one
      * lands; the UI can show this instead of a connect that silently does not
@@ -694,6 +704,7 @@ class MainApplication : Application() {
         }
         val current = device ?: return false
         if (!vpnReconnectPermitted(VpnReconnectEntry.BALANCE_RECOVERY)) return false
+        val admission = vpnFenceAdmission() ?: return false
         // the gate is not asked again: the recovery decided on a fresh balance,
         // and a held connection still reports insufficient balance until the
         // rebuild replaces it. On the connect command queue, after the
@@ -710,7 +721,9 @@ class MainApplication : Application() {
                 }
             },
             // asked again when the command runs, not only when queued
-            admit = { vpnReconnectPermitted(VpnReconnectEntry.BALANCE_RECOVERY) },
+            admit = {
+                vpnReconnectPermitted(VpnReconnectEntry.BALANCE_RECOVERY) && vpnFenceAdmits(admission)
+            },
         )
     }
 
@@ -2757,7 +2770,9 @@ class MainApplication : Application() {
             return
         }
         if (device == null) return
-        if (!vpnReconnectPermitted(VpnReconnectEntry.START_SERVICE)) {
+        // taken here, carried by the start intent, asked again by the service
+        val admission = vpnFenceAdmission()
+        if (!vpnReconnectPermitted(VpnReconnectEntry.START_SERVICE) || admission == null) {
             cancelVpnStartRetry()
             vpnRequestStart = false
             return
@@ -2794,6 +2809,9 @@ class MainApplication : Application() {
                         putExtra("command_version", VPN_SERVICE_COMMAND_VERSION)
                         putExtra("stop", false)
                         putExtra("start", true)
+                        // a revoke after this point makes the service refuse
+                        // the intent even if the user has connected again
+                        putExtra(VPN_START_FENCE_EPOCH_EXTRA, admission)
                         // Retained for redelivery compatibility with older APKs.
                         putExtra("foreground", true)
                     }
@@ -2859,6 +2877,13 @@ class MainApplication : Application() {
      */
     private fun scheduleVpnStartRetry() {
         vpnStartRetryRunnable?.let(mainHandler::removeCallbacks)
+        // admitted now; a revoke before the retry runs fails it for good
+        val admission = vpnFenceAdmission()
+        if (admission == null) {
+            vpnStartRetryRunnable = null
+            vpnRequestStart = false
+            return
+        }
         val delayMillis = vpnServiceStartRetryDelayMillis(vpnStartFailureCount)
         if (vpnStartFailureCount < Int.MAX_VALUE) vpnStartFailureCount += 1
         lateinit var retry: Runnable
@@ -2873,7 +2898,8 @@ class MainApplication : Application() {
                     serviceActive = serviceActive,
                     startPending = vpnStartPending,
                     foregroundActivityAvailable = retryListener != null,
-                    revokeFenced = !vpnReconnectPermitted(VpnReconnectEntry.FOREGROUND_RETRY),
+                    revokeFenced = !vpnReconnectPermitted(VpnReconnectEntry.FOREGROUND_RETRY) ||
+                        !vpnFenceAdmits(admission),
                 )
             ) {
                 return@Runnable
@@ -3019,6 +3045,7 @@ class MainApplication : Application() {
         // drop it before any early return; a recovery connect already queued
         // is denied by the fence when it runs
         clearBalanceRecovery()
+        invalidatePendingVpnStarts()
         val current = device ?: return
         val connectDevice = com.bringyour.network.ui.connect.SdkConnectDevice(current)
         if (!connectCommands.connectRequested(connectDevice)) return
@@ -3026,6 +3053,23 @@ class MainApplication : Application() {
         Log.i(TAG, "Disconnecting VPN connection after the system revoked the VPN")
         connectCommands.runOnDevice(connectDevice, connect = false)
         updateVpnService()
+    }
+
+    /**
+     * The raise moved the fence epoch, which already fails every start intent,
+     * queued connect and scheduled retry admitted before it (each asks
+     * [vpnFenceAdmits] when it runs). This drops the state that waits on them,
+     * so none of it survives to look like a start in progress: the foreground
+     * retry timer, the adoption watchdog, the "start pending" flags, and the
+     * Always-on connect dedupe (its queued connect is gone, so a later one must
+     * not be suppressed by it). Main thread.
+     */
+    private fun invalidatePendingVpnStarts() {
+        cancelVpnStartRetry()
+        cancelVpnStartAdoptionWatchdog()
+        vpnRequestStart = false
+        vpnStartPending = false
+        alwaysOnConnectRequestedDevice = null
     }
 
     /**
@@ -3142,6 +3186,7 @@ class MainApplication : Application() {
         }
         val current = device ?: return
         if (!vpnReconnectPermitted(VpnReconnectEntry.ALWAYS_ON_CONNECT)) return
+        val admission = vpnFenceAdmission() ?: return
         if (current.connectEnabled) {
             alwaysOnConnectRequestedDevice = null
             return
@@ -3154,7 +3199,9 @@ class MainApplication : Application() {
         connectCommands.runOnDevice(
             com.bringyour.network.ui.connect.SdkConnectDevice(current),
             connect = true,
-            admit = { vpnReconnectPermitted(VpnReconnectEntry.ALWAYS_ON_CONNECT) },
+            admit = {
+                vpnReconnectPermitted(VpnReconnectEntry.ALWAYS_ON_CONNECT) && vpnFenceAdmits(admission)
+            },
         )
         Handler(mainLooper).postDelayed({
             if (systemAlwaysOnVpn && device === current && !current.connectEnabled) {

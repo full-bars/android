@@ -159,7 +159,68 @@ class VpnRevokeFenceTest {
         assertEquals(2, Regex("VpnReconnectEntry\\.BALANCE_RECOVERY").findAll(recovery).count())
         assertTrue(recovery.contains("admit ="))
         val alwaysOn = function(app, "    private fun ensureAlwaysOnConnected(")
-        assertTrue(alwaysOn.contains("admit = { vpnReconnectPermitted(VpnReconnectEntry.ALWAYS_ON_CONNECT) }"))
+        assertTrue(alwaysOn.contains("vpnReconnectPermitted(VpnReconnectEntry.ALWAYS_ON_CONNECT) && vpnFenceAdmits(admission)"))
+    }
+
+    // ---- epoch: every site that holds work across a possible revoke
+
+    /** Source-text checks: admission taken when the work is queued, asked again when it runs. */
+    @Test
+    fun everyDeferredSiteTakesAnAdmissionAndAsksItAgain() {
+        val app = source("MainApplication.kt")
+        val service = source("MainService.kt")
+        // queued connects: balance recovery, Always-on
+        for (name in listOf("    fun observeBalanceRecovery(", "    private fun ensureAlwaysOnConnected(")) {
+            val body = function(app, name)
+            val take = body.indexOf("val admission = vpnFenceAdmission()")
+            assertTrue("$name takes an admission", take >= 0)
+            assertTrue("$name asks it at execution", body.indexOf("vpnFenceAdmits(admission)") > take)
+            assertTrue("$name queues after taking it", take < body.indexOf("runOnDevice("))
+        }
+        // the start intent carries it and the service asks it
+        val start = function(app, "    fun startVpnService(")
+        assertTrue(start.contains("val admission = vpnFenceAdmission()"))
+        assertTrue(start.contains("admission == null"))
+        assertTrue(start.contains("putExtra(VPN_START_FENCE_EPOCH_EXTRA, admission)"))
+        val onStart = function(service, "    override fun onStartCommand(")
+        assertTrue(onStart.contains("VPN_START_FENCE_EPOCH_EXTRA"))
+        assertTrue(onStart.contains("vpnStartEpochAdmitted(carriedEpoch) { app.vpnFenceAdmits(it) }"))
+        // the scheduled foreground retry
+        val retry = function(app, "    private fun scheduleVpnStartRetry(")
+        assertTrue(retry.contains("val admission = vpnFenceAdmission()"))
+        assertTrue(retry.contains("!vpnFenceAdmits(admission)"))
+        // the TUN retry and the build that ends in establish()
+        val tunnelSchedule = service.substring(service.indexOf("private fun scheduleTunnelRetry("))
+        val runnable = tunnelSchedule.substring(
+            tunnelSchedule.indexOf("val admission ="),
+            tunnelSchedule.indexOf("tunnelRetryRunnable = runnable"),
+        )
+        assertTrue(runnable.contains("!app.vpnFenceAdmits(admission)"))
+        val update = function(service, "    private fun updatePfd(")
+        assertTrue(update.indexOf("val admission = app.vpnFenceAdmission()") in 0 until update.indexOf("builder.setSession"))
+        assertTrue(update.contains("!app.vpnFenceAdmits(admission)"))
+    }
+
+    @Test
+    fun aRevokeInvalidatesWhatWasAlreadyPendingBeforeAnyEarlyReturn() {
+        val app = source("MainApplication.kt")
+        val revoked = function(app, "    fun vpnServiceRevoked(")
+        val invalidate = revoked.indexOf("invalidatePendingVpnStarts()")
+        assertTrue(invalidate > revoked.lastIndexOf("revokeFence.raise()"))
+        assertTrue(invalidate < revoked.indexOf("device ?: return"))
+        val body = function(app, "    private fun invalidatePendingVpnStarts(")
+        for (piece in listOf(
+            "cancelVpnStartRetry()", "cancelVpnStartAdoptionWatchdog()", "vpnRequestStart = false",
+            "vpnStartPending = false", "alwaysOnConnectRequestedDevice = null",
+        )) assertTrue(piece, body.contains(piece))
+    }
+
+    /** Deferred posts that carry no state are admitted when they run, by taking the admission then. */
+    @Test
+    fun postedStartsTakeTheirAdmissionWhenTheyRunNotWhenPosted() {
+        val start = function(source("MainApplication.kt"), "    fun startVpnService(")
+        // the repost to main returns before the admission is taken
+        assertTrue(start.indexOf("mainHandler.post { startVpnService() }") < start.indexOf("val admission"))
     }
 
     @Test

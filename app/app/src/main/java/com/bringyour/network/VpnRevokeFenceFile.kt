@@ -6,11 +6,31 @@ import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 
 internal const val VPN_REVOKE_FENCE_FILE = "vpn_revoke_fence"
-private const val RAISED_LINE = "vpn-revoke-fence-v1 raised\n"
-private const val CLEARED_LINE = "vpn-revoke-fence-v1 cleared\n"
+private const val PREFIX = "vpn-revoke-fence-v2"
 
 /**
- * The fence bit as a one-line file, replaced all-or-nothing: the new content is
+ * The epoch of a fence file that exists but cannot be read: far above any
+ * counter the fence has reached, so work admitted under an earlier epoch is
+ * never mistaken for work admitted after this.
+ */
+internal const val VPN_REVOKE_FENCE_UNREADABLE_EPOCH = 1L shl 62
+
+private fun encode(record: VpnRevokeFenceRecord) =
+    "$PREFIX ${if (record.raised) "raised" else "cleared"} ${record.epoch}\n"
+
+private fun decode(text: String): VpnRevokeFenceRecord? {
+    val parts = text.removeSuffix("\n").split(' ')
+    if (!text.endsWith("\n") || parts.size != 3 || parts[0] != PREFIX) return null
+    val epoch = parts[2].toLongOrNull()?.takeIf { it >= 0 } ?: return null
+    return when (parts[1]) {
+        "raised" -> VpnRevokeFenceRecord(true, epoch)
+        "cleared" -> VpnRevokeFenceRecord(false, epoch)
+        else -> null
+    }
+}
+
+/**
+ * The fence record (bit and epoch) as a one-line file, replaced all-or-nothing: the new content is
  * written to a temp file in the same directory, fsynced, renamed over the
  * target (atomic on the same filesystem) and read back. A reader therefore sees
  * the whole old content or the whole new content, never a torn mix.
@@ -30,22 +50,21 @@ internal class VpnRevokeFenceFile(
     private val target get() = File(dir, name)
     private val temp get() = File(dir, "$name.tmp")
 
-    override fun read(): Boolean {
+    override fun read(): VpnRevokeFenceRecord {
         val file = target
-        if (!file.exists()) return false
+        if (!file.exists()) return VpnRevokeFenceRecord(raised = false, epoch = 0)
+        // anything torn, foreign or unreadable: fail closed
+        val unreadable = VpnRevokeFenceRecord(raised = true, epoch = VPN_REVOKE_FENCE_UNREADABLE_EPOCH)
         return try {
-            when (file.readText(Charsets.UTF_8)) {
-                CLEARED_LINE -> false
-                else -> true // RAISED_LINE, or anything torn or foreign: fail closed
-            }
+            decode(file.readText(Charsets.UTF_8)) ?: unreadable
         } catch (_: Exception) {
-            true
+            unreadable
         }
     }
 
-    /** True only when the new bit was renamed into place and read back equal. */
-    override fun write(raised: Boolean): Boolean {
-        val content = if (raised) RAISED_LINE else CLEARED_LINE
+    /** True only when the new record was renamed into place and read back equal. */
+    override fun write(record: VpnRevokeFenceRecord): Boolean {
+        val content = encode(record)
         return try {
             temp.delete() // a leftover from a crash mid-write is never promoted
             FileOutputStream(temp).use { out ->
