@@ -289,6 +289,25 @@ class VpnRevokeFenceTest {
         assertTrue(clear.contains("return cleared"))
     }
 
+    /** Source-text check: the accepted check-then-act windows are named at both sites, with no lock added. */
+    @Test
+    fun theAcceptedEstablishWindowsAreDocumentedAtBothSitesWithoutALock() {
+        val service = source("MainService.kt")
+        val update = function(service, "    private fun updatePfd(")
+        val guard = function(service, "    private fun establishAlwaysOnGuard(")
+        for (body in listOf(update, guard)) {
+            assertTrue(body.contains("ACCEPTED RISK, deliberately not closed"))
+            assertTrue(body.contains("ANR"))
+            assertTrue(body.contains("A device run must show"))
+        }
+        // the premise of both comments: nothing is held across establish()
+        for (body in listOf(update, guard)) {
+            val before = body.substring(0, body.indexOf("builder.establish()"))
+            assertFalse(before.contains("synchronized"))
+            assertFalse(before.contains(".withLock"))
+        }
+    }
+
     @Test
     fun replacementAndDestroyStillTearDown() {
         val service = source("MainService.kt")

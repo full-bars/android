@@ -847,6 +847,20 @@ import kotlin.math.roundToInt
         app.device?.let { device ->
             // the last check before the interface is built: a revoke on the
             // binder thread can land during the configuration above
+            //
+            // ACCEPTED RISK, deliberately not closed: a revoke can still land
+            // between this check and builder.establish() below. Closing it
+            // needs a lock held across establish(), and establish() is a
+            // blocking system call on the main thread (an ANR if the system
+            // is slow); the fence's own lock cannot be held across it. What it
+            // costs: a window of microseconds in which one tunnel can be built
+            // after a revoke. It is not left standing: onRevoke posts stop()
+            // to the main thread, which runs after this call returns and tears
+            // the interface down, and any later reconcilePfd sees the raised
+            // fence and stops too.
+            // A device run must show that (1) a revoke fired during an
+            // updatePfd leaves no interface up once the main looper is idle,
+            // and (2) establish() itself stays well under the ANR budget.
             if (app.vpnRevokeFenced() || !app.vpnFenceAdmits(admission)) {
                 Log.i(TAG, "[service]revoke fence raised before establish; stopping")
                 cancelTunnelRetry()
@@ -978,6 +992,15 @@ import kotlin.math.roundToInt
         // logcat only: the guard also runs before first unlock, where no SDK
         // object may be loaded (see holdDirectBootAlwaysOnGuard)
         Log.i(TAG, privateDnsModeLogLine((application as MainApplication).privateDnsMode.value))
+        // ACCEPTED RISK, deliberately not closed: the fence is asked once at
+        // the top of this function and not again before establish(), so a
+        // revoke landing in between still builds the guard interface. Same
+        // trade as in updatePfd: a lock held across establish() would turn a
+        // microsecond window into main-thread ANR exposure, so there is none.
+        // The guard is the fail-closed interface (it blackholes traffic, it
+        // does not route it), and onRevoke's stop() on the main thread runs
+        // after this call returns and tears it down. A device run must show that a revoke during guard setup leaves no
+        // guard interface up once the main looper is idle.
         val established = try {
             builder.establish()
         } catch (e: Exception) {
