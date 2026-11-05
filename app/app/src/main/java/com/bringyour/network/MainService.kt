@@ -265,6 +265,7 @@ import kotlin.math.roundToInt
             app.ensureApplicationStateInitialized()
         } catch (e: Exception) {
             Log.e(TAG, "[service] application initialization failed after promotion: ${e.message}", e)
+            if (keepRequiredVpnUp("application-init-failure")) return START_REDELIVER_INTENT
             app.vpnServiceDidNotStart(this)
             stop()
             return START_NOT_STICKY
@@ -293,6 +294,10 @@ import kotlin.math.roundToInt
                     "systemStart=$systemStart appActive=${app.serviceActive} " +
                     "deviceRequiresVpn=$deviceRequiresVpn",
             )
+            // Only a stale intent ("obsolete flow") may be held; the user's stop,
+            // an incompatible command and the revoke fence always stop.
+            val obsoleteFlow = !stop && start && commandCompatible && !revokeFenced
+            if (obsoleteFlow && keepRequiredVpnUp("obsolete-flow")) return START_REDELIVER_INTENT
             if (app.service?.get() !== this) {
                 app.vpnServiceDidNotStart(this, retryRequested = false)
             }
@@ -1251,6 +1256,42 @@ import kotlin.math.roundToInt
 //        Sdk.freeMemory()
 //    }
 
+    /**
+     * An internal stop of a promoted service (a stale start, the close monitor,
+     * an init failure) must not end a required VPN while the app is in the
+     * background: nothing can start the service again from there. Tear the flow
+     * down and schedule the bounded CONFIGURATION retry, keeping the service
+     * and its foreground notification. Returns false when the service should
+     * stop as before (not required, no device, not the adopted service, revoke
+     * fence). Main thread only.
+     */
+    private fun keepRequiredVpnUp(reason: String): Boolean {
+        val app = application as MainApplication
+        val device = boundDevice
+        val decision = decideInternalStop(
+            foregroundPromoted = foregroundPromotionSucceeded,
+            ownsService = !stopping && app.service?.get() === this,
+            deviceBound = device != null,
+            revokeFenced = app.vpnRevokeFenced(),
+            provideEnabled = device?.provideEnabled ?: false,
+            connectEnabled = device?.connectEnabled ?: false,
+            routeLocal = device?.routeLocal ?: true,
+        )
+        if (decision != VpnInternalStopDecision.KEEP_AND_RETRY || device == null) return false
+        Log.i(TAG, "[service]internal stop ($reason) held: VPN still required; retrying TUN")
+        val endedPacketFlow = packetFlow
+        packetFlow = null
+        appliedTunnelConfiguration = null
+        endedPacketFlow?.close()
+        device.tunnelStarted = false
+        scheduleTunnelRetry(
+            TunnelRetryKind.CONFIGURATION,
+            desiredTunnelConfiguration(),
+            "internal-stop-$reason",
+        )
+        return true
+    }
+
     fun stop() {
         if (Looper.myLooper() != mainLooper) {
             mainHandler.post { stop() }
@@ -1512,7 +1553,7 @@ import kotlin.math.roundToInt
                 Handler(mainLooper).post {
                     // Only stop if no newer monitor has been started since this one.
                     if (closeMonitorGeneration.get() == generation) {
-                        stop()
+                        if (!keepRequiredVpnUp("close-monitor")) stop()
                         closeMonitorStarted = false
                     }
                 }

@@ -227,3 +227,39 @@ internal enum class VpnReconnectEntry {
 /** Whether `entry` may reconnect while the revoke fence is [raised]. */
 internal fun vpnReconnectAllowed(entry: VpnReconnectEntry, raised: Boolean): Boolean =
     !raised || entry == VpnReconnectEntry.USER_CONNECT
+
+internal enum class VpnInternalStopDecision {
+    STOP,
+    /** Tear the flow down, keep the service and its notification, retry the TUN. */
+    KEEP_AND_RETRY,
+}
+
+/**
+ * Whether a promoted service stops itself or stays up and retries the TUN.
+ * A required VPN (provide, connect or the kill switch) must not lose its
+ * foreground service to an internal stop while the app is backgrounded: the
+ * app cannot start it again from there. Not covered, and not asked here:
+ * replacement, onDestroy, the user's disconnect, the revoke fence, and a
+ * missing device (nothing to run, and the retry needs an adopted
+ * service with a configuration).
+ */
+internal fun decideInternalStop(
+    foregroundPromoted: Boolean,
+    ownsService: Boolean,
+    deviceBound: Boolean,
+    revokeFenced: Boolean,
+    provideEnabled: Boolean,
+    connectEnabled: Boolean,
+    routeLocal: Boolean,
+): VpnInternalStopDecision =
+    if (
+        foregroundPromoted &&
+        ownsService &&
+        deviceBound &&
+        !revokeFenced &&
+        vpnServiceRequired(provideEnabled, connectEnabled, routeLocal)
+    ) {
+        VpnInternalStopDecision.KEEP_AND_RETRY
+    } else {
+        VpnInternalStopDecision.STOP
+    }
