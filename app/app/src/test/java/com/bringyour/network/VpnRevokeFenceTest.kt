@@ -166,6 +166,21 @@ class VpnRevokeFenceTest {
     }
 
     @Test
+    fun aPendingTunnelRetryAsksTheFenceWhenItRuns() {
+        val service = source("MainService.kt")
+        val schedule = service.substring(service.indexOf("private fun scheduleTunnelRetry("))
+        val runnable = schedule.substring(schedule.indexOf("runnable = Runnable {"), schedule.indexOf("tunnelRetryRunnable = runnable"))
+        val check = runnable.indexOf("app.vpnRevokeFenced()")
+        assertTrue(0 <= check)
+        // before either retry kind acts
+        assertTrue(check < runnable.indexOf("when (kind)"))
+        assertTrue(check < runnable.indexOf("updatePfd(configuration)"))
+        // and updatePfd checks once more right before it builds the interface
+        val update = function(service, "    private fun updatePfd(")
+        assertTrue(update.indexOf("vpnRevokeFenced()") in 0 until update.indexOf("val pfd = try"))
+    }
+
+    @Test
     fun aRevokeDropsTheBalanceRecoveryBeforeAnyEarlyReturn() {
         val revoked = function(source("MainApplication.kt"), "    fun vpnServiceRevoked(")
         val clear = revoked.indexOf("clearBalanceRecovery()")

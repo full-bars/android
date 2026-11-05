@@ -606,6 +606,13 @@ import kotlin.math.roundToInt
             tunnelRetryRunnable = null
             val app = application as MainApplication
             if (stopping || app.service?.get() !== this) return@Runnable
+            // asked again at execution: an off-main revoke can raise the fence
+            // while this retry waits, and reconcilePfd stops on a raised fence
+            if (app.vpnRevokeFenced()) {
+                cancelTunnelRetry()
+                reconcilePfd()
+                return@Runnable
+            }
             when (kind) {
                 TunnelRetryKind.ALWAYS_ON_GUARD -> {
                     if (alwaysOnGuardRequired(app, boundDevice?.let { desiredTunnelConfiguration() })) {
@@ -827,6 +834,14 @@ import kotlin.math.roundToInt
             }
             }
         app.device?.let { device ->
+            // the last check before the interface is built: a revoke on the
+            // binder thread can land during the configuration above
+            if (app.vpnRevokeFenced()) {
+                Log.i(TAG, "[service]revoke fence raised before establish; stopping")
+                cancelTunnelRetry()
+                stop()
+                return
+            }
             // Uploaded logs then show whether strict Private DNS (DoT) was in
             // force for a "connected but no DNS" report (see PrivateDnsMode).
             // Written to the sdk log too, which is what feedback uploads.
