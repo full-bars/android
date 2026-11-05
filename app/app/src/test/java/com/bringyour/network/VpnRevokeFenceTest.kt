@@ -218,6 +218,16 @@ class VpnRevokeFenceTest {
         assertTrue(clearing.isNotEmpty())
     }
 
+    /** Source-text check: a clear that did not land is returned and surfaced, not swallowed. */
+    @Test
+    fun aClearThatDidNotLandIsSurfacedNotSwallowed() {
+        val clear = function(source("MainApplication.kt"), "    fun clearVpnRevokeFence(")
+        assertTrue(clear.contains("val cleared = revokeFence.clear()"))
+        assertTrue(clear.contains("vpnRevokeFenceClearFailed.value = !cleared"))
+        assertTrue(clear.contains("Log.e("))
+        assertTrue(clear.contains("return cleared"))
+    }
+
     @Test
     fun replacementAndDestroyStillTearDown() {
         val service = source("MainService.kt")

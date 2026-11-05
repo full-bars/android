@@ -472,9 +472,25 @@ class MainApplication : Application() {
 
     internal fun vpnRevokeFenced(): Boolean = revokeFence.raised
 
-    /** The user's explicit connect: the only thing that clears the revoke fence. */
-    fun clearVpnRevokeFence() {
-        revokeFence.clear()
+    /**
+     * Set when a clear did not reach the disk. The fence stays raised then
+     * (fail closed), so the user's connect starts nothing until a later one
+     * lands; the UI can show this instead of a connect that silently does not
+     * come up.
+     */
+    val vpnRevokeFenceClearFailed = kotlinx.coroutines.flow.MutableStateFlow(false)
+
+    /**
+     * The user's explicit connect: the only thing that clears the revoke fence.
+     * False when the clear did not land: the fence is still raised.
+     */
+    fun clearVpnRevokeFence(): Boolean {
+        val cleared = revokeFence.clear()
+        vpnRevokeFenceClearFailed.value = !cleared
+        if (!cleared) {
+            Log.e(TAG, "revoke fence clear did not reach disk; the fence stays raised")
+        }
+        return cleared
     }
 
     /** The reconnect-tunnel action: clears the fence, then starts the service. */
