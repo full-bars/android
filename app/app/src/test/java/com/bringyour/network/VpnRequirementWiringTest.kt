@@ -63,8 +63,8 @@ class VpnRequirementWiringTest {
 
     @Test
     fun aProvideModeChangeAsksForAReconcile() {
-        // turning providing off while the provider is already detached fires no
-        // provideChanged event, so the mode change itself has to trigger one
+        // the SDK's provideChanged already fires on a mode change today; this
+        // subscription keeps the reconcile working if that ever stops being true
         val app = source("MainApplication.kt")
         assertTrue(app.contains("addProvideModeChangeListener"))
         assertTrue(app.contains("deviceProvideModeSub"))

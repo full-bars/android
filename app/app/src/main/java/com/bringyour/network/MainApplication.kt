@@ -2605,10 +2605,9 @@ class MainApplication : Application() {
                 updateVpnService()
             }
         }
-        // the requirement now follows the MODE, so a mode change has to ask for a
-        // reconcile itself: turning providing off while the provider is already
-        // detached (a rotation or a budget wait) fires no provideChanged event,
-        // and without this the VPN would stay up after the operator turned it off
+        // the SDK does fire provideChanged on a mode change (applyProvideModeWithLock
+        // publishes both events), so this subscription is a safeguard rather than
+        // the only trigger: it keeps the reconcile independent of that detail
         deviceProvideModeSub = device?.addProvideModeChangeListener {
             Handler(mainLooper).post {
                 updateVpnService()
