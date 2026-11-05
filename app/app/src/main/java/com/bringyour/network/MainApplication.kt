@@ -2487,6 +2487,10 @@ class MainApplication : Application() {
         // down the device; it must not restart the service after logout.
         vpnServiceUpdateGeneration += 1
         vpnServiceUpdatePosted = false
+        // a new session starts without a remembered provide edge: a stale true
+        // here would either write a false "provider restored" or swallow the
+        // next session's "without provider" edge
+        provideIntentWithoutProvider = false
         resetTunnelRecoveryState()
         stopVpnService("logout")
 
@@ -2769,14 +2773,21 @@ class MainApplication : Application() {
         // when the intent says provide and nothing is providing, the VPN is still
         // required but the operator should be able to see why: one ring entry per
         // edge, so the next capture separates a rotation from a permanent refusal
-        val intentWithoutProvider = inputs.provideMode != inputs.provideModeNone && !inputs.provideEnabled
-        if (intentWithoutProvider != provideIntentWithoutProvider) {
-            provideIntentWithoutProvider = intentWithoutProvider
+        val edge = provideEdge(
+            previous = provideIntentWithoutProvider,
+            provideMode = inputs.provideMode,
+            provideModeNone = inputs.provideModeNone,
+            provideEnabled = inputs.provideEnabled,
+        )
+        if (edge.event != null) {
+            provideIntentWithoutProvider = edge.intentWithoutProvider
             VpnLifecycleLog.record(
                 { createDeviceProtectedStorageContext().filesDir },
-                if (intentWithoutProvider) "provide intent without provider" else "provider restored",
+                edge.event,
                 "inputs=$inputs",
             )
+        } else {
+            provideIntentWithoutProvider = edge.intentWithoutProvider
         }
         if (systemAlwaysOnVpn || inputs.required()) {
             startVpnService()
