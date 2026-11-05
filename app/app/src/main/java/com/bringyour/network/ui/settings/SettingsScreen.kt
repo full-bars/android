@@ -55,6 +55,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.rememberCoroutineScope
@@ -129,7 +130,9 @@ import com.solana.mobilewalletadapter.clientlib.Solana
 import com.solana.mobilewalletadapter.clientlib.TransactionResult
 import com.solana.mobilewalletadapter.clientlib.successPayload
 import com.solana.publickey.SolanaPublicKey
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.Date
 import androidx.core.net.toUri
 import androidx.lifecycle.Lifecycle
@@ -1689,7 +1692,13 @@ private fun SettingsScreen(
             // device is unsaved: the phrase can't be recovered once the key goes
             // with the account
             val deletedNetworkId = remember { BittensorKeySignOut.networkId(context) }
-            val keyNeedsBackup = remember { BittensorKeySignOut.needsBackup(context, deletedNetworkId) }
+            val keyNeedsBackup by produceState<Boolean?>(initialValue = null, deletedNetworkId) {
+                value = withContext(Dispatchers.IO) {
+                    // a read that fails is treated as unsaved: the warning is the
+                    // safe side of not knowing, and the dialog never stays locked
+                    runCatching { BittensorKeySignOut.needsBackup(context, deletedNetworkId) }.getOrDefault(true)
+                }
+            }
 
             FoldSafeBasicAlertDialog(
                 onDismissRequest = {
@@ -1733,7 +1742,7 @@ private fun SettingsScreen(
                             )
                         }
 
-                        if (keyNeedsBackup) {
+                        if (keyNeedsBackup == true) {
                             Spacer(modifier = Modifier.height(8.dp))
 
                             Row {
@@ -1779,7 +1788,7 @@ private fun SettingsScreen(
 
                         Spacer(modifier = Modifier.height(16.dp))
 
-                        if (keyNeedsBackup) {
+                        if (keyNeedsBackup == true) {
                             URButton(
                                 onClick = {
                                     setShowDeleteAccountDialog(false)
@@ -1853,7 +1862,7 @@ private fun SettingsScreen(
                                     )
                                 },
                                 style = ButtonStyle.WARNING,
-                                enabled = deleteConfirmed && !isDeletingAccount,
+                                enabled = deleteConfirmed && keyNeedsBackup != null && !isDeletingAccount,
                                 isProcessing = isDeletingAccount,
                                 modifier = Modifier.weight(1f)
                             ) { buttonTextStyle ->
