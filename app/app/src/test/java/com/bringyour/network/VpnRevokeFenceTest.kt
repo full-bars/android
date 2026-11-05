@@ -327,7 +327,7 @@ class VpnRevokeFenceTest {
         val reconcile = function(service, "    private fun reconcilePfd(")
         assertTrue(reconcile.contains("device unavailable outside Always-on; stopping"))
         val monitor = service.substring(service.indexOf("private fun startCloseMonitor("))
-        assertTrue(monitor.contains("stop()"))
+        assertTrue(Regex("""\bstop\(""").containsMatchIn(monitor))
         assertFalse(monitor.contains("scheduleTunnelRetry"))
     }
 }
