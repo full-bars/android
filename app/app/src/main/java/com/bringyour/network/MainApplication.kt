@@ -203,6 +203,9 @@ class MainApplication : Application() {
 
 //    var byDevice: BringYourDevice? = null
     var deviceProvideSub: Sub? = null
+    var deviceProvideModeSub: Sub? = null
+    /** True while the operator's intent says provide and no provider is up. */
+    var provideIntentWithoutProvider: Boolean = false
     var deviceProvidePausedSub: Sub? = null
 
     var deviceProvideNetworkSub: Sub? = null
@@ -2485,7 +2488,7 @@ class MainApplication : Application() {
         vpnServiceUpdateGeneration += 1
         vpnServiceUpdatePosted = false
         resetTunnelRecoveryState()
-        stopVpnService()
+        stopVpnService("logout")
 
         removeNetworkCallback()
         removeOfflineCallback()
@@ -2498,6 +2501,8 @@ class MainApplication : Application() {
 //        router = null
         deviceProvideSub?.close()
         deviceProvideSub = null
+        deviceProvideModeSub?.close()
+        deviceProvideModeSub = null
         deviceProvidePausedSub?.close()
         deviceProvidePausedSub = null
         deviceProvideNetworkSub?.close()
@@ -2592,6 +2597,15 @@ class MainApplication : Application() {
             }
         }
         deviceProvideSub = device?.addProvideChangeListener {
+            Handler(mainLooper).post {
+                updateVpnService()
+            }
+        }
+        // the requirement now follows the MODE, so a mode change has to ask for a
+        // reconcile itself: turning providing off while the provider is already
+        // detached (a rotation or a budget wait) fires no provideChanged event,
+        // and without this the VPN would stay up after the operator turned it off
+        deviceProvideModeSub = device?.addProvideModeChangeListener {
             Handler(mainLooper).post {
                 updateVpnService()
             }
@@ -2736,7 +2750,7 @@ class MainApplication : Application() {
 
         if (!vpnReconnectPermitted(VpnReconnectEntry.RECONCILE)) {
             // revoke leaves provide enabled; do not let it restart the service
-            stopVpnService(ignoreAlwaysOn = true)
+            stopVpnService("revoke fence", ignoreAlwaysOn = true)
             return
         }
         if (systemAlwaysOnVpn) {
@@ -2752,11 +2766,23 @@ class MainApplication : Application() {
         // remote-user NAT while the operator's intent is unchanged, and reading
         // the pointer there stopped a VPN nobody asked to turn off.
         val inputs = vpnRequirementInputs(device)
+        // when the intent says provide and nothing is providing, the VPN is still
+        // required but the operator should be able to see why: one ring entry per
+        // edge, so the next capture separates a rotation from a permanent refusal
+        val intentWithoutProvider = inputs.provideMode != inputs.provideModeNone && !inputs.provideEnabled
+        if (intentWithoutProvider != provideIntentWithoutProvider) {
+            provideIntentWithoutProvider = intentWithoutProvider
+            VpnLifecycleLog.record(
+                { createDeviceProtectedStorageContext().filesDir },
+                if (intentWithoutProvider) "provide intent without provider" else "provider restored",
+                "inputs=$inputs",
+            )
+        }
         if (systemAlwaysOnVpn || inputs.required()) {
             startVpnService()
         } else {
             Log.i(TAG, "[service] app no longer requires VPN: $inputs")
-            stopVpnService()
+            stopVpnService("not required: $inputs")
         }
     }
 
@@ -3256,7 +3282,7 @@ class MainApplication : Application() {
         }
     }
 
-    private fun stopVpnService(ignoreAlwaysOn: Boolean = false) {
+    private fun stopVpnService(reason: String = "app no longer requires VPN", ignoreAlwaysOn: Boolean = false) {
         cancelVpnStartAdoptionWatchdog()
         cancelVpnStartRetry()
         vpnRequestStart = false
@@ -3282,7 +3308,7 @@ class MainApplication : Application() {
 
         if (serviceActive) {
             serviceActive = false
-            service?.get()?.stop("app no longer requires VPN")
+            service?.get()?.stop(reason)
             synchronized(serviceActiveMonitor) {
                 serviceActiveMonitor.notifyAll()
             }
@@ -3327,6 +3353,6 @@ class MainApplication : Application() {
         vpnIntent.putExtra("start", false)
         stopService(vpnIntent)
 
-        stopVpnService()
+        stopVpnService("force stop")
     }
 }

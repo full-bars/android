@@ -550,7 +550,7 @@ import kotlin.math.roundToInt
         if (app.vpnRevokeFenced()) {
             // the user revoked the VPN: neither a tunnel nor the guard comes back
             Log.i(TAG, "[service]revoke fence raised; stopping")
-            stop()
+            stop("revoke fence")
             return
         }
         // null exactly when no device is bound
@@ -876,7 +876,7 @@ import kotlin.math.roundToInt
             if (app.vpnRevokeFenced() || !app.vpnFenceAdmits(admission)) {
                 Log.i(TAG, "[service]revoke fence raised before establish; stopping")
                 cancelTunnelRetry()
-                stop()
+                stop("revoke fence")
                 return
             }
             // Uploaded logs then show whether strict Private DNS (DoT) was in
