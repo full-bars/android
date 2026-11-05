@@ -60,8 +60,13 @@ class VpnRevokeDisconnectWiringTest {
 
     @Test
     fun theReconcileCountsAQueuedDisconnect() {
-        val reconcile = function(source("MainApplication.kt"), "    private fun reconcileVpnService(")
-        assertTrue(reconcile.contains("connectCommands.connectRequested("))
+        // the queued disconnect must still count; the reconcile now decides
+        // through the shared snapshot, so the pending request is read there
+        val app = source("MainApplication.kt")
+        val inputs = function(app, "    internal fun vpnRequirementInputs(")
+        assertTrue(inputs.contains("connectCommands.connectRequested("))
+        assertFalse("the snapshot reads only the device", inputs.contains("current.connectEnabled"))
+        val reconcile = function(app, "    private fun reconcileVpnService(")
         assertFalse("the reconcile reads only the device", reconcile.contains("device.connectEnabled"))
     }
 }
