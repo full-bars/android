@@ -3,8 +3,13 @@ package com.bringyour.network.ui.connect.providerlocations
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.bringyour.network.DeviceManager
+import com.bringyour.network.ui.connect.extenderColorArgb
+import com.bringyour.network.ui.connect.extenderCommaSeparatedValues
+import com.bringyour.sdk.ConnectLocation
+import com.bringyour.sdk.ConnectLocationId
 import com.bringyour.sdk.DeviceLocal
 import com.bringyour.sdk.ProviderLocationsViewController
+import com.bringyour.sdk.Sdk
 import com.bringyour.sdk.Sub
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -31,9 +36,42 @@ data class ProviderLocationRow(
     val lat: Double?,
     val lon: Double?,
     val connectedSinceMillis: Long,
+    // the sdk's address-family category ("dualstack", "v4-only", "v6-only")
+    // and its short label ("both", "v4", "v6"); legacy reads as v4-only
+    val ipFamily: String = "",
+    val ipFamilyLabel: String = "",
+    // the extenders carrying this client's connection to the provider right
+    // now (connect/EXTENDER.md K1), in the sdk's order: none over a direct or
+    // p2p route, one through an extender, briefly two across a transport
+    // migration. Part of the row's value, so a migration, which changes
+    // nothing else, still republishes the row
+    val extenders: List<ProviderExtender> = listOf(),
 ) {
     val plottable: Boolean get() = lat != null && lon != null
+
+    // the extenders' ring colors as the dots draw them (K3), parsed once per
+    // row; a color that does not parse gets no ring, as on the connect grid
+    val extenderRingArgb: List<Int> = extenders.mapNotNull { extenderColorArgb(it.colorHex) }
 }
+
+/**
+ * One extender on a provider's route: its address, which is the extender's id
+ * on the provider rows (EXTENDER.md K9), and the sdk's color for it (K3).
+ */
+data class ProviderExtender(
+    val ip: String,
+    val colorHex: String,
+)
+
+/**
+ * Pairs the sdk's comma separated extender addresses and colors by index (K1,
+ * K3). The sdk keeps the two lists the same length; if they ever differ, the
+ * unpaired tail is dropped rather than drawn in a made-up color.
+ */
+fun providerExtenders(ips: String?, colorHexes: String?): List<ProviderExtender> =
+    extenderCommaSeparatedValues(ips).zip(extenderCommaSeparatedValues(colorHexes)) { ip, colorHex ->
+        ProviderExtender(ip = ip, colorHex = colorHex)
+    }
 
 @HiltViewModel
 class ProviderLocationsViewModel @Inject constructor(
@@ -128,6 +166,12 @@ class ProviderLocationsViewModel @Inject constructor(
                         lat = lat,
                         lon = lon,
                         connectedSinceMillis = location.connectedSinceMillis,
+                        ipFamily = location.ipFamily,
+                        ipFamilyLabel = location.ipFamilyLabel,
+                        extenders = providerExtenders(
+                            ips = location.extenderIps,
+                            colorHexes = location.extenderColorHexes,
+                        ),
                     )
                 )
             }
@@ -171,6 +215,32 @@ class ProviderLocationsViewModel @Inject constructor(
     fun removeProvider(clientId: String) {
         _providerLocations.value = _providerLocations.value.filter { it.clientId != clientId }
         vc?.removeProvider(clientId)
+    }
+
+    /**
+     * The location "Stay on this exit" connects to: this provider alone, by
+     * client id (see [stayOnExitTarget]). Null when the row has no client id.
+     */
+    fun stayOnExitLocation(row: ProviderLocationRow): ConnectLocation? {
+        val target = stayOnExitTarget(row) ?: return null
+        val clientId = try {
+            Sdk.parseId(target.clientId)
+        } catch (e: Exception) {
+            return null
+        }
+        val location = ConnectLocation()
+        val locationId = ConnectLocationId()
+        locationId.clientId = clientId
+        location.connectLocationId = locationId
+        location.name = target.name
+        location.city = target.city
+        location.region = target.region
+        location.country = target.country
+        location.countryCode = target.countryCode
+        // a public exit of the current connection, not one of the user's own
+        // devices, so it keeps the public provide mode it carries traffic under
+        location.networkPeer = false
+        return location
     }
 
     override fun onCleared() {

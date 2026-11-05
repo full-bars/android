@@ -8,6 +8,7 @@ import androidx.lifecycle.viewModelScope
 import com.bringyour.network.APP_LOG_PROCESS_NAME
 import com.bringyour.network.DeviceManager
 import com.bringyour.network.NetworkSpaceManagerProvider
+import com.bringyour.network.clearDiagnosticsLogs
 import com.bringyour.network.R
 import com.bringyour.network.utils.formatByteCountCompact
 import com.bringyour.sdk.Exit
@@ -64,7 +65,7 @@ class DeveloperViewModel @Inject constructor(
         private set
 
     /**
-     * What the last export produced, as NUMBERS rather than a finished
+     * What the last export produced, as numbers rather than a finished
      * sentence -- see [DiagnosticExportSummary]. The screen renders it, which
      * is the only place a `<plurals>` resource can be resolved from.
      */
@@ -72,7 +73,7 @@ class DeveloperViewModel @Inject constructor(
         private set
 
     /**
-     * The verbosity the DEVICE reports it is logging at, or null when there is
+     * The verbosity the device reports it is logging at, or null when there is
      * no device to ask (signed out, or before one has been created).
      *
      * Read back from the device rather than remembered from the last tap. The
@@ -89,7 +90,7 @@ class DeveloperViewModel @Inject constructor(
      * The control-plane address family policy this process reports, and what
      * the sdk has learned on its own.
      *
-     * NOT nullable, unlike [logVerbosity]. The policy is process-global sdk
+     * Not nullable, unlike [logVerbosity]. The policy is process-global sdk
      * state that is always answerable -- there is no device to ask and
      * therefore no "unavailable" -- and the row has to work signed out and
      * with the tunnel down, because those are the states a user is in when
@@ -123,7 +124,7 @@ class DeveloperViewModel @Inject constructor(
      * Sources the exporter will not be able to read, as "<source>: <reason>",
      * refreshed off the main thread whenever the inventory is.
      *
-     * The export ui shows any unavailable source with its reason BEFORE the
+     * The export ui shows any unavailable source with its reason before the
      * user commits to an export, not only afterwards in the summary --
      * learning that the logs were unreachable after zipping them is not
      * graceful degradation, it is a report of it.
@@ -136,7 +137,7 @@ class DeveloperViewModel @Inject constructor(
      *
      * Two things need it. (1) Re-entrancy: [diagnosticBundleFileName] has
      * one-second resolution and only a `-redacted` discriminator, so two
-     * exports of the same mode inside one second name the SAME file and the
+     * exports of the same mode inside one second name the same file and the
      * second os.Create truncates the zip the first is still streaming into --
      * the share sheet then hands support a corrupt archive. (2) Feedback: a
      * full export takes many seconds, and with nothing on screen to show for
@@ -149,11 +150,15 @@ class DeveloperViewModel @Inject constructor(
     var refreshingDiagnostics by mutableStateOf(false)
         private set
 
+    /** True while clearing diagnostics logs. */
+    var clearingLogs by mutableStateOf(false)
+        private set
+
     /**
      * A finished bundle waiting to be handed to the share sheet, consumed by
      * the screen via [consumePendingShare].
      *
-     * The export deliberately does NOT take a completion lambda: the one the
+     * The export deliberately does not take a completion lambda: the one the
      * screen would pass captures the composition's Activity, so a viewmodel
      * that outlives a rotation would call startActivity on a destroyed one and
      * would hold it alive for the whole export. Handing back state instead
@@ -174,7 +179,7 @@ class DeveloperViewModel @Inject constructor(
     /**
      * Writes a diagnostic bundle into destDir and leaves it in [pendingShare]
      * for the screen to hand to the share sheet; a failure to write it at all
-     * is reported in [lastExport]. A source that could not be READ is not a
+     * is reported in [lastExport]. A source that could not be read is not a
      * failure: it is recorded inside the bundle, listed in
      * [unavailableSources] before the export, and repeated in [lastExport]
      * after it.
@@ -218,10 +223,10 @@ class DeveloperViewModel @Inject constructor(
     /**
      * The picker's export, and the only caller that may pass a selection.
      *
-     * Separate from [exportDiagnostics] because an EMPTY selection must never
+     * Separate from [exportDiagnostics] because an empty selection must never
      * reach the sdk from this control: empty SelectedNames means "no filter"
      * there, so "Export selected" with nothing checked would produce a
-     * complete RAW bundle -- every severity, every rotation, plus the logcat
+     * complete raw bundle -- every severity, every rotation, plus the logcat
      * dump and a manifest carrying client_id and instance_id in the clear --
      * under a label promising a narrow subset. The row is disabled in that
      * state as well; this is the second guard, so no future caller can
@@ -270,7 +275,7 @@ class DeveloperViewModel @Inject constructor(
 
             deviceManager.device?.let { options.setManifestJson(it.diagnosticManifestJson()) }
 
-            // A source that cannot be read is RECORDED as missing, not silently
+            // A source that cannot be read is recorded as missing, not silently
             // omitted. The sdk cannot do this for us -- LogInventory swallows
             // directory-read failures and ExportDiagnosticBundle only ever
             // learns about per-FILE open/stat errors -- so without this an
@@ -286,7 +291,7 @@ class DeveloperViewModel @Inject constructor(
             if (logcatText != null) {
                 options.addPlatformLog(LOGCAT_LOG_NAME, logcatText)
             } else {
-                // Recorded as a missing SOURCE rather than written as the body
+                // Recorded as a missing source rather than written as the body
                 // of platform/logcat.txt: a failure stored inside the file it
                 // was supposed to fill never reaches README.txt's NOT INCLUDED
                 // list, the ExportResult, or the summary on screen.
@@ -397,6 +402,27 @@ class DeveloperViewModel @Inject constructor(
         }
     }
 
+    /**
+     * Clears only diagnostics logs off the main thread, leaving all application
+     * settings, databases, and preferences intact.
+     */
+    fun clearLogs(filesDir: File) {
+        if (clearingLogs) {
+            return
+        }
+        clearingLogs = true
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    clearDiagnosticsLogs(filesDir)
+                }
+                refreshDiagnostics()
+            } finally {
+                clearingLogs = false
+            }
+        }
+    }
+
     private fun readLogInventory(): List<LogRow> {
         val list = Sdk.logInventory()
         return (0 until list.len()).map { i ->
@@ -415,7 +441,7 @@ class DeveloperViewModel @Inject constructor(
      * Raises or lowers the verbosity of the process that actually writes the
      * logs worth raising it for.
      *
-     * Always through the DEVICE, never Sdk.setLogVerbosity: that one reaches
+     * Always through the device, never Sdk.setLogVerbosity: that one reaches
      * only the calling process, and the transport internals, contract
      * accounting and window diagnostics are written by the process the device
      * runs in. Device.SetLogVerbosity is the one that reaches it -- on android
@@ -423,7 +449,7 @@ class DeveloperViewModel @Inject constructor(
      * same call carries the level across to the extension the transport runs
      * in. Going through the device is what keeps the two honest.
      *
-     * The level is then READ BACK from the device rather than assumed. The sdk
+     * The level is then read back from the device rather than assumed. The sdk
      * clamps out-of-range values and a hosted device refuses the call
      * outright, neither of which throws. Reading back is what makes a set that
      * did not take visible.
@@ -440,11 +466,10 @@ class DeveloperViewModel @Inject constructor(
      *
      * THREE-way, not two. The device carries the policy furthest (on the
      * other platform binding the same call reaches the packet tunnel
-     * extension), the network space sets this process AND records the choice
+     * extension), the network space sets this process and records the choice
      * for the next launch, and the process-global setter is the last resort
      * that at least puts the choice in force for this session. Signed out
-     * there is no device and therefore -- see DeviceManager.networkSpace,
-     * which is `device?.networkSpace` -- no space through the device either,
+     * there is no device and therefore no space through the device either,
      * which is why the space is fetched from the provider.
      *
      * Read back from the sdk rather than assumed: it clamps out-of-range
@@ -477,7 +502,7 @@ class DeveloperViewModel @Inject constructor(
         // Polled with the rest of the readout rather than cached from the last
         // tap: the flag lives in the device's process and the restore a device
         // runs at construction can move it under us. A stale "Verbose" here is
-        // the one lie this control cannot afford. Read BEFORE the null guard
+        // the one lie this control cannot afford. Read before the null guard
         // below, so signing out clears the level to "Unavailable" instead of
         // leaving the last device's reading on screen.
         logVerbosity = device?.getLogVerbosity()
@@ -578,7 +603,7 @@ class DeveloperViewModel @Inject constructor(
      */
     /**
      * Keeps a site's new flows on the exit its earlier flows already use, even
-     * past the flow cap -- the cap then only gates which exits collect NEW
+     * past the flow cap -- the cap then only gates which exits collect new
      * sites. This is what holds a busy site (video especially) to one egress
      * ip. Off restores the cap veto, the A/B point.
      */
@@ -586,9 +611,13 @@ class DeveloperViewModel @Inject constructor(
         update { s -> s.affinityStickyPastCap = sticky }
     }
 
-    /** Restores legacy hard IP/domain inheritance for controlled A/B runs. */
-    val setFreshFlowAffinity: (Boolean) -> Unit = { enabled ->
-        update { s -> s.freshFlowAffinity = enabled }
+    /**
+     * Caps healthy donor reuse by original connection creation age, setup included.
+     * Reuse does not renew its origin. Nonpositive values disable reuse;
+     * warned or unhealthy exits always race.
+     */
+    val setAffinityMaxTimeMillis: (Long) -> Unit = { millis ->
+        update { s -> s.affinityMaxTimeMillis = millis }
     }
 
     /**
@@ -600,20 +629,16 @@ class DeveloperViewModel @Inject constructor(
     }
 
     /**
-     * Lets a quarantined exit keep inheriting new flows from sites already on
-     * it (through the early part of the bench, when the verdict is least
-     * proven), so a bench does not split the site's egress IP. Off restores
-     * the scatter, the A/B point.
+     * Retained compatibility value, not a fresh-flow health override.
+     * Warned or unhealthy donors always yield to a fresh provider race.
      */
     val setQuarantineGroupFollow: (Boolean) -> Unit = { follow ->
         update { s -> s.quarantineGroupFollow = follow }
     }
 
     /**
-     * How long into a quarantine episode a site's new connections keep
-     * following their benched exit. Early benches are usually false alarms;
-     * one that sustains is trending toward removal and stops collecting
-     * flows first. 0 disables the follow.
+     * Retained compatibility duration. It cannot extend ordinary fresh-flow
+     * donor eligibility past a warning or unhealthy verdict.
      */
     val setGroupFollowWindowMillis: (Long) -> Unit = { millis ->
         update { s -> s.groupFollowWindowMillis = millis }
@@ -895,6 +920,9 @@ class DeveloperViewModel @Inject constructor(
         // before the fix -- so each one can still be switched off entirely.
         // the defaults in connect's DefaultMultiClientSettings are marked.
 
+        /** connect default 1 minute; 0 disables ordinary donor reuse. */
+        val AFFINITY_MAX_TIME_PRESETS = listOf(0L, 15_000L, 30_000L, 60_000L, 120_000L, 300_000L)
+
         /** connect default 3s */
         val SEND_STALL_PRESETS = listOf(0L, 1_000L, 2_000L, 3_000L, 5_000L, 10_000L)
 
@@ -989,7 +1017,7 @@ class DeveloperViewModel @Inject constructor(
         val PROBE_TIMEOUT_PRESETS = listOf(0L, 2_000L, 4_000L, 8_000L)
 
         /**
-         * connect default 0 = the ENTIRE health-host table every pass. A
+         * connect default 0 = the entire health-host table every pass. A
          * positive value narrows a pass to a rotating block of that many
          * hosts (4 was the old compact width). Width costs bytes, never wall
          * time -- a pass's probes are all in flight together.
@@ -997,10 +1025,8 @@ class DeveloperViewModel @Inject constructor(
         val PROBE_SAMPLE_PRESETS = listOf(0, 4, 16, 64)
 
         /**
-         * connect default 45s. How long into a bench a site keeps following
-         * its exit; 0 turns the follow off. 45s covers the observed
-         * false-positive bench range (every field acquittal landed inside
-         * ~50s) while stopping before the ~60s drain-to-conviction zone.
+         * Legacy compatibility values only; no preset allows ordinary new
+         * connections to inherit a warned or unhealthy donor.
          */
         val GROUP_FOLLOW_WINDOW_PRESETS = listOf(0L, 15_000L, 45_000L, 90_000L)
 
@@ -1049,7 +1075,7 @@ private data class DiagnosticExportOutcome(val file: File?, val summary: Diagnos
 /**
  * What an export produced, carried as numbers.
  *
- * The count is deliberately NOT formatted here. Built as
+ * The count is deliberately not formatted here. Built as
  * `"Exported ${result.fileCount} log files"` it reads "Exported 1 log files"
  * for the single-file case that a selective export produces most often. Only a
  * `<plurals>` resource can pick the right form, only a composable can resolve
@@ -1080,7 +1106,7 @@ data class DiagnosticExportSummary(
  * `LogVerbosityVerbose`, `LogVerbosityTrace`), as the java `long` gobind binds
  * a Go `int` to.
  *
- * Named for what each one BUYS, because the whole point of the control is that
+ * Named for what each one buys, because the whole point of the control is that
  * the interesting logging is off by default: `connect` gates its contract
  * accounting, transport internals and window diagnostics behind V(1) and V(2),
  * so at level 0 a bundle from a live connected session carries rpc chatter and
@@ -1104,7 +1130,7 @@ val LOG_VERBOSITY_PRESETS = listOf(
 /**
  * The level a tap moves to, wrapping back to Default after Trace.
  *
- * A level that is not one of the presets lands on the FIRST one, matching the
+ * A level that is not one of the presets lands on the first one, matching the
  * other stepper rows on this screen. That is reachable in practice: the sdk
  * reports whatever the `-v` flag says, including a value set past the sdk's
  * own range by other means, and stepping from an unknown value has to go
@@ -1158,7 +1184,7 @@ fun logVerbosityValueLabel(level: Long, name: String): String = "$level · $name
  * ports of real traffic into the logs, which is what the persistent warning on
  * the screen is for.
  *
- * Keyed off the level READ BACK from the device, so the warning is never shown
+ * Keyed off the level read back from the device, so the warning is never shown
  * for a raise that did not actually take, and never hidden for one that did.
  */
 fun logVerbosityRecordsDestinations(level: Long?): Boolean =
@@ -1281,7 +1307,7 @@ fun isDiagnosticBundleName(name: String): Boolean =
     name.startsWith(DIAGNOSTIC_BUNDLE_PREFIX) && name.endsWith(".zip")
 
 /**
- * `logcat -d` dumps and exits. Since android 4.1 an app reads only its OWN
+ * `logcat -d` dumps and exits. Since android 4.1 an app reads only its own
  * buffer, which is exactly the wanted scope -- no permission is involved and
  * no other app's entries are reachable. `-t` bounds the dump to the most
  * recent lines: an unbounded read of a resized buffer is three live copies of
@@ -1310,7 +1336,7 @@ fun readAtMost(reader: java.io.Reader, maxChars: Int): String {
 /**
  * "Export selected" must never fall back to exporting everything: an empty
  * SelectedNames means "no filter" to the sdk ("Empty means every file"), so an
- * unguarded empty selection produces a complete RAW bundle -- every severity,
+ * unguarded empty selection produces a complete raw bundle -- every severity,
  * every rotation, the logcat dump and a manifest carrying client_id and
  * instance_id in the clear -- from a control whose label promises a narrow
  * subset.
@@ -1372,7 +1398,7 @@ fun selectionLabel(fileCount: Int, byteCount: Long): String {
 
 /**
  * When a log was last written, UTC, or "" when unknown. The picker's rows name
- * severity, size AND modified time: which file covers the incident is a
+ * severity, size and modified time: which file covers the incident is a
  * question about time, and the glog file name does not answer it legibly.
  */
 fun logFileModifiedLabel(modifiedMillis: Long): String {

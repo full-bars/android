@@ -21,17 +21,35 @@ import com.bringyour.sdk.WalletAuthArgs
 import com.bringyour.network.ui.LoginNavHost
 import com.bringyour.network.ui.login.BITTENSOR_SIGN_PURPOSE_CONNECT
 import com.bringyour.network.ui.login.BITTENSOR_SIGN_PURPOSE_CREATE
+import com.bringyour.network.ui.login.bittensorFailureUri
+import com.bringyour.network.ui.login.bittensorRefusalMessage
+import com.bringyour.network.ui.login.bittensorProofUri
+import com.bringyour.network.ui.wallet.BittensorProofRequest
+import com.bringyour.network.ui.wallet.BittensorReturnAction
+import com.bringyour.network.ui.wallet.BittensorWallets
+import com.bringyour.network.ui.wallet.bittensorReturnAction
+import com.bringyour.network.ui.wallet.startBittensorBridgeProof
+import com.bringyour.network.ui.wallet.forwardSnConsentReturn
+import com.bringyour.network.ui.wallet.snConsentReturn
 import com.bringyour.network.ui.login.BITTENSOR_SIGN_PURPOSE_LOGIN
 import com.bringyour.network.ui.login.LoginCreateNetworkParams
 import com.bringyour.network.ui.login.LoginViewModel
 import com.bringyour.network.ui.login.launchBittensorSignMessage
 import com.bringyour.network.ui.login.AUTH_JWT_TYPE_APPLE
 import com.bringyour.network.ui.login.AppleOAuthSession
+import com.bringyour.network.ui.login.SsoOAuthReturnRoute
+import com.bringyour.network.ui.login.ssoOAuthReturnRoute
+import com.bringyour.network.ui.settings.bittensorAddReturn
+import com.bringyour.network.ui.settings.forwardSsoAddSignInReturn
+import com.bringyour.network.ui.login.SsoProvider
+import com.bringyour.network.ui.settings.forwardBittensorAddSignInReturn
 import com.bringyour.network.ui.login.appleOAuthUserName
 import com.bringyour.network.ui.login.isAppleOAuthReturn
 import com.bringyour.network.ui.login.ssoJwtPayload
 import com.bringyour.network.ui.login.requestBittensorChallenge
 import com.bringyour.network.ui.wallet.SnWalletConnectExtras
+import com.bringyour.network.ui.wallet.Top200Bindings
+import com.bringyour.network.ui.wallet.forwardTop200SignLink
 import com.bringyour.network.ui.theme.URNetworkTheme
 import com.bringyour.sdk.AuthCodeLoginArgs
 import com.bringyour.sdk.AuthLoginArgs
@@ -50,6 +68,18 @@ class LoginActivity : AppCompatActivity() {
     private var referrerClient: InstallReferrerClient? = null
     private var referralCode by mutableStateOf<String?>(null)
 
+    // the install referrer is read once per install (InstallReferrerCheck)
+    private val installReferrerCheck by lazy {
+        val prefs = getSharedPreferences(INSTALL_REFERRER_PREFS, MODE_PRIVATE)
+        InstallReferrerCheck(object : InstallReferrerCheck.Store {
+            override fun isChecked(): Boolean = prefs.getBoolean(INSTALL_REFERRER_CHECKED, false)
+
+            override fun markChecked() {
+                prefs.edit().putBoolean(INSTALL_REFERRER_CHECKED, true).apply()
+            }
+        })
+    }
+
     private val loginViewModel: LoginViewModel by viewModels()
 
     val activityResultSender = ActivityResultSender(this)
@@ -57,6 +87,7 @@ class LoginActivity : AppCompatActivity() {
     private var promptAccountSwitch by mutableStateOf(false)
     private var currentNetworkName by mutableStateOf<String?>(null)
     private var targetJwt by mutableStateOf<String?>(null)
+    private var targetLoginRequest by mutableStateOf<LoginRequest?>(null)
     private var targetUrl: String? = null
     private var defaultLocation: String? = null
     private var startInstantCreate by mutableStateOf(false)
@@ -89,19 +120,67 @@ class LoginActivity : AppCompatActivity() {
 
         if (Intent.ACTION_VIEW == action) {
             Log.i(TAG, "Intent.ACTION_VIEW == action")
-            intent?.data?.let { u ->
+            // a recreated activity already handled its link: running it again
+            // would repeat the sign-in (an ur://…?auth_code= hand-off twice)
+            intent?.data?.takeIf { savedInstanceState == null }?.let { u ->
                 if (isAppleOAuthReturn(u)) {
+                    if (app.device != null && ssoOAuthReturnRoute(
+                            AppleOAuthSession.attempts(this),
+                            u.getQueryParameter("state"),
+                        ) == SsoOAuthReturnRoute.ADD_SIGN_IN
+                    ) {
+                        // Settings' add sign-in method sheet started this attempt: the
+                        // sheet adds the Apple ID to the signed-in network; never a login
+                        Log.i(TAG, "forwardSsoAddSignInReturn")
+                        forwardSsoAddSignInReturn(this, SsoProvider.APPLE, u, MainActivity::class.java)
+                        return
+                    }
                     Log.i(TAG, "appleOAuthLogin $u")
                     appleOAuthLogin(u)
                 } else if (u.scheme == "ur" && u.host == "bittensor-sign-message") {
-                    if (u.getQueryParameter("purpose") == BITTENSOR_SIGN_PURPOSE_CONNECT && app.device != null) {
-                        // the earnings screen's wallet connect: the main activity owns that flow
-                        Log.i(TAG, "forwardWalletConnectToMain $u")
-                        forwardWalletConnectToMain(u)
+                    // a WalletConnect bridge return is judged by its waiting session
+                    // (message, purpose, address, expiry); with none waiting it is a
+                    // pre-helper return, handled as before
+                    val action = bittensorReturnAction(u.toString(), System.currentTimeMillis())
+                    val addReturn = bittensorAddReturn(action)
+                    if (addReturn != null && app.device != null) {
+                        // Settings' add sign-in method sheet started this session: the
+                        // sheet adds the wallet to the signed-in network; never a login
+                        Log.i(TAG, "forwardBittensorAddSignInReturn")
+                        forwardBittensorAddSignInReturn(this, addReturn, MainActivity::class.java)
                         return
                     }
-                    Log.i(TAG, "bittensorSignMessageLogin $u")
-                    bittensorSignMessageLogin(u)
+                    val consentReturn = snConsentReturn(action)
+                    if (consentReturn != null && app.device != null) {
+                        // the Earnings screen's payout consent waits for this session: the
+                        // screen submits a signed consent, and a refused return (forged or
+                        // mismatched) only brings it back to the wait; never a login
+                        Log.i(TAG, "forwardSnConsentReturn")
+                        forwardSnConsentReturn(this, consentReturn, MainActivity::class.java)
+                        return
+                    }
+                    val bridgeUri = when (action) {
+                        BittensorReturnAction.Legacy -> u
+                        is BittensorReturnAction.Proven -> bittensorProofUri(action.proof)
+                        is BittensorReturnAction.Failed -> bittensorFailureUri(action, bittensorRefusalMessage(action))
+                    }
+                    if (bridgeUri.getQueryParameter("purpose") == BITTENSOR_SIGN_PURPOSE_CONNECT && app.device != null) {
+                        // the earnings screen's wallet connect: the main activity owns that flow
+                        Log.i(TAG, "forwardWalletConnectToMain $bridgeUri")
+                        forwardWalletConnectToMain(bridgeUri)
+                        return
+                    }
+                    Log.i(TAG, "bittensorSignMessageLogin $bridgeUri")
+                    bittensorSignMessageLogin(bridgeUri)
+                } else if (Top200Bindings.isSignLink(u.scheme, u.host, u.path)) {
+                    // Earnings › Top 200 › Sign fleet binding: the link only fills the screen's
+                    // field and never signs; one that arrives while signed out is dropped
+                    if (app.device != null) {
+                        Log.i(TAG, "forwardTop200SignLink")
+                        forwardTop200SignLink(this, Top200Bindings.linkBindingParameter(u.encodedQuery), MainActivity::class.java)
+                        return
+                    }
+                    Log.i(TAG, "top200 sign link while signed out: dropped")
                 } else if ((u.scheme == "https" && u.host == "ur.io" && u.path == "/c") || (u.scheme == "ur")) {
                     Log.i(TAG, "createWithUri $u")
                     createWithUri(u)
@@ -111,8 +190,9 @@ class LoginActivity : AppCompatActivity() {
         } else if (app.device != null) {
             navigateToMain()
             return
-        } else if (app.deviceManager.canRefer) {
-            // fresh install, async check the install referrer
+        } else if (installReferrerCheck.shouldCheck(signedIn = app.device != null)) {
+            // signed out and the install referrer not read yet: a Play install
+            // from a ur.io/c referral link carries the code
             // see https://developer.android.com/google/play/installreferrer/library
 
             referrerClient = InstallReferrerClient.newBuilder(this).build()
@@ -123,14 +203,10 @@ class LoginActivity : AppCompatActivity() {
                             when (responseCode) {
                                 InstallReferrerClient.InstallReferrerResponse.OK -> {
                                     try {
-                                        referrerClient?.installReferrer?.let { details ->
-                                            details.installReferrer?.let {
-                                                val u = Uri.parse(it)
-                                                if (u.scheme == "https" && u.host == "ur.io" && u.path == "/c") {
-                                                    Log.i(TAG, "referrerClient createWithUri $u")
-                                                    createWithUri(Uri.parse(it))
-                                                }
-                                            }
+                                        val referrer = referrerClient?.installReferrer?.installReferrer
+                                        InstallReferrerCheck.referralCode(referrer)?.let { code ->
+                                            Log.i(TAG, "install referrer: referral code")
+                                            referralCode = code
                                         }
                                     } catch (e: Exception) {
                                         // do nothing
@@ -138,7 +214,7 @@ class LoginActivity : AppCompatActivity() {
                                 }
                             }
                         } finally {
-                            app.deviceManager.canRefer = false
+                            installReferrerCheck.finish(responseCode)
 
                             referrerClient?.endConnection()
                             referrerClient = null
@@ -162,6 +238,7 @@ class LoginActivity : AppCompatActivity() {
                     loginViewModel,
                     promptAccountSwitch = promptAccountSwitch,
                     targetJwt = targetJwt,
+                    targetLoginRequest = targetLoginRequest,
                     currentNetworkName = currentNetworkName,
                     startInstantCreate = startInstantCreate,
                     isLoadingAuthCode = isLoadingAuthCode,
@@ -198,6 +275,13 @@ class LoginActivity : AppCompatActivity() {
 
         defaultLocation = extractDefaultLocation(uri)
 
+        // a campaign email landing link: park the in-app destination (and the
+        // feedback pre-fill) for MainNavHost, then continue the normal entry
+        com.bringyour.network.analytics.OnboardingLink.parse(uri)?.let { link ->
+            app.widgetRoute.value = link.route
+            link.feedbackPrefill?.let { app.pendingFeedbackPrefill.value = it }
+        }
+
         if (defaultLocation != null) {
             defaultLocation = defaultLocation?.removeSuffix("=")
         }
@@ -211,13 +295,14 @@ class LoginActivity : AppCompatActivity() {
             val args = AuthCodeLoginArgs()
             args.authCode = authCode
 
-            app.api?.authCodeLogin(args) { result, err ->
+            val request = app.beginLoginRequest() ?: return
+            request.api.authCodeLogin(args) { result, err ->
 
                 val loginJwt = result?.jwt
 
                 if (err == null && loginJwt != null) {
 
-                    app.dispatchLoginResult {
+                    app.dispatchLoginResult(request) {
 
                         if (app.asyncLocalState?.localState?.byJwt == loginJwt) {
                             // user already logged into this network
@@ -234,16 +319,17 @@ class LoginActivity : AppCompatActivity() {
 
                             if (localState != null) {
                                 localState.parseByJwt { jwt, success ->
-                                    app.dispatchLoginResult {
+                                    app.dispatchLoginContinuation(request) {
                                         if (success && jwt != null) {
+                                            targetLoginRequest = request
                                             targetJwt = loginJwt
                                             currentNetworkName = jwt.networkName
                                             promptAccountSwitch = true
                                             isLoadingAuthCode = false
                                         } else {
                                             Log.i(TAG, "authCodeLogin: local byJwt parse failed")
-                                            app.logout()
                                             welcomeThenAuthClientAndFinish(
+                                                request = request,
                                                 byJwt = loginJwt,
                                                 callback = { error ->
                                                     if (error != null) {
@@ -257,8 +343,8 @@ class LoginActivity : AppCompatActivity() {
                                 }
                             } else {
                                 Log.i(TAG, "authCodeLogin: local state missing")
-                                app.logout()
                                 welcomeThenAuthClientAndFinish(
+                                    request = request,
                                     byJwt = loginJwt,
                                     callback = { error ->
                                         if (error != null) {
@@ -271,6 +357,7 @@ class LoginActivity : AppCompatActivity() {
 
                         } else {
                             welcomeThenAuthClientAndFinish(
+                                request = request,
                                 byJwt = loginJwt,
                                 callback = { err ->
                                     if (err != null) {
@@ -283,7 +370,7 @@ class LoginActivity : AppCompatActivity() {
                     }
 
                 } else {
-                    isLoadingAuthCode = false
+                    app.dispatchLoginResult(request) { isLoadingAuthCode = false }
                     Log.i(TAG, "authCodeLogin: error: result is: $result")
                 }
 
@@ -383,53 +470,58 @@ class LoginActivity : AppCompatActivity() {
         args.authJwt = authJwt
         args.authJwtType = provider
 
-        app.api?.authLogin(args) { result, err ->
-            val resultError = result?.error
-            val networkJwt = if (err == null && resultError == null) {
-                result?.network?.byJwt?.takeIf(String::isNotEmpty)
-            } else {
-                null
-            }
-            if (networkJwt != null) {
-                welcomeThenAuthClientAndFinish(
-                    byJwt = networkJwt,
-                    callback = { finishError ->
-                        if (finishError != null) {
-                            Log.i(TAG, "authClientAndFinish error: $finishError")
+        val request = app.beginLoginRequest() ?: return
+        request.api.authLogin(args) { result, err ->
+            app.dispatchLoginResult(request) {
+                val resultError = result?.error
+                val networkJwt = if (err == null && resultError == null) {
+                    result?.network?.byJwt?.takeIf(String::isNotEmpty)
+                } else {
+                    null
+                }
+                if (networkJwt != null) {
+                    welcomeThenAuthClientAndFinish(
+                        request = request,
+                        byJwt = networkJwt,
+                        callback = { finishError ->
+                            if (finishError != null) {
+                                Log.i(TAG, "authClientAndFinish error: $finishError")
+                            }
+                            isLoadingAuthCode = false
+                        },
+                    )
+                    return@dispatchLoginResult
+                }
+                lifecycleScope.launch {
+                    if (!app.isCurrentLoginRequest(request)) return@launch
+                    if (err != null) {
+                        isLoadingAuthCode = false
+                        loginViewModel.setLoginError(err.message)
+                    } else if (resultError != null) {
+                        isLoadingAuthCode = false
+                        loginViewModel.setLoginError(resultError.message)
+                    } else if (result == null) {
+                        isLoadingAuthCode = false
+                        loginViewModel.setLoginError(getString(R.string.login_error))
+                    } else if (result?.authAllowed != null) {
+                        val authAllowed = mutableListOf<String>()
+                        for (i in 0 until result.authAllowed.len()) {
+                            authAllowed.add(result.authAllowed.get(i))
                         }
                         isLoadingAuthCode = false
-                    },
-                )
-                return@authLogin
-            }
-            lifecycleScope.launch {
-                if (err != null) {
-                    isLoadingAuthCode = false
-                    loginViewModel.setLoginError(err.message)
-                } else if (resultError != null) {
-                    isLoadingAuthCode = false
-                    loginViewModel.setLoginError(resultError.message)
-                } else if (result == null) {
-                    isLoadingAuthCode = false
-                    loginViewModel.setLoginError(getString(R.string.login_error))
-                } else if (result?.authAllowed != null) {
-                    val authAllowed = mutableListOf<String>()
-                    for (i in 0 until result.authAllowed.len()) {
-                        authAllowed.add(result.authAllowed.get(i))
+                        loginViewModel.setLoginError(getString(R.string.login_error_auth_allowed, authAllowed.joinToString(",")))
+                    } else {
+                        // a new user: continue into create network with the identity token
+                        loginViewModel.setLoginError(null)
+                        isLoadingAuthCode = false
+                        jwtCreateNetworkParams = LoginCreateNetworkParams.LoginCreateAuthJwtParams(
+                            authJwt = authJwt,
+                            authJwtType = provider,
+                            userName = (result.userName ?: "").ifEmpty { appleUserName },
+                            userAuth = email,
+                            referralCode = referralCode
+                        )
                     }
-                    isLoadingAuthCode = false
-                    loginViewModel.setLoginError(getString(R.string.login_error_auth_allowed, authAllowed.joinToString(",")))
-                } else {
-                    // a new user: continue into create network with the identity token
-                    loginViewModel.setLoginError(null)
-                    isLoadingAuthCode = false
-                    jwtCreateNetworkParams = LoginCreateNetworkParams.LoginCreateAuthJwtParams(
-                        authJwt = authJwt,
-                        authJwtType = provider,
-                        userName = (result.userName ?: "").ifEmpty { appleUserName },
-                        userAuth = email,
-                        referralCode = referralCode
-                    )
                 }
             }
         } ?: run {
@@ -484,62 +576,81 @@ class LoginActivity : AppCompatActivity() {
 
         args.walletAuth = walletAuth
 
-        app.api?.authLogin(args) { result, err ->
-            val resultError = result?.error
-            val networkJwt = if (err == null && resultError == null) {
-                result?.network?.byJwt?.takeIf(String::isNotEmpty)
-            } else {
-                null
-            }
-            if (networkJwt != null) {
-                welcomeThenAuthClientAndFinish(
-                    byJwt = networkJwt,
-                    callback = { error ->
-                        if (error != null) {
-                            Log.i(TAG, "authClientAndFinish error: $error")
-                        }
-                        isLoadingAuthCode = false
-                    },
-                )
-                return@authLogin
-            }
-            lifecycleScope.launch {
-
-                if (err != null) {
-                    isLoadingAuthCode = false
-                    loginViewModel.setLoginError(err.message)
-                } else if (resultError != null) {
-                    isLoadingAuthCode = false
-                    loginViewModel.setLoginError(resultError.message)
-                } else if (result?.walletAuth != null) {
-                    loginViewModel.setLoginError(null)
-                    val api = app.api
-                    if (api == null) {
-                        isLoadingAuthCode = false
-                        loginViewModel.setLoginError(getString(R.string.login_error))
-                        return@launch
-                    }
-
-                    requestBittensorChallenge(api, address)
-                        .onSuccess { createMessage ->
+        val request = app.beginLoginRequest() ?: return
+        request.api.authLogin(args) { result, err ->
+            app.dispatchLoginResult(request) {
+                val resultError = result?.error
+                val networkJwt = if (err == null && resultError == null) {
+                    result?.network?.byJwt?.takeIf(String::isNotEmpty)
+                } else {
+                    null
+                }
+                if (networkJwt != null) {
+                    welcomeThenAuthClientAndFinish(
+                        request = request,
+                        byJwt = networkJwt,
+                        callback = { error ->
+                            if (error != null) {
+                                Log.i(TAG, "authClientAndFinish error: $error")
+                            }
                             isLoadingAuthCode = false
-                            if (!launchBittensorSignMessage(
-                                    this@LoginActivity,
-                                    createMessage,
-                                    BITTENSOR_SIGN_PURPOSE_CREATE
-                                )
-                            ) {
+                        },
+                    )
+                    return@dispatchLoginResult
+                }
+                lifecycleScope.launch {
+                    if (!app.isCurrentLoginRequest(request)) return@launch
+
+                    if (err != null) {
+                        isLoadingAuthCode = false
+                        loginViewModel.setLoginError(err.message)
+                    } else if (resultError != null) {
+                        isLoadingAuthCode = false
+                        loginViewModel.setLoginError(resultError.message)
+                    } else if (result?.walletAuth != null) {
+                        loginViewModel.setLoginError(null)
+                        val api = app.api
+                        if (api == null) {
+                            isLoadingAuthCode = false
+                            loginViewModel.setLoginError(getString(R.string.login_error))
+                            return@launch
+                        }
+
+                        if (uri.getQueryParameter("wallet") == BittensorWallets.WALLET_CONNECT) {
+                            // a WalletConnect sign-in signs the create challenge with the same wallet
+                            val opened = startBittensorBridgeProof(
+                                this@LoginActivity,
+                                api,
+                                BittensorProofRequest(BittensorWallets.WALLET_CONNECT, BittensorWallets.PURPOSE_CREATE, address),
+                            )
+                            isLoadingAuthCode = false
+                            if (!opened) {
                                 loginViewModel.setLoginError(getString(R.string.login_error))
                             }
+                            return@launch
                         }
-                        .onFailure { challengeError ->
-                            isLoadingAuthCode = false
-                            Log.i(TAG, "unable to fetch create-network wallet challenge: $challengeError")
-                            loginViewModel.setLoginError(getString(R.string.login_error))
-                        }
-                } else {
-                    isLoadingAuthCode = false
-                    loginViewModel.setLoginError(getString(R.string.login_error))
+
+                        requestBittensorChallenge(api, address)
+                            .onSuccess { createMessage ->
+                                isLoadingAuthCode = false
+                                if (!launchBittensorSignMessage(
+                                        this@LoginActivity,
+                                        createMessage,
+                                        BITTENSOR_SIGN_PURPOSE_CREATE
+                                    )
+                                ) {
+                                    loginViewModel.setLoginError(getString(R.string.login_error))
+                                }
+                            }
+                            .onFailure { challengeError ->
+                                isLoadingAuthCode = false
+                                Log.i(TAG, "unable to fetch create-network wallet challenge: $challengeError")
+                                loginViewModel.setLoginError(getString(R.string.login_error))
+                            }
+                    } else {
+                        isLoadingAuthCode = false
+                        loginViewModel.setLoginError(getString(R.string.login_error))
+                    }
                 }
             }
         } ?: run {
@@ -601,6 +712,7 @@ class LoginActivity : AppCompatActivity() {
      * its own overlay; a failed finish takes the overlay down for the retry.
      */
     private fun welcomeThenAuthClientAndFinish(
+        request: LoginRequest,
         byJwt: String,
         callback: (String?) -> Unit,
     ) {
@@ -608,8 +720,9 @@ class LoginActivity : AppCompatActivity() {
             callback(getString(R.string.login_client_error))
             return
         }
-        app.authenticateNetworkSession(byJwt, newNetwork = false) { completion ->
+        app.authenticateNetworkSession(request, byJwt, newNetwork = false) { completion ->
             lifecycleScope.launch(Dispatchers.Main) {
+                if (!app.ownsLoginRequest(request)) return@launch
                 if (completion is LoginClientCompletion.Failed) {
                     welcomeOverlayVisible = false
                     callback(completion.message ?: getString(R.string.login_client_error))
@@ -617,28 +730,9 @@ class LoginActivity : AppCompatActivity() {
                 }
                 welcomeOverlayVisible = true
                 delay(2250)
+                if (!app.isCurrentLoginRequest(request)) return@launch
                 finishAuthenticatedLogin()
                 callback(null)
-            }
-        }
-    }
-
-    fun authClientAndFinish(
-        callback: (String?) -> Unit,
-    ) {
-        val app = app ?: run {
-            callback(getString(R.string.login_client_error))
-            return
-        }
-
-        app.authenticateLoginClient { completion ->
-            lifecycleScope.launch(Dispatchers.Main) {
-                if (completion is LoginClientCompletion.Failed) {
-                    callback(completion.message ?: getString(R.string.login_client_error))
-                } else {
-                    finishAuthenticatedLogin()
-                    callback(null)
-                }
             }
         }
     }
@@ -646,16 +740,16 @@ class LoginActivity : AppCompatActivity() {
     // LoginStartupState is already Ready before either method is called. The
     // Activity owns only animation/navigation; if it is destroyed, a fresh
     // LoginActivity observes app.device in onCreate and enters MainActivity.
-    fun finishAuthenticatedLoginAfterWelcome() {
+    fun finishAuthenticatedLoginAfterWelcome(request: LoginRequest) {
         lifecycleScope.launch(Dispatchers.Main) {
             delay(2750)
-            finishAuthenticatedLogin()
+            if (app?.isCurrentLoginRequest(request) == true) finishAuthenticatedLogin()
         }
     }
 
-    fun finishAuthenticatedLoginNow() {
+    fun finishAuthenticatedLoginNow(request: LoginRequest) {
         lifecycleScope.launch(Dispatchers.Main) {
-            finishAuthenticatedLogin()
+            if (app?.isCurrentLoginRequest(request) == true) finishAuthenticatedLogin()
         }
     }
 
@@ -696,3 +790,7 @@ class LoginActivity : AppCompatActivity() {
     }
 
 }
+
+// the install referrer's one-shot flag (InstallReferrerCheck.Store)
+private const val INSTALL_REFERRER_PREFS = "install_referrer"
+private const val INSTALL_REFERRER_CHECKED = "checked"

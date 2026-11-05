@@ -25,6 +25,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -47,25 +48,33 @@ import com.bringyour.network.ui.theme.BlueLight
 import com.bringyour.network.ui.theme.TextMuted
 import com.bringyour.network.ui.theme.URNetworkTheme
 
+/**
+ * An info icon that opens a popup explaining something. The 16 dp glyph sits
+ * in a standard 48 dp icon button (Touch_Targets): Compose would grow a
+ * 16 dp button's touch area to 48 dp anyway, but a neighbor's could cut into
+ * it, so the button keeps the room in the layout, and its own margin around
+ * the glyph is the space between it and its label.
+ */
 @Composable
 fun InfoIconWithOverlay(
-    contentDescription: String = "Info",
+    // what the popup explains; a generic "Learn more" when the caller does not say
+    contentDescription: String = stringResource(id = R.string.learn_more),
     content: @Composable () -> Unit
 ) {
 
-    var showOverlay by remember { mutableStateOf(false) }
+    var showOverlay by rememberSaveable { mutableStateOf(false) }
 
     Box() {
         IconButton(
             onClick = {
                 showOverlay = true
             },
-            modifier = Modifier.size(16.dp)
         ) {
             Icon(
                 painter = painterResource(R.drawable.icon_info),
                 contentDescription = contentDescription,
                 tint = TextMuted,
+                modifier = Modifier.size(16.dp),
             )
 
             if (showOverlay) {
@@ -165,7 +174,7 @@ private fun InfoPopupPreview() {
                                 )
                             )
                             Icon(imageVector = Icons.AutoMirrored.Filled.ArrowForward,
-                                contentDescription = "Right Arrow",
+                                contentDescription = null,
                                 tint = Color.White,
                                 modifier = Modifier.size(20.dp)
                             )

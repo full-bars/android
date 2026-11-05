@@ -42,7 +42,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  # write only so the gradle job can refresh the rolling test APK release
+  contents: write
 
 # This workflow is expensive (the gomobile bind dominates), so a busy branch
 # keeps one run at a time.
@@ -62,8 +63,10 @@ env:
   # versionName/versionCode are read from app/local.properties, which is
   # git-ignored. Absent, the build shells out to warpctl and dies at
   # CONFIGURATION time. These values only name the archive; nothing ships.
-  UR_CI_VERSION: "0.0.0-ci"
-  UR_CI_VERSION_CODE: "1"
+  # The code rises with every run so a test APK installs over the last one
+  # instead of failing as a downgrade. Nothing ships from this workflow.
+  UR_CI_VERSION: "0.0.0-ci-${{ github.run_number }}"
+  UR_CI_VERSION_CODE: "${{ github.run_number }}"
 
 jobs:
   sdk-aar:
@@ -73,9 +76,7 @@ jobs:
     # minutes rather than burning the afternoon. Observed: ~3.5 min.
     timeout-minutes: 45
     env:
-      # setup-go pins 1.26.5 below, but a `go` directive anywhere in the graph
-      # could still make the toolchain silently self-upgrade to 1.27 and
-      # re-break the bind. `local` turns that into a loud, obvious failure.
+      # Do not let a dependency silently switch the selected Go toolchain.
       GOTOOLCHAIN: local
     steps:
       # This repository is ~700 MB, most of it design art under res/ that the
@@ -95,14 +96,14 @@ jobs:
 
       # sdk/build/go.mod resolves these with `replace ... => ../../<name>` (and
       # sdk/go.mod with `replace ... => ../<name>`), so they must sit as
-      # siblings of the sdk checkout. The directory names must match the
-      # replace targets exactly -- `connect`, not whatever a fork is named.
-      # glog's default branch is master, so it is cloned without --branch.
+      # siblings of the sdk checkout. connect/sctp is inside the connect clone.
+      # glog and gvisor use non-main default branches.
       - name: Check out the sibling modules
         run: |
           git clone --depth 1 --branch main https://github.com/urnetwork/connect.git connect
           git clone --depth 1 https://github.com/urnetwork/glog.git glog
           git clone --depth 1 https://github.com/urnetwork/goidenticons.git goidenticons
+          git clone --depth 1 https://github.com/urnetwork/gvisor.git gvisor
 
       # The sdk references RenderPngV2. goidenticons publishes it today, and an
       # unconditional shim is a REDECLARATION that fails the build. Write it
@@ -118,11 +119,8 @@ jobs:
             echo 'func RenderPngV2(data []byte, size int) ([]byte, error) { return RenderPng(data, size) }' >> goidenticons/render_v2_ci_shim.go
           fi
 
-      # NOT `go-version: stable`, which the sdk/connect workflows use. Stable is
-      # 1.27 now, and sdk/build/Makefile says so itself in the build_android
-      # recipe: "gomobile/gobind must be built with go <= 1.26 -- the go 1.27
-      # runtime fatals when this GODEBUG is set", GODEBUG=gotypesalias=0 being
-      # exactly what that recipe exports. sdk/build/go.mod pins 1.26.5.
+      # Follow the SDK build module's Go directive and prevent an implicit
+      # toolchain change during the bind.
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
@@ -160,6 +158,12 @@ jobs:
       - name: Install the pinned gomobile toolchain
         working-directory: sdk/build
         run: make init_tools
+
+      # gomobile hides go list errors and then reports an empty generated go.mod.
+      # Check the same module graph first so missing replacements are visible.
+      - name: Check the Android SDK module graph
+        working-directory: sdk/build
+        run: GOOS=android GOARCH=arm64 go list -m -json -tags=sdk_mobile_bind,android all > /dev/null
 
       - name: Build the Android SDK .aar
         working-directory: sdk/build
@@ -246,6 +250,14 @@ jobs:
             "$UR_CI_VERSION" "$UR_CI_VERSION_CODE" > android/app/local.properties
           cat android/app/local.properties
 
+      # This branch commits app/debug.keystore so every test APK is signed with
+      # the same key; that lets one test build update the previous one in place
+      # instead of forcing an uninstall between iterations.
+      - name: Use the repo's committed debug keystore
+        run: |
+          mkdir -p "$HOME/.android"
+          cp android/app/debug.keystore "$HOME/.android/debug.keystore"
+
       # The debug build type signs with signingConfigs.debug, whose storeFile is
       # the standard ~/.android/debug.keystore with the published
       # android/androiddebugkey constants. AGP normally creates it on demand;
@@ -290,10 +302,42 @@ jobs:
             :app:compilePlayReleaseKotlin \
             :app:compileSolana_dappReleaseKotlin
 
-      - name: Upload the unit test report
+      - name: Upload the github debug APK
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: urnetwork-android-github-apk
+          path: android/app/app/build/outputs/apk/github/debug/*.apk
+          if-no-files-found: error
+
+      # One permanent download link instead of hunting through run artifacts:
+      # the rolling `ci-latest` prerelease is replaced on every build, so
+      #   https://github.com/full-bars/android/releases/download/ci-latest/UR-latest.apk
+      # always serves the newest debug APK. The tag URL is used rather than
+      # /releases/latest because GitHub excludes prereleases from "latest".
+      - name: Publish the rolling test APK
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          apk=$(ls android/app/app/build/outputs/apk/github/debug/*arm64-v8a*.apk 2>/dev/null | head -1)
+          [ -n "$apk" ] || apk=$(ls android/app/app/build/outputs/apk/github/debug/*universal*.apk 2>/dev/null | head -1)
+          [ -n "$apk" ] || { echo "no APK to publish"; exit 0; }
+          cp "$apk" UR-latest.apk
+          gh release view ci-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create ci-latest --repo "$GITHUB_REPOSITORY" --prerelease \
+                 --title "Latest CI debug APK" --notes "Replaced on every build."
+          gh release upload ci-latest UR-latest.apk --repo "$GITHUB_REPOSITORY" --clobber
+
+      # Keep the XML alongside the HTML report. The XML lets the acceptance
+      # result normalizer identify the failing class and assertion without
+      # giving a debugging model the entire Gradle console log.
+      - name: Upload unit test reports and machine-readable results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: unit-test-report
-          path: android/app/app/build/reports/tests
+          path: |
+            android/app/app/build/reports/tests
+            android/app/app/build/test-results
           if-no-files-found: warn

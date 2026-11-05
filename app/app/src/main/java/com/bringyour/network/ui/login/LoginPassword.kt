@@ -111,11 +111,12 @@ fun LoginPassword(
             inProgress = false
             return@login
         }
-        application.authenticateWithPassword(user.text, password.text) { completion ->
+        val attempt = application.authenticateWithPassword(user.text, password.text) { request, completion ->
             if (completion is PasswordLoginCompletion.Ready) {
-                loginActivity?.finishAuthenticatedLoginAfterWelcome()
+                loginActivity?.finishAuthenticatedLoginAfterWelcome(request)
             }
             scope.launch {
+                if (!application.ownsLoginRequest(request)) return@launch
                 when (completion) {
                     is PasswordLoginCompletion.Failed -> {
                         inProgress = false
@@ -123,16 +124,20 @@ fun LoginPassword(
                     }
                     is PasswordLoginCompletion.VerificationRequired -> {
                         inProgress = false
-                        navController.navigate("verify/${Uri.encode(completion.userAuth)}")
+                        navController.navigate(verifyRoute(completion.userAuth, completion.sendError))
                     }
                     is PasswordLoginCompletion.Ready -> {
                         loginError = null
                         isContentVisible = false
                         delay(500)
-                        welcomeOverlayVisible = true
+                        if (application.isCurrentLoginRequest(request)) welcomeOverlayVisible = true
                     }
                 }
             }
+        }
+        if (attempt == null) {
+            loginError = loginErrMsg
+            inProgress = false
         }
         Unit
     }
@@ -151,7 +156,7 @@ fun LoginPassword(
                         IconButton(onClick = { navController.popBackStack() }) {
                             Icon(
                                 Icons.AutoMirrored.Filled.KeyboardArrowLeft,
-                                contentDescription = "Back"
+                                contentDescription = stringResource(id = R.string.back)
                             )
                         }
                     },
@@ -269,7 +274,7 @@ fun LoginPasswordForm(
                 Spacer(modifier = Modifier.width(4.dp))
                 Icon(
                     imageVector = Icons.AutoMirrored.Filled.ArrowForward,
-                    contentDescription = "Right Arrow",
+                    contentDescription = null,
                     modifier = Modifier.size(16.dp),
                     tint = if (!inProgress) Color.White else Color.Gray
                 )

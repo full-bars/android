@@ -44,7 +44,7 @@ class PlanViewModel @Inject constructor(
      * out-of-band payment). This flavor has no Google Play billing, so it is never
      * emitted here -- the sequence stays 0 and the collector in MainNavHost (which is
      * shared across flavors) simply never fires. It exists so that shared UI can handle
-     * the pending case uniformly wherever a store CAN report it.
+     * the pending case uniformly wherever a store can report it.
      */
     private val _purchasePendingSequence = MutableStateFlow(0L)
     val purchasePendingSequence: StateFlow<Long> = _purchasePendingSequence.asStateFlow()
@@ -111,7 +111,7 @@ class PlanViewModel @Inject constructor(
     }
 
     /**
-     * Billing errors, surfaced by the shared UI for EVERY flavor. Nothing sets this
+     * Billing errors, surfaced by the shared UI for every flavor. Nothing sets this
      * here today (this flavor has no Google Play billing), but any payment path that
      * fails must be able to put a message in front of the user rather than failing
      * silently — which is what used to happen everywhere.
@@ -148,10 +148,37 @@ class PlanViewModel @Inject constructor(
     var inProgress by mutableStateOf(false)
         private set
 
+    val setInProgress: (Boolean) -> Unit = { ip ->
+        inProgress = ip
+    }
+
+    /** The api of the active network space (the purchase requests go through it). */
+    val api: com.bringyour.sdk.Api?
+        get() = networkSpaceManagerProvider.getNetworkSpace()?.api
+
+    /**
+     * This flavor has no store that localizes prices: the picker prints the
+     * server's tier figures (PlanPresentation), so these stay null.
+     */
+    val storeYearlyPrice: com.bringyour.network.ui.upgrade.StorePrice? = null
+    val storeMonthlyPrice: com.bringyour.network.ui.upgrade.StorePrice? = null
+
+    /**
+     * The store whose win-back offer this flavor shows (mmm/reengagement/
+     * PLAN.md "THE STORES"): Stripe, which applies it at checkout, so the
+     * picker only prints it. No store offers here: the first month is the
+     * tier's monthly price at the offer's discount.
+     */
+    val winbackStore: String = com.bringyour.sdk.Sdk.WinbackOfferStoreStripe
+    val storeMonthlyOfferPrices: Map<String, com.bringyour.network.ui.upgrade.StorePrice> = emptyMap()
+
+    /** The yearly plan's free trial on Stripe, in days. */
+    val freeTrialDays: Int = com.bringyour.network.ui.upgrade.FREE_TRIAL_DAYS
+
     /**
      * The Stripe payment-link buttons attach `client_reference_id=networkId` -- a
      * payment made without it can never be credited. This used to be derived once at
-     * init, so a slow jwt parse OR an account switch left the buttons silently
+     * init, so a slow jwt parse or an account switch left the buttons silently
      * no-opping (or worse, crediting the previous account). Re-derived every time the
      * upgrade UI is shown; the buttons stay disabled until it resolves.
      */

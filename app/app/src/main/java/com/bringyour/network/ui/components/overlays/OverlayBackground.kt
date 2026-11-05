@@ -1,6 +1,7 @@
 package com.bringyour.network.ui.components.overlays
 
 import android.util.Log
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusGroup
@@ -34,10 +35,13 @@ import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.bringyour.network.R
+import com.bringyour.network.ui.POST_LOGIN_OVERLAY_CLOSE_TAG
 import com.bringyour.network.ui.theme.URNetworkTheme
 import com.bringyour.network.utils.isTv
 
@@ -49,6 +53,11 @@ fun OverlayBackground(
 ) {
 
     val focusRequester = remember { FocusRequester() }
+
+    // Back closes the overlay, and so does Esc with nothing focused, which the
+    // system reads as Back (adaptive app quality, Keyboard_Exit); Esc inside it
+    // is handled below
+    BackHandler { onDismiss() }
 
     Box(
         modifier = Modifier
@@ -83,7 +92,7 @@ fun OverlayBackground(
 
         Image(
             painter = painterResource(id = bgImageResourceId),
-            contentDescription = "Overlay Background",
+            contentDescription = null,
             modifier = Modifier.fillMaxSize(),
             contentScale = ContentScale.Crop
             // contentScale = if (isLandscape) ContentScale.Crop else ContentScale.FillBounds
@@ -98,11 +107,13 @@ fun OverlayBackground(
             ) {
                 IconButton(
                     onClick = { onDismiss() },
-                    modifier = Modifier.focusRequester(focusRequester)
+                    modifier = Modifier
+                        .focusRequester(focusRequester)
+                        .testTag(POST_LOGIN_OVERLAY_CLOSE_TAG)
                 ) {
                     Icon(
                         imageVector = Icons.Filled.Close,
-                        contentDescription = "Close Overlay",
+                        contentDescription = stringResource(id = R.string.close),
                         tint = Color.White,
                     )
                 }
@@ -111,7 +122,9 @@ fun OverlayBackground(
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(16.dp),
+                    // below the close button, so a tall card in a short
+                    // window scrolls under it rather than covering it
+                    .padding(start = 16.dp, top = OverlayCloseRowHeight, end = 16.dp, bottom = 16.dp),
                 contentAlignment = Alignment.BottomCenter,
             ) {
                 content()
@@ -125,6 +138,9 @@ fun OverlayBackground(
         }
     }
 }
+
+/** The close button's row: the 48dp button and its 16dp padding. */
+private val OverlayCloseRowHeight = 80.dp
 
 @Preview(showBackground = true)
 @Composable

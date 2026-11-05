@@ -1,5 +1,7 @@
 package com.bringyour.network.ui.wallet
 
+import com.bringyour.network.ui.components.FoldSafeModalBottomSheet
+import com.bringyour.network.ui.components.rememberFoldSafeSheetState
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -7,9 +9,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
-import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
@@ -31,7 +31,8 @@ import com.bringyour.network.ui.theme.TextMuted
 /**
  * Manual coldkey entry. The address is validated before anything else happens
  * (syntax locally, then the unauthenticated server check); a blocked address never
- * leaves the device. Continuing still signs through the ur.io bridge so the server
+ * leaves the device. Continuing opens the wallet chooser and asks for a signature by
+ * this address (BittensorProofSheets) so the server
  * can verify ownership.
  */
 @OptIn(ExperimentalMaterial3Api::class)
@@ -43,9 +44,9 @@ fun ConnectWalletSheet(
     onContinue: () -> Unit,
     onDismiss: () -> Unit,
 ) {
-    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val sheetState = rememberFoldSafeSheetState()
 
-    ModalBottomSheet(
+    FoldSafeModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = sheetState,
         containerColor = SheetBlack,

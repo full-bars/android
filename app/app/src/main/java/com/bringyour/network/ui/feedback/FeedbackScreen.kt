@@ -1,7 +1,6 @@
 package com.bringyour.network.ui.feedback
 
 import android.app.Activity
-import android.content.res.Configuration
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -10,7 +9,6 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -44,13 +42,14 @@ import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.vector.rememberVectorPainter
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
-import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.platform.SoftwareKeyboardController
+import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.res.vectorResource
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.buildAnnotatedString
@@ -65,7 +64,11 @@ import com.bringyour.network.R
 import com.bringyour.network.ui.components.ExportLogButton
 import com.bringyour.network.ui.components.PromptSolanaDAppStoreReview
 import com.bringyour.network.ui.components.ShareLogFileButton
+import com.bringyour.network.ui.components.SupportContact
 import com.bringyour.network.ui.components.URButton
+import com.bringyour.network.ui.components.URInlineErrorText
+import com.bringyour.network.ui.components.openSupportUri
+import com.bringyour.network.ui.components.supportLinkSpans
 import com.bringyour.network.ui.components.URSwitch
 import com.bringyour.network.ui.components.URTextInput
 import com.bringyour.network.ui.components.URTextInputLabel
@@ -76,7 +79,7 @@ import com.bringyour.network.ui.shared.viewmodels.OverlayViewModel
 import com.bringyour.network.ui.theme.Black
 import com.bringyour.network.ui.theme.Pink
 import com.bringyour.network.ui.theme.URNetworkTheme
-import com.bringyour.network.utils.isTablet
+import com.bringyour.network.ui.components.tabletReadableColumn
 import com.bringyour.sdk.Sdk
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -91,9 +94,10 @@ fun FeedbackScreen(
     FeedbackScreen(
         feedbackMsg = feedbackViewModel.feedbackMsg,
         setFeedbackMsg = feedbackViewModel.setFeedbackMsg,
-        sendFeedback = feedbackViewModel.sendFeedback,
+        sendFeedback = feedbackViewModel::sendFeedback,
         launchOverlay = overlayViewModel.launch,
         isSendEnabled = feedbackViewModel.isSendEnabled,
+        sendStatus = feedbackViewModel.sendStatus,
         starCount = feedbackViewModel.starCount,
         setStarCount = feedbackViewModel.setStarCount,
         bundleStore = bundleStore,
@@ -109,9 +113,10 @@ fun FeedbackScreen(
 fun FeedbackScreen(
     feedbackMsg: TextFieldValue,
     setFeedbackMsg: (TextFieldValue) -> Unit,
-    sendFeedback: () -> Unit,
+    sendFeedback: (onSent: () -> Unit) -> Unit,
     launchOverlay: (OverlayMode) -> Unit,
     isSendEnabled: Boolean,
+    sendStatus: FeedbackSendStatus,
     starCount: Int,
     setStarCount: (Int) -> Unit,
     bundleStore: BundleStore?,
@@ -121,8 +126,6 @@ fun FeedbackScreen(
     toggleIncludeLogs: () -> Unit
 ) {
 
-    val configuration = LocalConfiguration.current
-    val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
     val reviewManagerRequest = rememberReviewManager()
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -138,63 +141,74 @@ fun FeedbackScreen(
     }
 
 
+    // the overlay and review prompt wait for the send to succeed; a failure keeps the form
     val submitFeedback = {
 
-        if (feedbackMsg.text.isNotEmpty() || starCount > 0) {
+        if (isSendEnabled) {
 
-            sendFeedback()
+            val sentStarCount = starCount
 
-            launchOverlay(OverlayMode.FeedbackSubmitted)
+            sendFeedback {
 
-            setFeedbackMsg(TextFieldValue())
+                launchOverlay(OverlayMode.FeedbackSubmitted)
 
-            if (starCount == 5) {
-                scope.launch {
-                    delay(1000)
+                if (sentStarCount == 5) {
+                    scope.launch {
+                        delay(1000)
 
-                    if (bundleStore == BundleStore.SOLANA_DAPP) {
-                        // prompt dialog to navigate to review
-                        setPromptSolanaReview(true)
-                    } else {
-                        // PLAY - launch native review prompt
-                        promptReview()
+                        if (bundleStore == BundleStore.SOLANA_DAPP) {
+                            // prompt dialog to navigate to review
+                            setPromptSolanaReview(true)
+                        } else {
+                            // PLAY - launch native review prompt
+                            promptReview()
+                        }
+
                     }
-
                 }
             }
-
-            setStarCount(0)
         }
     }
+
+    val isSending = sendStatus == FeedbackSendStatus.Sending
     Scaffold(
         bottomBar = {
 
-            Box(
+            Column(
                 modifier = Modifier
                     .background(Black)
                     .imePadding()
+                    .tabletReadableColumn()
                     .padding(16.dp)
             ) {
+
+                if (sendStatus == FeedbackSendStatus.Failed) {
+                    URInlineErrorText(stringResource(id = R.string.feedback_send_failed))
+                    Spacer(modifier = Modifier.height(8.dp))
+                }
 
                 URButton(
                     onClick = {
                         submitFeedback()
                         keyboardController?.hide()
                     },
-                    enabled = isSendEnabled
+                    enabled = isSendEnabled,
+                    isProcessing = isSending,
                 ) { buttonTextStyle ->
                     Row {
                         Text(
-                            stringResource(id = R.string.send),
+                            stringResource(id = if (isSending) R.string.feedback_sending else R.string.send),
                             style = buttonTextStyle
                         )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.ArrowForward,
-                            contentDescription = "Right Arrow",
-                            modifier = Modifier.size(16.dp),
-                            tint = if (isSendEnabled) Color.White else Color.Gray
-                        )
+                        if (!isSending) {
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.ArrowForward,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp),
+                                tint = if (isSendEnabled) Color.White else Color.Gray
+                            )
+                        }
                     }
                 }
 
@@ -203,98 +217,32 @@ fun FeedbackScreen(
         }
     ) { innerPadding ->
 
-        if (isTablet() && !isLandscape) {
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .verticalScroll(rememberScrollState())
-                    .padding(innerPadding)
-                    .padding(16.dp)
-                    .pointerInput(Unit) {
-                        detectTapGestures(onTap = {
-                            keyboardController?.hide()
-                        })
-                    },
-            ) {
+        // one form for every window: the full width of a phone, and centered in
+        // the readable column of a wider window (it was pinned to the left at 512dp)
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+                .tabletReadableColumn()
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp)
+                .pointerInput(Unit) {
+                    detectTapGestures(onTap = {
+                        keyboardController?.hide()
+                    })
+                },
+        ) {
 
-                FeedbackForm(
-                    feedbackMsg = feedbackMsg,
-                    setFeedbackMsg = setFeedbackMsg,
-                    sendFeedback = {
-                        if (feedbackMsg.text.isNotEmpty()) {
-                            submitFeedback()
-                        }
-                    },
-                    starCount = starCount,
-                    setStarCount = setStarCount,
-                    includeLogs = includeLogs,
-                    toggleIncludeLogs = toggleIncludeLogs,
-                    keyboardController = keyboardController
-                )
-
-            }
-        } else if (isTablet() && isLandscape) {
-            Column(
-                modifier = Modifier
-                    .pointerInput(Unit) {
-                        detectTapGestures(onTap = {
-                            keyboardController?.hide()
-                        })
-                    }
-                    .width(512.dp)
-                    .verticalScroll(rememberScrollState())
-                    .padding(innerPadding)
-                    .padding(16.dp),
-            ) {
-
-                FeedbackForm(
-                    feedbackMsg = feedbackMsg,
-                    setFeedbackMsg = setFeedbackMsg,
-                    sendFeedback = {
-                        if (feedbackMsg.text.isNotEmpty()) {
-                            submitFeedback()
-                        }
-                    },
-                    starCount = starCount,
-                    setStarCount = setStarCount,
-                    includeLogs = includeLogs,
-                    toggleIncludeLogs = toggleIncludeLogs,
-                    keyboardController = keyboardController
-                )
-
-            }
-        } else {
-            /**
-             * phone
-             */
-
-            Column(
-                modifier = Modifier
-                    .width(512.dp)
-                    .fillMaxHeight()
-                    .verticalScroll(rememberScrollState())
-                    .padding(16.dp)
-                    .padding(innerPadding)
-                    .pointerInput(Unit) {
-                        detectTapGestures(onTap = {
-                            keyboardController?.hide()
-                        })
-                    }
-                ,
-                verticalArrangement = Arrangement.SpaceBetween
-            ) {
-
-                FeedbackForm(
-                    feedbackMsg = feedbackMsg,
-                    setFeedbackMsg = setFeedbackMsg,
-                    sendFeedback = { submitFeedback() },
-                    starCount = starCount,
-                    setStarCount = setStarCount,
-                    includeLogs = includeLogs,
-                    toggleIncludeLogs = toggleIncludeLogs,
-                    keyboardController = keyboardController
-                )
-            }
+            FeedbackForm(
+                feedbackMsg = feedbackMsg,
+                setFeedbackMsg = setFeedbackMsg,
+                sendFeedback = { submitFeedback() },
+                starCount = starCount,
+                setStarCount = setStarCount,
+                includeLogs = includeLogs,
+                toggleIncludeLogs = toggleIncludeLogs,
+                keyboardController = keyboardController
+            )
         }
 
     }
@@ -324,22 +272,21 @@ private fun FeedbackForm(
     keyboardController: SoftwareKeyboardController?
 ) {
 
-    val supportUrl = "https://discord.com/invite/RUNZXMwPRK"
+    val context = LocalContext.current
 
-    val uriHandler = LocalUriHandler.current
-    
-    val discordText = "Discord"
-    val feedbackFull = stringResource(id = R.string.send_feedback, discordText)
-
-    val startIndex = feedbackFull.indexOf(discordText)
-    val endIndex = startIndex + discordText.length
+    // the email sits next to Discord, which is unreachable in some regions
+    val feedbackFull = stringResource(
+        id = R.string.send_feedback_contact,
+        SupportContact.EMAIL,
+        SupportContact.DISCORD_NAME,
+    )
 
     val feedbackAnnotatedString = buildAnnotatedString {
         withStyle(style = MaterialTheme.typography.bodyLarge.toSpanStyle().copy(color = Color.White)) {
             append(feedbackFull)
-            if (startIndex >= 0) {
-                addStyle(SpanStyle(color = Pink), startIndex, endIndex)
-                addStringAnnotation("URL", supportUrl, startIndex, endIndex)
+            for (span in supportLinkSpans(feedbackFull, SupportContact.feedbackLinks)) {
+                addStyle(SpanStyle(color = Pink), span.start, span.end)
+                addStringAnnotation("URL", span.uri, span.start, span.end)
             }
         }
     }
@@ -368,7 +315,7 @@ private fun FeedbackForm(
                             .firstOrNull()
 
                         if (annotation?.tag == "URL") {
-                            uriHandler.openUri(annotation.item)
+                            openSupportUri(context, annotation.item)
                         }
                     }
                 }
@@ -397,7 +344,8 @@ private fun FeedbackForm(
             keyboardController = keyboardController
         )
 
-        Spacer(modifier = Modifier.height(16.dp))
+        // the switch's 48 dp touch target fills the rest
+        Spacer(modifier = Modifier.height(4.dp))
 
         Row(
             modifier = Modifier
@@ -442,9 +390,10 @@ private fun FeedbackForm(
                     rememberVectorPainter(image = ImageVector.vectorResource(id = R.drawable.baseline_star_outline_24))
                 }
 
+                // each star names the rating it gives, and a filled one reads as selected
                 Icon(
                     painter = starIcon,
-                    contentDescription = if (index <= starCount) "Filled star" else "Empty star",
+                    contentDescription = pluralStringResource(id = R.plurals.feedback_star_count, count = index, index),
                     tint = Pink,
                     modifier = Modifier
                         .size(32.dp)
@@ -453,6 +402,7 @@ private fun FeedbackForm(
                             setStarCount(index)
                             // starCount.value = index
                         }
+                        .semantics { if (index <= starCount) selected = true }
                 )
                 Spacer(modifier = Modifier.width(8.dp))
             }
@@ -480,6 +430,7 @@ private fun FeedbackScreenPreview() {
                     sendFeedback = {},
                     launchOverlay = {},
                     isSendEnabled = true,
+                    sendStatus = FeedbackSendStatus.Idle,
                     starCount = 3,
                     setStarCount = {},
                     bundleStore = null,

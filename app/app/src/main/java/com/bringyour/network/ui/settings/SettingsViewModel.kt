@@ -19,11 +19,13 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.bringyour.network.DeviceManager
 import com.bringyour.network.ForegroundDeviceControllerOwner
+import com.bringyour.network.ProvidePauseState
 import com.bringyour.network.TAG
 import com.bringyour.network.ui.shared.models.ProvideControlMode
 import com.bringyour.network.ui.shared.models.provideIndicatorDotColorFor
 import com.bringyour.network.ui.shared.models.provideIndicatorRingColorFor
 import com.bringyour.network.ui.shared.models.ProvideNetworkMode
+import com.bringyour.network.ui.shared.models.ProvidePowerMode
 import com.bringyour.network.ui.theme.Green
 import com.bringyour.network.ui.theme.Red
 import com.bringyour.network.ui.theme.Yellow
@@ -48,6 +50,7 @@ import javax.inject.Inject
 @HiltViewModel
 class SettingsViewModel @Inject constructor(
     private val deviceManager: DeviceManager,
+    private val providePauseState: ProvidePauseState,
     @ApplicationContext private val context: Context
 ): ViewModel(), DefaultLifecycleObserver {
 
@@ -67,7 +70,7 @@ class SettingsViewModel @Inject constructor(
     private val _requestPermission = MutableStateFlow(false)
     val requestPermission: StateFlow<Boolean> = _requestPermission
 
-    // the LIVE effective provide mode — drives the provide indicator.
+    // the live effective provide mode — drives the provide indicator.
     // ProvideMode is a bit set: compare per-case, never with ranges.
     private val _provideMode = MutableStateFlow(Sdk.ProvideModeNone)
     val provideMode: StateFlow<Long> = _provideMode
@@ -189,6 +192,15 @@ class SettingsViewModel @Inject constructor(
         _allowProvideOnCell.value = !currentValue
     }
 
+    /**
+     * When this device provides on battery; stored with the app
+     */
+    val providePowerMode: StateFlow<ProvidePowerMode> = providePauseState.powerMode
+
+    val setProvidePowerMode: (ProvidePowerMode) -> Unit = { mode ->
+        providePauseState.setPowerMode(mode)
+    }
+
     private val _isCreatingAuthCode = MutableStateFlow(false)
     val isCreatingAuthCode: StateFlow<Boolean> = _isCreatingAuthCode
 
@@ -276,37 +288,58 @@ class SettingsViewModel @Inject constructor(
         this.provideControlMode = mode
     }
 
+    /**
+     * Deletes the account. `onSuccess` runs only once it is deleted, with the
+     * device signed in when the user asked, the one to sign out: the server
+     * answers later, possibly after it signed that account out and the next
+     * account signed in (MainApplication.logout(signedOutDevice)). A server
+     * refusal (an error in the result) or a transport error runs `onFailure`
+     * with the failed outcome, and the user stays signed in and may retry.
+     */
     val deleteAccount: (
-            onSuccess: () -> Unit,
-            onFailure: (Exception?) -> Unit
+            onSuccess: (signedOutDevice: DeviceLocal) -> Unit,
+            onFailure: (DeleteAccountOutcome.Failed) -> Unit
             ) -> Unit = { onSuccess, onFailure ->
 
                 _isDeletingAccount.value = true
 
-        deviceManager.device?.api?.networkDelete { _, exception ->
+        val signedOutDevice = deviceManager.device
+        signedOutDevice?.api?.networkDelete { result, exception ->
+
+            val outcome = DeleteAccountOutcome.of(
+                exception = exception,
+                resultPresent = result != null,
+                resultHasError = result?.error != null,
+                resultErrorMessage = result?.error?.message,
+            )
 
             viewModelScope.launch {
 
-                if (exception != null) {
-                    onFailure(exception)
-                } else {
-                    onSuccess()
+                when (outcome) {
+                    is DeleteAccountOutcome.Deleted -> onSuccess(signedOutDevice)
+                    is DeleteAccountOutcome.Failed -> {
+                        Log.i(TAG, "Error deleting account: ${exception?.message ?: outcome.serverMessage}")
+                        onFailure(outcome)
+                    }
                 }
                 _isDeletingAccount.value = false
 
             }
         } ?: run {
             _isDeletingAccount.value = false
+            onFailure(DeleteAccountOutcome.Failed(null))
         }
     }
 
     private val _isAddingAuth = MutableStateFlow(false)
     val isAddingAuth: StateFlow<Boolean> = _isAddingAuth
 
+    // the refusal carries the server's code: a pasted Bittensor signature from
+    // another account has its own words (AddAuthMethodSheet)
     val addAuth: (
         args: AddAuthArgs,
         onSuccess: () -> Unit,
-        onError: (String) -> Unit
+        onError: (AddAuthRefusal) -> Unit
     ) -> Unit = { args, onSuccess, onError ->
 
         _isAddingAuth.value = true
@@ -316,18 +349,18 @@ class SettingsViewModel @Inject constructor(
                 _isAddingAuth.value = false
 
                 if (err != null) {
-                    onError(err.message ?: "Failed to add sign-in method")
+                    onError(AddAuthRefusal(err.message ?: "Failed to add sign-in method"))
                 } else if (result?.error != null) {
-                    onError(result.error.message ?: "Failed to add sign-in method")
+                    onError(AddAuthRefusal(result.error.message ?: "Failed to add sign-in method", result.error.code))
                 } else if (result != null) {
                     onSuccess()
                 } else {
-                    onError("Failed to add sign-in method")
+                    onError(AddAuthRefusal("Failed to add sign-in method"))
                 }
             }
         } ?: run {
             _isAddingAuth.value = false
-            onError("Unable to connect. Please try again.")
+            onError(AddAuthRefusal("Unable to connect. Please try again."))
         }
     }
 
@@ -531,7 +564,7 @@ class SettingsViewModel @Inject constructor(
         device: DeviceLocal,
         vc: AccountPreferencesViewController,
     ) {
-        // Track the LIVE effective provide mode: Network provide (same-network
+        // Track the live effective provide mode: Network provide (same-network
         // peers) is always active, so the provider merely existing
         // (provideEnabled) no longer means the device provides publicly.
         // ProvideMode is a bit set: compare per-case, never with ranges.
@@ -561,7 +594,7 @@ class SettingsViewModel @Inject constructor(
         sub?.let { subs.add(it) }
     }
 
-    // the indicator encodes the LIVE effective provide tier (apple parity):
+    // the indicator encodes the live effective provide tier (apple parity):
     // Network provide (incl. Auto while idle) = solid green dot; Public
     // provide = green dot + outer green ring (yellow while paused, which
     // stops public only); not providing = red dot, no ring

@@ -90,11 +90,13 @@ fun TransportSettingsScreen(
 
     val currentSettings = transportSettingsViewModel.settings(kind)
     val runtimeStatus = transportSettingsViewModel.status(kind)
+    // the editor opens only on the policy in force, never on the default
+    // while it is unknown: an Update from that form would replace the real
+    // policy. It follows the policy until the user edits
     LaunchedEffect(currentSettings) {
-        if (!edited) {
-            val start = currentSettings ?: defaultSettings
-            original = start
-            draft = TransportSettingsUi(start.sdk.clone() ?: start.sdk)
+        if (!edited && currentSettings != null) {
+            original = currentSettings
+            draft = TransportSettingsUi(currentSettings.sdk.clone() ?: currentSettings.sdk)
         }
     }
 
@@ -144,7 +146,7 @@ fun TransportSettingsScreen(
                 },
                 navigationIcon = {
                     IconButton(onClick = { navController.popBackStack() }) {
-                        Icon(Icons.AutoMirrored.Filled.KeyboardArrowLeft, contentDescription = "Back")
+                        Icon(Icons.AutoMirrored.Filled.KeyboardArrowLeft, contentDescription = stringResource(id = R.string.back))
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
@@ -245,10 +247,9 @@ fun TransportSettingsScreen(
                         Spacer(modifier = Modifier.height(16.dp))
                     }
                     SettingsGroup(title = stringResource(id = R.string.enabled_under_auto)) {
-                        selectable.forEachIndexed { index, transport ->
-                            if (0 < index) {
-                                Spacer(modifier = Modifier.height(12.dp))
-                            }
+                        // no spacers: the switches' 48 dp touch targets space the
+                        // rows and the footer
+                        selectable.forEach { transport ->
                             val enabled = currentDraft.isAutoEnabled(transport)
                             AutoToggleRow(
                                 transport = transport,
@@ -267,7 +268,6 @@ fun TransportSettingsScreen(
                                 }
                             )
                         }
-                        Spacer(modifier = Modifier.height(8.dp))
                         Text(
                             stringResource(id = R.string.enabled_under_auto_footer),
                             style = MaterialTheme.typography.bodySmall,
@@ -302,14 +302,28 @@ fun TransportSettingsScreen(
 
             }
 
+            // pinned below the scrolling content; on a tablet it is exactly as
+            // wide as the content column above it, never the whole screen
             Column(
-                modifier = Modifier.padding(16.dp)
+                modifier = Modifier
+                    .tabletReadableColumn()
+                    .padding(16.dp)
             ) {
                 URButton(
                     onClick = {
+                        val editedFrom = original
                         draft?.let {
-                            transportSettingsViewModel.apply(it.sdk, kind)
-                            navController.popBackStack()
+                            if (editedFrom != null && transportSettingsViewModel.apply(it.sdk, kind, editedFrom)) {
+                                navController.popBackStack()
+                            } else {
+                                // the policy changed under the editor: start
+                                // again from the one in force
+                                edited = false
+                                transportSettingsViewModel.settings(kind)?.let { current ->
+                                    original = current
+                                    draft = TransportSettingsUi(current.sdk.clone() ?: current.sdk)
+                                }
+                            }
                         }
                     },
                     enabled = isDirty
@@ -389,7 +403,9 @@ private fun AutoToggleRow(
         Box(modifier = Modifier.weight(1f)) {
             TransportLabel(transport, showsDetail = false)
         }
-        Spacer(modifier = Modifier.width(12.dp))
+        // the gap next to the switch is 6 dp less: its touch target adds 6 dp
+        // of its own
+        Spacer(modifier = Modifier.width(if (constrained) 12.dp else 6.dp))
         if (constrained) {
             // a runtime warning, not an editing restriction: the toggle stays
             // editable
@@ -399,7 +415,7 @@ private fun AutoToggleRow(
                 tint = Amber,
                 modifier = Modifier.size(18.dp),
             )
-            Spacer(modifier = Modifier.width(8.dp))
+            Spacer(modifier = Modifier.width(2.dp))
         }
         URSwitch(
             checked = checked,

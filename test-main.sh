@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MPL-2.0
 #
-# Product acceptance test for the LOCAL Android app against the production
+# Product acceptance test for the local Android app against the production
 # ("main") environment.  It builds and installs each shipping target, drives
 # the real Compose UI, creates or restores an instant account, logs out, logs
 # back in with its 24-word secret key, then uses the acceptance account to
@@ -9,23 +9,29 @@
 # log out.
 #
 # Targets: github, play, solana_dapp, and the ungoogled github source transform
-# shipped by F-Droid. GitHub and F-Droid run on every eligible supported-ARM
-# device, Play requires Google Play services, and Solana requires Seeker or
-# Saga hardware. All share one application id, so each compatible device/target
+# shipped by F-Droid. GitHub, Play and F-Droid run on the owned acceptance AVD;
+# Solana runs only on the explicitly authorized physical Saga/Seeker serial.
+# Play requires Google Play services. All share one application id, so each device/target
 # cell starts from a clean install while securely restoring the same
 # recoverable account fixture.
 #
 # Usage:
-#   ./test-main.sh                         all targets on every eligible device
+#   ./test-main.sh                         owned AVD plus authorized physical Solana lane
+#   ./test-main.sh --profile=smoke         github only; no peer-to-peer phase
+#   ./test-main.sh --profile=flavor --flavor=play
+#                                          selected flavor(s); no peer-to-peer phase
 #   ./test-main.sh --repeat=5              five full passes per target
 #   ./test-main.sh --flavor=github         one target (repeatable/comma-separated)
-#   ./test-main.sh --smoke                  install and launch every compatible cell only
-#   ./test-main.sh --skip-build            reuse APKs and build-id sidecars
+#   ./test-main.sh --smoke                 install and launch every compatible cell only
+#   ./test-main.sh --skip-build            reuse APKs only when their inputs match
 #   ./test-main.sh --headless              start the AVD without a window
 #   ./test-main.sh --keep-emulator         leave an emulator started here running
 #   ./test-main.sh --keep-fixture          retain the recoverable account for another app
 #   ./test-main.sh --diagnostic-device=<serial> --diagnostic-case=peer-to-peer --flavor=github
 #                                             one diagnostic P2P cell; never final proof
+#   ./test-main.sh --diagnostic-owned-avd --diagnostic-case=peer-to-peer --flavor=play
+#                                             fresh owned AVD, P2P only, no account signup;
+#                                             never final proof; mandatory cleanup
 #
 # Environment:
 #   UR_ACCEPT_VAULT=<path>                 alternate tests.yml fixture vault
@@ -38,9 +44,9 @@
 #
 # The private device unlock code is read from android.unlock_code in tests.yml.
 #
-# Reserved performance devices are always excluded from acceptance:
-#   Pixel 8 Pro (3B161FDJG001KT)
-#   Galaxy S24 Ultra (R5CX21FY6ND)
+# The reserved performance phones are always excluded from acceptance. Their adb
+# serials are read from android.performance_device_serials in tests.yml, beside
+# the unlock code; a run without them stops before any device is touched.
 set -euo pipefail
 umask 077
 
@@ -55,16 +61,25 @@ headless="${HEADLESS:-0}"
 keep_emulator=0
 keep_fixture="${UR_ACCEPT_KEEP_FIXTURE:-0}"
 result_matrix="${UR_ACCEPT_RESULT_FILE:-}"
+profile="${UR_ACCEPT_PROFILE:-full}"
 smoke_only=0
 targets="github play solana_dapp fdroid"
 selected_targets=""
 selected_flavor_value=""
 flavor_selector_count=0
+run_peer_to_peer=1
+main_test_scope="com.bringyour.network.acceptance.EgressProbeRequestTest,com.bringyour.network.acceptance.MainAcceptanceTest"
+# The USDC quote case runs on its own so it is measured on its own. Folded into
+# the main scope, a payment-construction regression would be reported as five
+# unrelated auth failures.
+usdc_test_scope="com.bringyour.network.acceptance.SolanaPayQuoteAcceptanceTest"
 diagnostic_device=""
+diagnostic_owned_avd=0
+diagnostic_device_origin=attached-physical
 diagnostic_case=""
 diagnostic_device_seen=0
 diagnostic_case_seen=0
-reserved_device_serials=(3B161FDJG001KT R5CX21FY6ND)
+reserved_device_serials=()
 
 for arg in "$@"; do
   case "$arg" in
@@ -79,13 +94,23 @@ for arg in "$@"; do
       selected_flavor_value="${arg#*=}"
       selected_targets="$selected_targets $selected_flavor_value"
       ;;
+    --profile=*) profile="${arg#*=}" ;;
     --diagnostic-device=*)
       [ "$diagnostic_device_seen" -eq 0 ] || {
-        echo "--diagnostic-device may be supplied only once" >&2
+        echo "select exactly one --diagnostic-device or --diagnostic-owned-avd" >&2
         exit 2
       }
       diagnostic_device_seen=1
       diagnostic_device="${arg#*=}"
+      ;;
+    --diagnostic-owned-avd)
+      [ "$diagnostic_device_seen" -eq 0 ] || {
+        echo "select exactly one --diagnostic-device or --diagnostic-owned-avd" >&2
+        exit 2
+      }
+      diagnostic_device_seen=1
+      diagnostic_owned_avd=1
+      diagnostic_device_origin=runner-owned-avd
       ;;
     --diagnostic-case=*)
       [ "$diagnostic_case_seen" -eq 0 ] || {
@@ -112,24 +137,66 @@ case "$repeat_count" in
   ''|*[!0-9]*) echo "--repeat must be a positive integer" >&2; exit 2 ;;
   0) echo "--repeat must be at least 1" >&2; exit 2 ;;
 esac
+
+case "$profile" in
+  full) ;;
+  smoke)
+    targets="github"
+    run_peer_to_peer=0
+    ;;
+  flavor)
+    [ -n "$selected_targets" ] || {
+      echo "--profile=flavor requires at least one --flavor" >&2
+      exit 2
+    }
+    targets="github"
+    run_peer_to_peer=0
+    ;;
+  *) echo "unknown profile: $profile (expected full, smoke, or flavor)" >&2; exit 2 ;;
+esac
 if [ "$execution_mode" = diagnostic ]; then
-  android_acceptance_validate_diagnostic_request \
-    "$diagnostic_device" "$diagnostic_case" \
-    "$flavor_selector_count" "$selected_flavor_value" \
-    "$repeat_count" "$skip_build" "$smoke_only" \
-    "$keep_emulator" "$keep_fixture" "$result_matrix" \
-    "${reserved_device_serials[@]}" || exit $?
+  [ "$profile" = full ] || {
+    echo "diagnostic peer-to-peer requires --profile=full" >&2
+    exit 2
+  }
+  if [ "$diagnostic_owned_avd" -eq 1 ]; then
+    android_acceptance_validate_owned_avd_diagnostic_request \
+      "$diagnostic_case" "$flavor_selector_count" "$selected_flavor_value" \
+      "$repeat_count" "$skip_build" "$smoke_only" \
+      "$keep_emulator" "$keep_fixture" "$result_matrix" || exit $?
+    diagnostic_selector=--diagnostic-owned-avd
+  else
+    android_acceptance_validate_diagnostic_request \
+      "$diagnostic_device" "$diagnostic_case" \
+      "$flavor_selector_count" "$selected_flavor_value" \
+      "$repeat_count" "$skip_build" "$smoke_only" \
+      "$keep_emulator" "$keep_fixture" "$result_matrix" || exit $?
+    # the reserved phones are checked once tests.yml has been read, below
+    diagnostic_selector="--diagnostic-device=$diagnostic_device"
+  fi
 fi
 acceptance_timeout_seconds=$((900 + repeat_count * 900))
 
 if [ -n "$selected_targets" ]; then
   targets="$(printf '%s\n' "$selected_targets" | tr ',' ' ')"
 fi
+unique_targets=""
 for target in $targets; do
   case "$target" in github|play|solana_dapp|fdroid) ;; *) echo "unknown flavor: $target" >&2; exit 2 ;; esac
+  case " $unique_targets " in
+    *" $target "*) ;;
+    *) unique_targets="$unique_targets $target" ;;
+  esac
 done
+targets="${unique_targets# }"
+canonical_solana_serial=""
+if [ "$execution_mode" = canonical ]; then
+  case " $targets " in
+    *" solana_dapp "*) canonical_solana_serial="$(android_acceptance_canonical_solana_serial)" ;;
+  esac
+fi
 build_targets="$targets"
-if [ "$smoke_only" -ne 1 ]; then
+if [ "$smoke_only" -ne 1 ] && [ "$run_peer_to_peer" -eq 1 ]; then
   case " $targets " in
     *" play "*|*" solana_dapp "*)
       case " $targets " in
@@ -141,6 +208,9 @@ if [ "$smoke_only" -ne 1 ]; then
 fi
 
 die() { echo "[android acceptance] ERROR: $*" >&2; exit 1; }
+if [ -n "$result_matrix" ] && { [ "$profile" != full ] || [ -n "$selected_targets" ]; }; then
+  die "a partial profile or --flavor selection cannot write UR_ACCEPT_RESULT_FILE; use the full default matrix"
+fi
 network_test_gate="$root/tests/network-intensive-suite-lock.sh"
 if [ ! -x "$network_test_gate" ]; then
   echo "Android acceptance suite gate is missing or not executable: $network_test_gate" >&2
@@ -152,6 +222,17 @@ if [ "${URNETWORK_NETWORK_TEST_LOCK_HELD:-}" != 1 ]; then
 fi
 if ! "$network_test_gate" --verify-held main-acceptance; then
   echo "Android acceptance inherited an invalid network-intensive lock" >&2
+  exit 70
+fi
+if [ -n "${URNETWORK_ANDROID_SDK_OUTPUT_LOCK_HELD:-}" ] ||
+   [ -n "${URNETWORK_ANDROID_SDK_OUTPUT_LOCK_DIR:-}" ] ||
+   [ -n "${URNETWORK_ANDROID_SDK_OUTPUT_LOCK_PATH:-}" ] ||
+   [ -n "${URNETWORK_ANDROID_SDK_OUTPUT_LOCK_FD:-}" ] ||
+   [ -n "${URNETWORK_ANDROID_SDK_OUTPUT_LOCK_TOKEN:-}" ] ||
+   [ -n "${URNETWORK_ANDROID_SDK_OUTPUT_LOCK_ROLE:-}" ]; then
+  echo "Android acceptance must not inherit URNETWORK_ANDROID_SDK_OUTPUT_LOCK_*;" \
+    "launch test-main.sh without an outer SDK-output gate because its build" \
+    "and consumer phases acquire that gate internally" >&2
   exit 70
 fi
 
@@ -168,6 +249,24 @@ config_reader="$root/tests/read-tests-config.sh"
 [ -x "$config_reader" ] || die "test config reader is missing: $config_reader"
 UR_ACCEPT_VAULT="$vault" "$config_reader" --ready validate
 android_unlock_code="$(UR_ACCEPT_VAULT="$vault" "$config_reader" get android.unlock_code)"
+# Acceptance never touches the reserved performance phones. Their serials come
+# from tests.yml beside the unlock code, never from this repository, so a run
+# without them stops here, before any build or device work. A physical
+# diagnostic target is checked against them now that they are known.
+reserved_serial_lines="$(android_acceptance_reserved_device_serials "$config_reader" "$vault")" || exit 1
+while IFS= read -r reserved_serial; do
+  reserved_device_serials+=("$reserved_serial")
+done <<<"$reserved_serial_lines"
+if [ "$execution_mode" = diagnostic ] && [ "$diagnostic_owned_avd" -eq 0 ]; then
+  android_acceptance_validate_diagnostic_request \
+    "$diagnostic_device" "$diagnostic_case" \
+    "$flavor_selector_count" "$selected_flavor_value" \
+    "$repeat_count" "$skip_build" "$smoke_only" \
+    "$keep_emulator" "$keep_fixture" "$result_matrix" \
+    "${reserved_device_serials[@]}" || exit $?
+fi
+# Bash 3.2 treats an empty array as unset under nounset. The guarded command
+# expansions below preserve zero optional arguments without disabling set -u.
 gradle_worker_args=()
 if android_parallelism="$(android_acceptance_positive_parallelism "${GOMAXPROCS:-}")"; then
   gradle_worker_args=(--max-workers "$android_parallelism")
@@ -183,6 +282,14 @@ sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/Library/Android/sdk}}"
 adb="$sdk_root/platform-tools/adb"
 emulator="$sdk_root/emulator/emulator"
 avd_name="${UR_ACCEPT_ANDROID_AVD:-urnetwork-acceptance}"
+# The tabletop job (apple/DUO.md item 7): ConnectTabletopTest folds a Pixel
+# Fold into tabletop and checks connect's split at the fold. It runs once, after
+# the device/flavor cells, on its own Gradle Managed Device (app/app/build.gradle),
+# which Gradle creates, boots and shuts down; never on $avd_name or a fleet device.
+tabletop_managed_device=pixelFoldApi36
+tabletop_test_scope="com.bringyour.network.ui.connect.ConnectTabletopTest"
+# shellcheck disable=SC2086
+tabletop_target="$(android_acceptance_tabletop_target "$execution_mode" "$smoke_only" $targets)"
 tools_dir="${UR_ACCEPT_ANDROID_TOOLS:-$root/build/all/android/.acceptance-tools}"
 case "$tools_dir" in
   /*) ;;
@@ -192,20 +299,44 @@ esac
 available_avds="$("$emulator" -list-avds)" || die "could not list Android virtual devices"
 grep -Fxq "$avd_name" <<<"$available_avds" || \
   die "AVD $avd_name is missing; run $root/build/all/android/setup.sh"
+if [ "$avd_name" = urnetwork-acceptance ]; then
+  legacy_avd_state="$(android_acceptance_retire_legacy_reserved_avd \
+    "$adb" "$avd_name")" || \
+    die "could not safely retire or classify the reserved acceptance AVD"
+  if [ "$legacy_avd_state" = retired ]; then
+    echo "[android acceptance] retired a default-ID legacy acceptance AVD instance"
+  fi
+fi
+running_avd_status=0
+android_acceptance_no_running_avd "$adb" "$avd_name" || running_avd_status=$?
+case "$running_avd_status" in
+  0) ;;
+  1) die "AVD $avd_name is already running outside this acceptance invocation; stop it explicitly before running acceptance" ;;
+  *) die "could not prove that AVD $avd_name has no pre-existing emulator instance" ;;
+esac
 
 timestamp="$(date +%Y%m%d-%H%M%S)"
 artifacts="$here/tests/__acceptance__/$timestamp"
 mkdir -p "$artifacts" "$(dirname "$fixture")"
+results_ndjson="$artifacts/results.ndjson"
+result_summary_script="$here/scripts/acceptance-result.mjs"
+[ -f "$result_summary_script" ] || die "acceptance result summarizer is missing: $result_summary_script"
+: >"$results_ndjson"
+chmod 600 "$results_ndjson"
 run_dir="$(mktemp -d "${TMPDIR:-/tmp}/urnetwork-android-acceptance.XXXXXX")"
 chmod 700 "$run_dir"
 serial=""
 emulator_pid=""
+emulator_owner_token=""
 started_emulator=0
 started_emulator_serial=""
 peer_serial=""
 peer_emulator_pid=""
+peer_emulator_owner_token=""
 provider_session_pid=""
 client_session_pid=""
+provider_session_out=""
+client_session_out=""
 p2p_cleanup_failed=0
 fdroid_tree=""
 private_staging=""
@@ -215,6 +346,7 @@ captured_device_serials="$run_dir/captured-device-serials"
 device_serials="$run_dir/device-serials"
 excluded_devices="$artifacts/excluded-devices.tsv"
 device_records="$run_dir/device-records"
+device_cleanup_records="$run_dir/device-cleanup-records"
 device_inventory="$artifacts/devices.tsv"
 device_capabilities="$run_dir/device-capabilities"
 device_plan="$artifacts/device-flavor-plan.tsv"
@@ -251,44 +383,99 @@ pull_active_clients() {
 }
 
 release_active_clients() {
-  local directory="$1" active result=0
+  local directory="$1" active timeout_seconds
+  local -a active_clients=()
   [ -n "$credentials" ] || return 1
   while IFS= read -r active; do
-    if ! UR_ACCEPT_CREDENTIALS_FILE="$credentials" \
-      timeout 90 node "$root/build/all/acceptance/client-cleanup.mjs" "$active"; then
-      result=1
-    fi
-  done < <(find "$directory" -type f -name 'active-client-id-*' -print 2>/dev/null | LC_ALL=C sort)
-  return "$result"
+    [ -s "$active" ] || continue
+    active_clients+=("$active")
+  done < <(find "$directory" -type f \
+    \( -name 'active-client-id-*' -o -name 'physical-active-client-id' \) \
+    -print 2>/dev/null | LC_ALL=C sort)
+  [ "${#active_clients[@]}" -gt 0 ] || return 0
+
+  # Each unique client makes two independently bounded API calls. The shared
+  # CLI groups aliases before those calls and continues across independent
+  # client groups, so give it a finite outer guard without reverting to one
+  # process (and one destructive remove) per marker.
+  timeout_seconds=$((30 + 60 * ${#active_clients[@]}))
+  UR_ACCEPT_CREDENTIALS_FILE="$credentials" \
+    timeout "$timeout_seconds" node \
+    "$root/build/all/acceptance/client-cleanup.mjs" "${active_clients[@]}"
 }
 
 # Invoked through the EXIT/INT/TERM traps installed below.
 # shellcheck disable=SC2329
 cleanup() {
   exit_status=$?
-  local package_label
+  local package_label staging_owned=1
+  local peer_cleanup_grace=0 fallback_cleanup_grace=0
+  local session_role session_out session_status
   local_device_count=0
   local_pair_count=0
-  for session_pid in "$provider_session_pid" "$client_session_pid"; do
+  for session_role in provider client; do
+    if [ "$session_role" = provider ]; then
+      session_pid="$provider_session_pid"; session_out="$provider_session_out"
+    else
+      session_pid="$client_session_pid"; session_out="$client_session_out"
+    fi
     [ -n "$session_pid" ] || continue
     if kill -0 "$session_pid" 2>/dev/null; then
       kill -TERM "$session_pid" 2>/dev/null || true
     fi
-    wait "$session_pid" 2>/dev/null || true
+    session_status=0
+    wait "$session_pid" 2>/dev/null || session_status=$?
+    [ -z "$session_out" ] || android_acceptance_record_session_exit \
+      "$session_out" "$session_role" "$session_pid" "$session_status" trap || true
   done
   if [ -n "$private_staging_serial" ] && [ -n "$private_staging" ]; then
-    timeout 15 "$adb" -s "$private_staging_serial" shell rm -f "$private_staging" >/dev/null 2>&1 || true
+    authorize_selected_device "$private_staging_serial" || staging_owned=0
+    if [ "$private_staging_serial" = "$started_emulator_serial" ] && \
+       [ -n "$emulator_pid" ]; then
+      android_acceptance_runner_owns_emulator \
+        "$adb" "$private_staging_serial" "$avd_name" "$emulator_pid" \
+        "$emulator_owner_token" || \
+        staging_owned=0
+    elif [ "$private_staging_serial" = "$peer_serial" ] && \
+         [ -n "$peer_emulator_pid" ]; then
+      android_acceptance_runner_owns_emulator \
+        "$adb" "$private_staging_serial" "$avd_name" "$peer_emulator_pid" \
+        "$peer_emulator_owner_token" || \
+        staging_owned=0
+    fi
+    if [ "$staging_owned" -eq 1 ]; then
+      timeout 15 "$adb" -s "$private_staging_serial" shell rm -f "$private_staging" >/dev/null 2>&1 || true
+    else
+      echo "[android acceptance] refused private staging cleanup after emulator ownership was lost" >&2
+      exit_status=1
+    fi
   fi
 
   mkdir -p "$artifacts/cleanup-clients"
   if [ -f "$device_records" ]; then
+    local_device_count="$(wc -l <"$device_records" | tr -d ' ')"
+  fi
+  if [ -f "$device_cleanup_records" ]; then
     while IFS=$'\t' read -r device_id target_serial extra <&3; do
       [ -n "$device_id" ] && [ -n "$target_serial" ] && [ -z "${extra:-}" ] || continue
-      local_device_count=$((local_device_count + 1))
       serial="$target_serial"
       device_cleanup="$artifacts/cleanup-clients/$device_id"
       state_file="$run_dir/devices/$device_id/animation-scales"
       mkdir -p "$device_cleanup"
+      if ! authorize_selected_device "$serial"; then
+        echo "[android acceptance] refused cleanup after selected-device authorization was lost" >&2
+        exit_status=1
+        continue
+      fi
+      if [ "$started_emulator" -eq 1 ] && \
+         [ "$serial" = "$started_emulator_serial" ] && \
+         ! android_acceptance_runner_owns_emulator \
+           "$adb" "$serial" "$avd_name" "$emulator_pid" \
+           "$emulator_owner_token"; then
+        echo "[android acceptance] refused fallback cleanup after emulator ownership was lost" >&2
+        exit_status=1
+        continue
+      fi
       if android_acceptance_adb_device_ready "$adb" "$serial"; then
         if [ "$smoke_only" -ne 1 ]; then
           if android_acceptance_manages_account_fixture "$execution_mode" "$smoke_only" && \
@@ -324,13 +511,16 @@ cleanup() {
         echo "[android acceptance] selected device $serial is unreachable during cleanup" >&2
         exit_status=1
       fi
-    done 3<"$device_records"
+    done 3<"$device_cleanup_records"
   fi
 
   if [ -n "$peer_serial" ]; then
     peer_cleanup="$artifacts/cleanup-clients/peer"
     mkdir -p "$peer_cleanup"
-    if android_acceptance_adb_device_ready "$adb" "$peer_serial"; then
+    if android_acceptance_runner_owns_emulator \
+        "$adb" "$peer_serial" "$avd_name" "$peer_emulator_pid" \
+        "$peer_emulator_owner_token"; then
+      peer_cleanup_grace=150
       pull_android_acceptance_active_clients \
         "$adb" "$peer_serial" "$run_dir" "$peer_cleanup" || exit_status=1
       pull_android_acceptance_private_client_id \
@@ -348,7 +538,7 @@ cleanup() {
       done
       timeout 15 "$adb" -s "$peer_serial" emu kill >/dev/null 2>&1 || true
     else
-      echo "[android acceptance] peer emulator is unreachable during cleanup" >&2
+      echo "[android acceptance] refused peer cleanup after emulator ownership was lost" >&2
       exit_status=1
     fi
   fi
@@ -356,48 +546,26 @@ cleanup() {
     echo "[android acceptance] could not release every retained network client" >&2
     exit_status=1
   fi
-  if [ -n "$credentials" ]; then
-    while IFS= read -r physical_active; do
-      [ -s "$physical_active" ] || continue
-      if ! UR_ACCEPT_CREDENTIALS_FILE="$credentials" timeout 90 \
-        node "$root/build/all/acceptance/client-cleanup.mjs" "$physical_active"; then
-        echo "[android acceptance] could not release a physical-session client" >&2
-        exit_status=1
-      fi
-    done < <(find "$artifacts/cleanup-clients" -type f -name 'physical-active-client-id' -print 2>/dev/null | LC_ALL=C sort)
-  fi
   if [ -n "$peer_emulator_pid" ]; then
-    for _ in $(seq 1 150); do
-      kill -0 "$peer_emulator_pid" 2>/dev/null || break
-      sleep 0.2
-    done
-    if kill -0 "$peer_emulator_pid" 2>/dev/null; then
-      kill -KILL "$peer_emulator_pid" 2>/dev/null || true
+    if ! android_acceptance_stop_emulator_child \
+        "$peer_emulator_pid" "$peer_cleanup_grace" 50; then
+      echo "[android acceptance] peer emulator required forced host cleanup" >&2
       exit_status=1
     fi
-    wait "$peer_emulator_pid" 2>/dev/null || true
   fi
   if [ "$started_emulator" -eq 1 ] && [ "$keep_emulator" -ne 1 ] && [ -n "$emulator_pid" ]; then
-    if [ -n "$started_emulator_serial" ]; then
+    if [ -n "$started_emulator_serial" ] && \
+       android_acceptance_runner_owns_emulator \
+         "$adb" "$started_emulator_serial" "$avd_name" "$emulator_pid" \
+         "$emulator_owner_token"; then
+      fallback_cleanup_grace=150
       timeout 15 "$adb" -s "$started_emulator_serial" emu kill >/dev/null 2>&1 || true
     fi
-    for _ in $(seq 1 150); do
-      kill -0 "$emulator_pid" 2>/dev/null || break
-      sleep 0.2
-    done
-    if kill -0 "$emulator_pid" 2>/dev/null; then
-      echo "[android acceptance] emulator did not stop after adb emu kill" >&2
-      kill -TERM "$emulator_pid" 2>/dev/null || true
-      for _ in $(seq 1 50); do
-        kill -0 "$emulator_pid" 2>/dev/null || break
-        sleep 0.2
-      done
-      if kill -0 "$emulator_pid" 2>/dev/null; then
-        kill -KILL "$emulator_pid" 2>/dev/null || true
-      fi
+    if ! android_acceptance_stop_emulator_child \
+        "$emulator_pid" "$fallback_cleanup_grace" 50; then
+      echo "[android acceptance] fallback emulator required forced host cleanup" >&2
       exit_status=1
     fi
-    wait "$emulator_pid" 2>/dev/null || true
   elif [ -n "$emulator_pid" ] && ! kill -0 "$emulator_pid" 2>/dev/null; then
     wait "$emulator_pid" 2>/dev/null || true
   fi
@@ -413,6 +581,13 @@ cleanup() {
     elif [ "$smoke_only" -eq 1 ]; then
       if ! android_acceptance_verify_device_flavor_smoke_results "$device_plan" "$smoke_results"; then
         echo "[android acceptance] device/flavor smoke result matrix is incomplete or failed" >&2
+        exit_status=1
+      fi
+    elif [ "$run_peer_to_peer" -eq 0 ]; then
+      if ! android_acceptance_verify_device_flavor_results \
+          "$device_plan" "$device_results" \
+          email phone instant password data-plane usdc-quote; then
+        echo "[android acceptance] partial device/flavor result matrix is incomplete or failed" >&2
         exit_status=1
       fi
     elif ! android_acceptance_verify_device_flavor_results "$device_plan" "$device_results"; then
@@ -432,7 +607,7 @@ cleanup() {
       matrix_status=FAIL
       matrix_detail="Android device/flavor acceptance failed; see $device_results"
     fi
-    for matrix_case in email phone instant password data-plane peer-to-peer; do
+    for matrix_case in email phone instant password data-plane peer-to-peer usdc-quote; do
       printf 'android\t%s\t%s\t%s\n' "$matrix_case" "$matrix_status" "$matrix_detail" >>"$result_matrix"
     done
     chmod 600 "$result_matrix"
@@ -476,13 +651,14 @@ if [ "$skip_build" -ne 1 ]; then
       GOBIN="$tools_dir/go-bin" \
       PATH="$tools_dir/go-bin:$PATH" \
       URNETWORK_ANDROID_SDK_BUILD_OWNER="$sdk_build_owner" \
-      timeout 3600 ./gradlew :app:buildSdkAcceptance "${gradle_worker_args[@]}"
+      timeout 3600 ./gradlew :app:buildSdkAcceptance ${gradle_worker_args[@]+"${gradle_worker_args[@]}"}
   ) 2>&1 | tee "$artifacts/sdk-build.log"
 fi
 
-# Retain descriptor 8 until this runner exits. The canonical suite's outer
-# network-intensive lock owns descriptor 9; the two ownership domains must
-# remain independently kernel-held. A writer that wins the small interval
+# Retain the SDK gate's dynamically selected descriptor until this runner
+# exits. The canonical suite's outer network-intensive lock owns descriptor 9;
+# the two ownership domains must remain independently kernel-held. A writer
+# that wins the small interval
 # after Gradle's SDK task either remains busy here or leaves a different owner
 # sidecar, both of which fail before fleet capture or device mutation.
 sdk_previous_directory="$(pwd -P)"
@@ -504,32 +680,81 @@ if [ "$skip_build" -ne 1 ] &&
   die "fresh Android SDK output provenance does not match this acceptance run"
 fi
 
-find_avd_serial() {
-  local candidate name devices
+available_emulator_console_port() {
+  local first_port="$1" last_port="$2" candidate_port devices
+
+  case "$first_port:$last_port" in *[!0-9:]*) return 2 ;; esac
   devices="$(timeout 15 "$adb" devices)" || return 1
-  while read -r candidate state _; do
-    case "$candidate" in emulator-*) ;; *) continue ;; esac
-    [ "$state" = device ] || continue
-    name="$(timeout 10 "$adb" -s "$candidate" emu avd name 2>/dev/null | sed -n '1p' | tr -d '\r')"
-    [ "$name" = "$avd_name" ] && { printf '%s\n' "$candidate"; return 0; }
-  done <<<"$devices"
+  for candidate_port in $(seq "$first_port" 2 "$last_port"); do
+    if ! grep -q "^emulator-${candidate_port}[[:space:]]" <<<"$devices"; then
+      printf '%s\n' "$candidate_port"
+      return 0
+    fi
+  done
   return 1
 }
 
 capture_device_fleet() {
   local raw="$run_dir/adb-devices.raw" selected_output="$device_serials"
+  local required_serials="$started_emulator_serial"
   if [ "$execution_mode" = diagnostic ]; then
     selected_output="$captured_device_serials"
+    required_serials="$diagnostic_device"
+  elif [ -n "$canonical_solana_serial" ]; then
+    required_serials="${required_serials:+$required_serials$'\n'}$canonical_solana_serial"
   fi
   timeout 15 "$adb" devices -l >"$raw" || return 1
   android_acceptance_select_adb_devices \
-    "$raw" "$selected_output" "$excluded_devices" "${reserved_device_serials[@]}"
+    "$raw" "$selected_output" "$excluded_devices" "$required_serials" \
+    "${reserved_device_serials[@]}"
 }
 
-# Only the exact fallback child started by this invocation uses the
-# credential-free AVD path. Attached hardware and arbitrary pre-existing
-# emulators retain the strict private-PIN contract.
-runner_owns_fallback_emulator() {
+# Enumeration alone never grants mutation or cleanup authority. Recheck the
+# owned emulator identity or exact authorized physical lane at each boundary.
+authorize_selected_device() {
+  local target_serial="$1" diagnostic_file="${2:-}" reserved authorization_status
+  for reserved in "${reserved_device_serials[@]}"; do
+    [ "$target_serial" != "$reserved" ] || {
+      [ -z "$diagnostic_file" ] || \
+        android_acceptance_authorization_failure "$diagnostic_file" selection not-authorized not-run || true
+      return 1
+    }
+  done
+  if [ -n "$started_emulator_serial" ] && [ "$target_serial" = "$started_emulator_serial" ]; then
+    if android_acceptance_runner_owns_emulator \
+        "$adb" "$target_serial" "$avd_name" "$emulator_pid" "$emulator_owner_token"; then
+      return 0
+    else
+      authorization_status=$?
+      [ -z "$diagnostic_file" ] || \
+        android_acceptance_authorization_failure "$diagnostic_file" owned-emulator ownership-unverified unknown || true
+      return "$authorization_status"
+    fi
+  elif [ -n "$peer_serial" ] && [ "$target_serial" = "$peer_serial" ]; then
+    if runner_owns_peer_emulator; then
+      return 0
+    else
+      authorization_status=$?
+      [ -z "$diagnostic_file" ] || \
+        android_acceptance_authorization_failure "$diagnostic_file" peer-emulator ownership-unverified unknown || true
+      return "$authorization_status"
+    fi
+  elif [ "$execution_mode" = canonical ] && [ -n "$canonical_solana_serial" ] && \
+       [ "$target_serial" = "$canonical_solana_serial" ]; then
+    android_acceptance_validate_canonical_solana_device "$adb" "$target_serial" "$diagnostic_file"
+  elif [ "$execution_mode" = diagnostic ] && [ "${diagnostic_owned_avd:-0}" -eq 0 ] && \
+       [ "$target_serial" = "$diagnostic_device" ]; then
+    android_acceptance_adb_device_ready "$adb" "$target_serial" "$diagnostic_file"
+  else
+    [ -z "$diagnostic_file" ] || \
+      android_acceptance_authorization_failure "$diagnostic_file" selection not-authorized not-run || true
+    return 1
+  fi
+}
+
+# Dispatch a runner-started fallback only to the credential-free ownership
+# gate. A failed proof must never fall through to the physical-device PIN path.
+runner_started_fallback_emulator() {
   local target_serial="$1"
 
   [ "$started_emulator" -eq 1 ] && [ -n "$emulator_pid" ] && \
@@ -537,28 +762,45 @@ runner_owns_fallback_emulator() {
     [ "$target_serial" = "$started_emulator_serial" ]
 }
 
+runner_owns_peer_emulator() {
+  [ -n "$peer_serial" ] && [ -n "$peer_emulator_pid" ] && \
+    android_acceptance_runner_owns_emulator \
+      "$adb" "$peer_serial" "$avd_name" "$peer_emulator_pid" \
+      "$peer_emulator_owner_token"
+}
+
 prepare_selected_device() {
   local target_serial="$1" state_dir="$2" status_file="$3"
+  local diagnostic_device_id="$4"
   local diagnostic_file="${status_file%.txt}-interactive.txt"
 
-  if runner_owns_fallback_emulator "$target_serial"; then
-    android_acceptance_prepare_owned_emulator \
+  authorize_selected_device "$target_serial" || return 1
+  if runner_started_fallback_emulator "$target_serial"; then
+    ANDROID_ACCEPTANCE_EMULATOR_OWNER_TOKEN="$emulator_owner_token" \
+      android_acceptance_prepare_owned_emulator \
       "$adb" "$target_serial" "$avd_name" "$emulator_pid" \
       "$state_dir" "$status_file" "$diagnostic_file"
   else
     android_acceptance_prepare_device \
-      "$adb" "$target_serial" "$android_unlock_code" "$state_dir" "$status_file"
+      "$adb" "$target_serial" "$android_unlock_code" "$state_dir" "$status_file" \
+      "$diagnostic_file" "$diagnostic_device_id" readiness 180 24 20
   fi
 }
 
 selected_device_interactive() {
-  local target_serial="$1" diagnostic_file="$2"
+  local target_serial="$1" diagnostic_device_id="$2" role="$3"
+  local diagnostic_file="$4"
 
-  if runner_owns_fallback_emulator "$target_serial"; then
-    android_acceptance_runner_owned_emulator_interactive \
-      "$adb" "$target_serial" "$avd_name" "$emulator_pid" "$diagnostic_file"
+  authorize_selected_device "$target_serial" || return 1
+  if runner_started_fallback_emulator "$target_serial"; then
+    ANDROID_ACCEPTANCE_EMULATOR_OWNER_TOKEN="$emulator_owner_token" \
+      android_acceptance_runner_owned_emulator_interactive \
+      "$adb" "$target_serial" "$avd_name" "$emulator_pid" \
+      "$diagnostic_file"
   else
-    android_acceptance_unlock_device "$adb" "$target_serial" "$android_unlock_code"
+    android_acceptance_unlock_device \
+      "$adb" "$target_serial" "$android_unlock_code" "$diagnostic_file" \
+      "$diagnostic_device_id" "$role" 20
   fi
 }
 
@@ -568,16 +810,19 @@ run_after_selected_device_interactive() {
   shift 5
 
   [ "$#" -gt 0 ] || return 2
-  if runner_owns_fallback_emulator "$target_serial"; then
+  authorize_selected_device "$target_serial" || return 1
+  if runner_started_fallback_emulator "$target_serial"; then
     renderer_evidence="$artifacts/emulator.log"
-    android_acceptance_run_after_owned_emulator_interactive \
+    ANDROID_ACCEPTANCE_EMULATOR_OWNER_TOKEN="$emulator_owner_token" \
+      android_acceptance_run_after_owned_emulator_interactive \
       "$adb" "$target_serial" "$avd_name" "$emulator_pid" \
       "$interactive_file" run_after_android_preflight \
       "$target_serial" "$diagnostic_device_id" "$role" "$preflight_file" \
       "$renderer_evidence" "$@"
   else
     android_acceptance_run_after_unlock \
-      "$adb" "$target_serial" "$android_unlock_code" \
+      "$adb" "$target_serial" "$android_unlock_code" "$interactive_file" \
+      "$diagnostic_device_id" "$role" 20 \
       run_after_android_preflight \
       "$target_serial" "$diagnostic_device_id" "$role" "$preflight_file" \
       "$renderer_evidence" "$@"
@@ -602,28 +847,46 @@ run_after_android_preflight() {
 }
 
 capture_device_fleet || die "could not enumerate the attached Android device fleet"
-if [ "$execution_mode" = diagnostic ]; then
+if [ "$execution_mode" = diagnostic ] && [ "$diagnostic_owned_avd" -eq 0 ]; then
   android_acceptance_select_diagnostic_device \
     "$captured_device_serials" "$device_serials" "$diagnostic_device" \
     "${reserved_device_serials[@]}" || \
     die "requested diagnostic device is not an eligible member of the captured fleet"
-  cp "$captured_device_serials" "$artifacts/diagnostic-captured-device-serials.txt"
-  chmod 600 "$artifacts/diagnostic-captured-device-serials.txt"
-elif [ ! -s "$device_serials" ]; then
-  echo "[android acceptance] no eligible attached device; starting fallback AVD $avd_name"
-  emulator_args=(-avd "$avd_name" -read-only -gpu host -no-snapshot -no-boot-anim -netdelay none -netspeed full)
+else
+  if [ -n "$canonical_solana_serial" ]; then
+    android_acceptance_validate_canonical_solana_device "$adb" "$canonical_solana_serial" || \
+      die "required physical Solana device failed read-only identity/capability validation"
+  fi
+  echo "[android acceptance] starting owned acceptance AVD $avd_name; unrelated devices remain untouched"
+  port="$(available_emulator_console_port 5554 5584)" || \
+    die "no free Android emulator console port for fallback acceptance AVD"
+  started_emulator_serial="emulator-$port"
+  emulator_owner_token="fallback-${timestamp}-$$-$RANDOM"
+  emulator_args=(-avd "$avd_name" -read-only -gpu host -port "$port" -no-snapshot -no-boot-anim -netdelay none -netspeed full)
   [ "$headless" -eq 1 ] && emulator_args+=(-no-window)
   run_android_acceptance_shared_avd_emulator \
-    "$emulator" "$artifacts/emulator.log" "${emulator_args[@]}" &
+    "$emulator" "$artifacts/emulator.log" "$emulator_owner_token" \
+    "${emulator_args[@]}" &
   emulator_pid=$!
   started_emulator=1
-  for _ in $(seq 1 60); do
-    started_emulator_serial="$(find_avd_serial || true)"
-    [ -n "$started_emulator_serial" ] && break
-    sleep 1
-  done
-  [ -n "$started_emulator_serial" ] || die "could not find emulator for AVD $avd_name"
+  android_acceptance_wait_for_runner_owned_emulator \
+    "$adb" "$started_emulator_serial" "$avd_name" "$emulator_pid" \
+    "$emulator_owner_token" 120 || \
+    die "fallback Android emulator did not prove runner ownership"
+  if [ "$execution_mode" = diagnostic ]; then
+    diagnostic_device="$started_emulator_serial"
+  fi
   capture_device_fleet || die "could not capture the Android fleet after starting the fallback AVD"
+  if [ "$execution_mode" = diagnostic ]; then
+    android_acceptance_select_owned_avd_diagnostic_device \
+      "$captured_device_serials" "$device_serials" "$adb" "$started_emulator_serial" \
+      "$avd_name" "$emulator_pid" "$emulator_owner_token" || \
+      die "diagnostic AVD lost exact runner ownership or inventory identity"
+  fi
+fi
+if [ "$execution_mode" = diagnostic ]; then
+  cp "$captured_device_serials" "$artifacts/diagnostic-captured-device-serials.txt"
+  chmod 600 "$artifacts/diagnostic-captured-device-serials.txt"
 fi
 [ -s "$device_serials" ] || die "no eligible Android device is attached"
 android_acceptance_write_device_records "$device_serials" "$device_records" || \
@@ -636,11 +899,17 @@ while IFS=$'\t' read -r device_id target_serial extra <&3; do
     die "malformed Android device record"
   serial="$target_serial"
   echo "[android acceptance] preparing attached device $serial ($device_id)"
+  readiness_diagnostic_id="$(android_acceptance_sanitized_device_id "$device_id")" || \
+    die "could not derive a sanitized readiness ID for $device_id"
   device_state_dir="$run_dir/devices/$device_id"
   mkdir -p "$device_state_dir"
   readiness_file="$artifacts/device-readiness/$device_id.txt"
+  authorize_selected_device "$serial" || die "selected device $serial lost mutation authorization"
+  # A failed read-only identity check must not enroll a phone for package
+  # removal in EXIT cleanup. Record immediately before the first mutation.
+  printf '%s\t%s\n' "$device_id" "$serial" >>"$device_cleanup_records"
   if ! prepare_selected_device \
-      "$serial" "$device_state_dir" "$readiness_file"; then
+      "$serial" "$device_state_dir" "$readiness_file" "$readiness_diagnostic_id"; then
     readiness_status="$(sed -n 's/^status=//p' "$readiness_file" 2>/dev/null || true)"
     die "Android device $serial readiness failed: ${readiness_status:-unknown}; see $readiness_file"
   fi
@@ -675,9 +944,13 @@ done 3<"$device_records"
 chmod 600 "$device_inventory" "$device_capabilities" "$excluded_devices"
 
 # The target list is validated above and intentionally expanded into arguments.
+canonical_plan_args=()
+if [ "$execution_mode" = canonical ]; then
+  canonical_plan_args=(--canonical-devices "$started_emulator_serial" "$canonical_solana_serial")
+fi
 # shellcheck disable=SC2086
 android_acceptance_write_device_flavor_plan \
-  "$device_capabilities" "$device_plan" "$device_skips" $targets || \
+  "$device_capabilities" "$device_plan" "$device_skips" ${canonical_plan_args[@]+"${canonical_plan_args[@]}"} $targets || \
   die "could not create the Android device/flavor execution plan"
 # shellcheck disable=SC2086
 android_acceptance_require_target_coverage "$device_plan" $targets || \
@@ -696,6 +969,7 @@ if [ "$execution_mode" = diagnostic ]; then
     mode diagnostic-only \
     final_proof forbidden \
     device "$diagnostic_device" \
+    device_origin "$diagnostic_device_origin" \
     flavor "$selected_flavor_value" \
     case "$diagnostic_case" \
     build fresh-paired-apks \
@@ -708,7 +982,7 @@ if [ -s "$device_skips" ]; then
   echo "[android acceptance] incompatible device/flavor cells were skipped; see $device_skips"
 fi
 if [ -s "$excluded_devices" ]; then
-  echo "[android acceptance] reserved performance devices were excluded; see $excluded_devices"
+  echo "[android acceptance] reserved and unrelated devices were excluded; see $excluded_devices"
 fi
 
 if [ "$smoke_only" -ne 1 ]; then
@@ -730,6 +1004,20 @@ gradle_flavor() {
     play) printf 'Play' ;;
     solana_dapp) printf 'Solana_dapp' ;;
   esac
+}
+
+acceptance_target_cache_dir() {
+  printf '%s/tests/__acceptance__/build/%s\n' "$here" "$1"
+}
+
+acceptance_target_input_fingerprint() {
+  local target="$1" flavor="$2"
+
+  android_acceptance_input_fingerprint \
+    "$here" \
+    "$sdk_output_dir/android/URnetworkSdk.aar" \
+    "$sdk_output_dir/android/URnetworkSdk-sources.jar" \
+    "$target" "$flavor"
 }
 
 prepare_fdroid_tree() {
@@ -776,6 +1064,7 @@ install_private_file_on() {
     credentials|guest-secret-key|tests.json|physical-command|physical-expected-peer-id) ;;
     *) echo "refusing unsafe acceptance destination: $destination" >&2; return 1 ;;
   esac
+  authorize_selected_device "$target_serial" || return 1
 
   # adb push cannot write directly into the app sandbox. Always remove the
   # temporary copy, including when run-as or chmod fails partway through.
@@ -829,19 +1118,252 @@ collect_smoke_artifacts() {
   timeout 30 "$adb" -s "$serial" exec-out uiautomator dump /dev/tty >"$out/ui.xml" 2>/dev/null || true
 }
 
-collect_physical_artifacts() {
-  local target_serial="$1" out="$2" artifact_status=0
+read_acceptance_completion_record() {
+  local target_serial="$1" out="$2" expected_build="$3" expected_repeat="$4"
+  local attempt attempt_dir ownership_status read_status capture_status captured_result outcome
+  local -a read_statuses
+  # Fresh private receipts cannot overwrite an earlier read, including a
+  # partial failed attempt. Never print unexpected app bytes to the runner log.
+  mkdir -m 700 "$out" || return 1
+  for attempt in 1 2 3; do
+    attempt_dir="$out/attempt-$attempt"
+    mkdir -m 700 "$attempt_dir" || return 1
+    if authorize_selected_device "$target_serial" \
+        >"$attempt_dir/ownership.stdout" 2>"$attempt_dir/ownership.stderr"; then
+      ownership_status=0
+    else
+      ownership_status=$?
+    fi
+    printf '%s\n' "$ownership_status" >"$attempt_dir/ownership-status.txt" || return 1
+    if [ "$ownership_status" -ne 0 ]; then
+      printf 'ownership-unavailable\n' >"$attempt_dir/verification.txt" || return 1
+      printf '%s\tnot-run\tnot-run\townership-unavailable\n' "$attempt" \
+        >>"$out/completion-attempts.tsv" || return 1
+      return 1
+    fi
+
+    # Drain stdout while retaining only its first 4 KiB. Closing the pipe at
+    # the cap would replace the producer's true exit status with SIGPIPE.
+    if timeout 30 "$adb" -s "$target_serial" exec-out run-as com.bringyour.network \
+        cat files/acceptance/result 2>"$attempt_dir/read.stderr" | \
+        node "$here/test-main-completion-record.mjs" \
+          "$attempt_dir" "$expected_build" "$expected_repeat" \
+          2>"$attempt_dir/capture.stderr"; then
+      read_statuses=("${PIPESTATUS[@]}")
+    else
+      read_statuses=("${PIPESTATUS[@]}")
+    fi
+    read_status="${read_statuses[0]}"
+    capture_status="${read_statuses[1]}"
+    printf '%s\n' "$read_status" >"$attempt_dir/read-status.txt" || return 1
+    printf '%s\n' "$capture_status" >"$attempt_dir/capture-status.txt" || return 1
+    captured_result=''
+    if [ "$capture_status" -eq 0 ] && [ -f "$attempt_dir/capture-result.txt" ]; then
+      IFS= read -r captured_result <"$attempt_dir/capture-result.txt" || return 1
+    fi
+    case "$captured_result" in
+      match|mismatch|oversize) ;;
+      *) captured_result=invalid ;;
+    esac
+    if [ "$capture_status" -ne 0 ] || [ "$captured_result" = invalid ]; then
+      outcome=capture-failed
+    elif [ "$captured_result" = oversize ]; then
+      outcome=record-oversize
+    elif [ "$read_status" -eq 124 ]; then
+      outcome=read-timeout
+    elif [ "$read_status" -ne 0 ]; then
+      outcome=read-failed
+    elif [ "$captured_result" = match ]; then
+      outcome=success
+    else
+      outcome=record-mismatch
+    fi
+    printf '%s\n' "$outcome" >"$attempt_dir/verification.txt" || return 1
+    printf '%s\t%s\t%s\t%s\n' "$attempt" "$read_status" "$capture_status" "$outcome" \
+      >>"$out/completion-attempts.tsv" || return 1
+    [ "$outcome" != success ] || return 0
+    # Only an explicit timeout is transient here. Missing/wrong app output,
+    # other ADB exits, local capture errors and lost ownership stay terminal.
+    [ "$outcome" = read-timeout ] && [ "$attempt" -lt 3 ] || return 1
+    sleep 1
+  done
+  return 1
+}
+
+# Diagnostic-only observation. The caller freezes both launch identities before
+# the workflow; never derive ownership from a recovered serial or a new child.
+# Each role gets one baseline and at most one best-effort post-break attempt.
+# An explicit owned-AVD diagnostic may also capture one recovery identity after
+# the existing finish authorization. This never retries an unavailable guard.
+# Failure here cannot repair or replace the original workflow/read verdict.
+observe_p2p_owned_guest() {
+  local target_serial="$1" phase="$2" trigger="$3" role owner_pid owner_token out
+  local ownership_status=0 ownership_stage=unreported started_at ended_at read_status capture_status
+  local recovery=0 prior_status prior_guard_status prior
+  local -a read_statuses=()
+  [ -n "${p2p_observation_out:-}" ] || return 0
+  case "$phase:$trigger" in
+    before-workflow:baseline|after-break:artifact-read|after-break:instrumentation-stream-lost|after-break:child-exit-failed) ;;
+    after-recovery:finish-authorized)
+      [ "${URNETWORK_ANDROID_P2P_RECOVERY_OBSERVATION:-}" = 1 ] && \
+        [ "${execution_mode:-}" = diagnostic ] && [ "${diagnostic_owned_avd:-0}" = 1 ] || return 0
+      [ "${android_acceptance_emulator_ownership_stage:-}" = verified ] || return 0
+      recovery=1 ;;
+    *) return 2 ;;
+  esac
+  case "$target_serial" in emulator-*)
+    case "${target_serial#emulator-}" in ''|*[!0-9]*) return 2 ;; esac ;;
+    *) return 2 ;;
+  esac
+  if [ "$target_serial" = "$p2p_observation_client_serial" ]; then
+    role=client; owner_pid="$p2p_observation_client_pid"; owner_token="$p2p_observation_client_token"
+  elif [ "$target_serial" = "$p2p_observation_provider_serial" ]; then
+    role=provider; owner_pid="$p2p_observation_provider_pid"; owner_token="$p2p_observation_provider_token"
+  else
+    return 2
+  fi
+  case "$owner_pid" in ''|0*|*[!0-9]*) return 2 ;; esac
+  case "$owner_token" in ''|*[!A-Za-z0-9._:-]*) return 2 ;; esac
+  case "$p2p_observation_avd" in ''|*$'\t'*|*$'\r'*|*$'\n'*) return 2 ;; esac
+  if [ "$recovery" -eq 1 ]; then
+    # Synchronous local comparisons bind the just-completed finish guard to
+    # the original role/serial/PID/token/AVD. No new device/owner query occurs.
+    [ "${4:-}" = "$role" ] && [ "${avd_name:-}" = "$p2p_observation_avd" ] || return 0
+    if [ "$role" = client ]; then
+      [ "$target_serial" = "${started_emulator_serial:-}" ] && \
+        [ "$owner_pid" = "${emulator_pid:-}" ] && [ "$owner_token" = "${emulator_owner_token:-}" ] || return 0
+    else
+      [ "$target_serial" = "${peer_serial:-}" ] && \
+        [ "$owner_pid" = "${peer_emulator_pid:-}" ] && [ "$owner_token" = "${peer_emulator_owner_token:-}" ] || return 0
+    fi
+    prior="$p2p_observation_out/$role/after-break"
+    [ -f "$prior/observation-status.txt" ] && [ ! -L "$prior/observation-status.txt" ] && \
+      [ -f "$prior/ownership-status.txt" ] && [ ! -L "$prior/ownership-status.txt" ] || return 0
+    IFS= read -r prior_status <"$prior/observation-status.txt" || return 0
+    IFS= read -r prior_guard_status <"$prior/ownership-status.txt" || return 0
+    [ "$prior_status:$prior_guard_status" = ownership-unavailable:1 ] || return 0
+  fi
+  out="$p2p_observation_out/$role/$phase"
+  # An unavailable first observation is retained too; no silent later retry.
+  [ ! -e "$out" ] && [ ! -L "$out" ] || return 0
+  (umask 077; mkdir -p "$p2p_observation_out/$role" && mkdir "$out") || return 1
+  started_at="$(node -p 'new Date().toISOString()')" || return 1
+  printf '%s\t%s\t%s\t%s\n' "$target_serial" "$p2p_observation_avd" "$owner_pid" "$owner_token" \
+    >"$out/owner.tsv" || return 1
+  printf '%s\n' "$started_at" >"$out/started-at.txt" || return 1
+  printf '%s\n' "$trigger" >"$out/trigger.txt" || return 1
+  if [ "$recovery" -eq 1 ]; then
+    printf 'finish-authorization\n' >"$out/ownership-source.txt" || return 1
+  else
+    android_acceptance_emulator_ownership_stage=unreported
+    android_acceptance_runner_owns_emulator \
+      "$adb" "$target_serial" "$p2p_observation_avd" "$owner_pid" "$owner_token" \
+      >/dev/null 2>&1 || ownership_status=$?
+  fi
+  printf '%s\n' "$ownership_status" >"$out/ownership-status.txt" || return 1
+  # Only the fixed check/status pairs enter retained diagnostics. Overrides
+  # or missing instrumentation cannot leak raw output or a stale prior stage.
+  case "$ownership_status:${android_acceptance_emulator_ownership_stage:-unreported}" in
+    0:verified|1:process-before|1:device-ready|1:instance-id-read|1:instance-id-empty|1:avd-name-read|1:avd-name-empty|1:process-after|2:serial-validation|2:avd-validation|2:pid-validation|2:token-validation|2:token-length|3:instance-id-match|3:avd-name-match)
+      ownership_stage="$android_acceptance_emulator_ownership_stage" ;;
+  esac
+  (umask 077; set -C; printf '%s\n' "$ownership_stage" >"$out/ownership-stage.txt") || return 1
+  if [ "$ownership_status" -ne 0 ]; then
+    printf 'ownership-unavailable\n' >"$out/observation-status.txt" || return 1
+    node -p 'new Date().toISOString()' >"$out/ended-at.txt" || return 1
+    return 1
+  fi
+  # Recovery reads only the existing identity header, with no OS log payload
+  # or raw stderr. The unchanged capture helper retains at most 64 KiB and
+  # requires a valid identity; numeric command and capture exits stay separate.
+  if [ "$recovery" -eq 1 ]; then
+    if timeout -k 1 10 "$adb" -s "$target_serial" shell '
+    printf "boot_id="; cat /proc/sys/kernel/random/boot_id || exit $?
+    printf "uptime="; cat /proc/uptime || exit $?
+    printf "adbd_pid="; pidof adbd || exit $?
+    printf "os_log_begin\n"
+  ' </dev/null 2>/dev/null | node "$here/test-main-guest-observation.mjs" "$out" \
+        2>"$out/capture.stderr"; then
+      read_statuses=("${PIPESTATUS[@]}")
+    else
+      read_statuses=("${PIPESTATUS[@]}")
+    fi
+  else
+  # One shell stream, no app commands, unfiltered dump or workflow retry. The
+  # guest's epoch timestamps can be joined to the host interval and uptime.
+  # Merged stdout/stderr stays private; both command and capture exits survive.
+  if timeout -k 1 10 "$adb" -s "$target_serial" shell '
+    printf "boot_id="; cat /proc/sys/kernel/random/boot_id || exit $?
+    printf "uptime="; cat /proc/uptime || exit $?
+    printf "adbd_pid="; pidof adbd || exit $?
+    printf "os_log_begin\n"
+    logcat -b main -b system -b crash -d -t 256 -v epoch adbd:V init:V lmkd:V lowmemorykiller:V logd:V tombstoned:V crash_dump32:V crash_dump64:V "*:S"
+  ' </dev/null 2>&1 | node "$here/test-main-guest-observation.mjs" "$out" \
+      2>"$out/capture.stderr"; then
+    read_statuses=("${PIPESTATUS[@]}")
+  else
+    read_statuses=("${PIPESTATUS[@]}")
+  fi
+  fi
+  read_status="${read_statuses[0]}"; capture_status="${read_statuses[1]}"
+  printf '%s\n' "$read_status" >"$out/read-status.txt" || return 1
+  printf '%s\n' "$capture_status" >"$out/capture-status.txt" || return 1
+  ended_at="$(node -p 'new Date().toISOString()')" || return 1
+  printf '%s\n' "$ended_at" >"$out/ended-at.txt" || return 1
+  if [ "$read_status:$capture_status" != 0:0 ]; then
+    printf 'read-or-capture-failed\n' >"$out/observation-status.txt" || return 1
+    return 1
+  fi
+  printf 'captured\n' >"$out/observation-status.txt"
+}
+
+# One bounded ADB read. Preserve the command's exact exit code and stderr,
+# separately from app-output validation or local archive extraction failures.
+# In particular, timeout can return 124 with partial stdout and empty stderr.
+collect_physical_adb_read() {
+  local out="$1" step="$2" command_status=0
+  shift 2
+  case "$step" in
+    logcat|screencap|activity|processes|status|glog|physical-memory.ndjson|physical-diagnostics.ndjson) ;;
+    *) return 2 ;;
+  esac
+  if timeout 30 "$@" 2>"$out/read-$step.stderr"; then
+    command_status=0
+  else
+    command_status=$?
+  fi
+  cat "$out/read-$step.stderr" >>"$out/collection.stderr" || return 1
+  printf '%s\t%s\n' "$step" "$command_status" >>"$out/collection-commands.tsv" || return 1
+  if [ "$command_status" -ne 0 ]; then
+    printf '%s\t%s\n' "$step" "$command_status" >"$out/collection-failed-command.tsv" || return 1
+  fi
+  return "$command_status"
+}
+
+# One read-only attempt. Keep stderr and partial files: an ADB transport loss
+# is evidence, not an app crash. Each retry gets a separate directory.
+collect_physical_artifacts_once() {
+  local target_serial="$1" out="$2" capture_phase="${3:-complete}" sampler_started diagnostic
+  case "$capture_phase" in live|complete) ;; *) return 2 ;; esac
   mkdir -p "$out/glog" || return 1
-  timeout 30 "$adb" -s "$target_serial" logcat -d >"$out/logcat.txt" 2>&1 || \
-    artifact_status=1
-  timeout 30 "$adb" -s "$target_serial" exec-out screencap -p \
-    >"$out/foreground.png" 2>/dev/null || artifact_status=1
-  timeout 30 "$adb" -s "$target_serial" shell dumpsys activity activities \
-    >"$out/activity.txt" 2>&1 || artifact_status=1
-  timeout 30 "$adb" -s "$target_serial" shell ps -A \
-    >"$out/processes.txt" 2>&1 || artifact_status=1
-  timeout 30 "$adb" -s "$target_serial" exec-out run-as com.bringyour.network \
-    cat files/acceptance/physical-status >"$out/status.json" 2>/dev/null || artifact_status=1
+  : >"$out/collection.stderr" || return 1
+  if [ "$capture_phase" = live ]; then
+    # Large system-log reads have severed the shared ADB transport while its
+    # instrumentation stream was still required. Keep live app evidence here,
+    # but do not invent a smaller log threshold or promote a tail as a full log.
+    printf 'deferred-until-quiescence\n' >"$out/logcat-status.txt" || return 1
+  else
+    collect_physical_adb_read "$out" logcat "$adb" -s "$target_serial" logcat -d -t 12000 \
+      >"$out/logcat.txt" || return "$?"
+  fi
+  collect_physical_adb_read "$out" screencap "$adb" -s "$target_serial" exec-out screencap -p \
+    >"$out/foreground.png" || return "$?"
+  collect_physical_adb_read "$out" activity "$adb" -s "$target_serial" shell dumpsys activity activities \
+    >"$out/activity.txt" || return "$?"
+  collect_physical_adb_read "$out" processes "$adb" -s "$target_serial" shell ps -A \
+    >"$out/processes.txt" || return "$?"
+  collect_physical_adb_read "$out" status "$adb" -s "$target_serial" exec-out run-as com.bringyour.network \
+    cat files/acceptance/physical-status >"$out/status.json" || return "$?"
   if ! timeout 30 "$adb" -s "$target_serial" exec-out run-as com.bringyour.network \
       cat files/acceptance/physical-startup-goroutines.txt \
       >"$out/physical-startup-goroutines.txt" 2>/dev/null; then
@@ -849,46 +1371,461 @@ collect_physical_artifacts() {
   elif ! android_acceptance_has_goroutine_stacks "$out/physical-startup-goroutines.txt"; then
     rm -f "$out/physical-startup-goroutines.txt"
   fi
-  timeout 30 "$adb" -s "$target_serial" exec-out run-as com.bringyour.network \
-    tar -C files/logs -cf - . 2>/dev/null | \
-    tar -xf - -C "$out/glog" 2>/dev/null || artifact_status=1
-  [ -s "$out/foreground.png" ] || artifact_status=1
-  [ -s "$out/status.json" ] || artifact_status=1
+  collect_physical_adb_read "$out" glog "$adb" -s "$target_serial" exec-out run-as com.bringyour.network \
+    tar -C files/logs -cf - . | \
+    tar -xf - -C "$out/glog" 2>>"$out/collection.stderr" || return "$?"
+  [ "$(od -An -tx1 -N8 "$out/foreground.png" | tr -d '[:space:]')" = 89504e470d0a1a0a ] || return 1
+  sampler_started="$(node -e 'const fs=require("node:fs"); const value=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); if (!value || typeof value!=="object" || Array.isArray(value)) process.exit(1); process.stdout.write(value.phase === "startup" ? "0" : "1")' \
+    "$out/status.json" 2>>"$out/collection.stderr")" || return 1
   android_acceptance_verify_physical_startup_evidence \
-    "$out/status.json" "$out/physical-startup-goroutines.txt" || artifact_status=1
-  return "$artifact_status"
+    "$out/status.json" "$out/physical-startup-goroutines.txt" || return 1
+  # The session already samples both timelines. Preserve their exact bytes
+  # before teardown: the last command status can predate the failing traffic.
+  # A startup failure occurs before the sampler exists. Every later phase
+  # requires both files; missing/read failures must remain collection failures.
+  if [ "$sampler_started" = 1 ]; then
+    for diagnostic in physical-memory.ndjson physical-diagnostics.ndjson; do
+      collect_physical_adb_read "$out" "$diagnostic" "$adb" -s "$target_serial" exec-out run-as com.bringyour.network \
+        cat "files/acceptance/$diagnostic" >"$out/$diagnostic" \
+        || return "$?"
+      if [ ! -s "$out/$diagnostic" ]; then
+        printf 'required physical diagnostic is empty: %s\n' "$diagnostic" >>"$out/collection.stderr"
+        return 1
+      fi
+      chmod 600 "$out/$diagnostic" || return 1
+    done
+  fi
 }
 
-boot_peer_emulator() {
-  local devices port=""
-  if [ -n "$peer_serial" ] && android_acceptance_adb_device_ready "$adb" "$peer_serial"; then
-    return 0
+collect_physical_artifacts() {
+  local target_serial="$1" out="$2" capture_phase="${3:-complete}" attempt attempt_dir collection_status=1
+  local ownership_unavailable failure_step failure_status
+  case "$capture_phase" in live|complete) ;; *) return 2 ;; esac
+  mkdir -p "$out" || return 1
+  for attempt in 1 2 3; do
+    attempt_dir="$out/attempt-$attempt"
+    # A second collector invocation must not erase the original attempt bytes.
+    mkdir "$attempt_dir" || return 1
+    collection_status=1
+    ownership_unavailable=0
+    # A serial is not ownership. Reprove the same selected phone or exact
+    # runner-owned emulator before every attempt; never search for a substitute.
+    if ! authorize_selected_device "$target_serial"; then
+      ownership_unavailable=1
+      printf 'selected-device ownership unavailable\n' >"$attempt_dir/collection.stderr"
+    elif collect_physical_artifacts_once "$target_serial" "$attempt_dir" "$capture_phase"; then
+      collection_status=0
+    else
+      collection_status=$?
+    fi
+    # Preserve the familiar top-level paths as the latest attempt, alongside
+    # every original attempt. A recovered read cannot repair a lost retained
+    # instrumentation stream; both final receipts are checked independently.
+    cp -R "$attempt_dir/." "$out/" || return 1
+    printf '%s\t%s\n' "$attempt" "$collection_status" >>"$out/collection-attempts.tsv"
+    [ "$collection_status" -ne 0 ] || return 0
+    [ "$attempt" -lt 3 ] || break
+    # Only an explicit ADB timeout, a failed ADB read with a transport error,
+    # or ownership unavailability is retryable. Never classify validation from
+    # arbitrary app output or from an earlier successful command's warning.
+    if [ "$ownership_unavailable" -eq 0 ]; then
+      failure_step=""; failure_status=""
+      [ -f "$attempt_dir/collection-failed-command.tsv" ] || break
+      IFS=$'\t' read -r failure_step failure_status <"$attempt_dir/collection-failed-command.tsv" || break
+      case "$failure_step" in
+        logcat|screencap|activity|processes|status|glog|physical-memory.ndjson|physical-diagnostics.ndjson) ;;
+        *) break ;;
+      esac
+      if [ "$failure_status" != 124 ] && ! LC_ALL=C grep -Eiq \
+          'device offline|device .*not found|error: closed|protocol fault|connection reset|connection terminated|transport.*(closed|error)' \
+          "$attempt_dir/read-$failure_step.stderr"; then
+        break
+      fi
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+# The P2P caller joins both original instrumentation children before this read.
+# Guest quiescence and fresh exact-device ownership are still required: a dead
+# host child alone cannot authorize even this diagnostic phase. Keep full and
+# partial output separately from the immutable pre-finish app-state snapshot.
+# One bounded read only; failure remains a cell failure, not a workflow retry.
+collect_p2p_quiescent_logcat() {
+  local target_serial="$1" role="$2" out="$3" quiesced collection_status=0
+  case "$role" in
+    client) quiesced="${p2p_client_quiesced:-0}" ;;
+    provider) quiesced="${p2p_provider_quiesced:-0}" ;;
+    *) return 2 ;;
+  esac
+  mkdir "$out" || return 1
+  : >"$out/collection.stderr" || return 1
+  if [ "$quiesced" != 1 ]; then
+    printf 'guest quiescence unavailable; full logcat deferred\n' >"$out/collection.stderr"
+    collection_status=1
+  elif ! authorize_selected_device "$target_serial"; then
+    printf 'selected-device ownership unavailable\n' >"$out/collection.stderr"
+    collection_status=1
+  else
+    collect_physical_adb_read "$out" logcat "$adb" -s "$target_serial" logcat -d -t 12000 \
+      >"$out/logcat.txt" || collection_status=$?
   fi
-  devices="$(timeout 15 "$adb" devices)"
-  for candidate_port in $(seq 5556 2 5584); do
-    if ! grep -q "^emulator-${candidate_port}[[:space:]]" <<<"$devices"; then
-      port="$candidate_port"
+  printf '1\t%s\n' "$collection_status" >"$out/collection-attempts.tsv" || return 1
+  return "$collection_status"
+}
+
+# The first observed failure predates any forced cleanup. Its finite local
+# provenance prevents a later host-induced "Process crashed" line from hiding
+# an ADB/collection failure. Genuine failures already in either stream retain
+# their own classification and log. Never write credentials or raw app values.
+record_p2p_failure() {
+  local out="$1" role="$2" reason="$3" classification=infrastructure log_role
+  case "$role" in client|provider|pair) ;; *) return 2 ;; esac
+  case "$reason" in
+    artifact-collection|ownership-unavailable|instrumentation-stream-lost|finish-command-failed|finish-ack-failed|child-exit-failed|cleanup-ownership-failed|peer-readiness-failed) ;;
+    natural-exit-timeout) classification=timeout ;;
+    workflow-failed) classification=peer-to-peer ;;
+    *) return 2 ;;
+  esac
+  [ ! -e "$out/p2p-first-failure.json" ] || return 0
+  for log_role in client provider; do
+    if LC_ALL=C grep -Eiq 'FATAL EXCEPTION|Process crashed|SIGSEGV|shortMsg=|panic:|fatal error:' \
+        "$out/$log_role-instrumentation.log" 2>/dev/null; then
+      classification=crash; role="$log_role"; reason=instrumentation-failed
+      break
+    elif LC_ALL=C grep -Eq 'FAILURES!!!|AssertionError|INSTRUMENTATION_FAILED' \
+        "$out/$log_role-instrumentation.log" 2>/dev/null; then
+      classification=instrumentation; role="$log_role"; reason=instrumentation-failed
       break
     fi
   done
-  if [ -z "$port" ]; then
-    echo "no free Android emulator console port for peer-to-peer acceptance" >&2
+  printf '{"schemaVersion":1,"role":"%s","reason":"%s","classification":"%s"}\n' \
+    "$role" "$reason" "$classification" >"$out/p2p-first-failure.json"
+}
+
+# The immutable first cause describes the workflow failure, not every later
+# cleanup obligation. Retain fixed operation/role/status metadata separately,
+# before successful API cleanup removes the private client-marker aliases.
+# No command arguments, raw output, client IDs, credentials or owner tokens are
+# admitted here. A failed receipt cannot turn a failed operation into success.
+record_p2p_cleanup_failure() {
+  local out="$1" role="$2" operation="$3" command_status="$4"
+  local receipt="$out/p2p-cleanup-failures.ndjson" count=0 size
+  case "$role" in client|provider|pair) ;; *) return 2 ;; esac
+  case "$operation" in
+    finish-instrumentation-before|finish-authorization|finish-command|finish-ack|finish-natural-exit|force-stop-authorization|force-stop-command|finish-term-exit|finish-receipt|finish-child-exit|finish-instrumentation-after|cleanup-quiescence|retain-authorization|retain-active-ledger|retain-reauthorization|retain-client-id|release-clients|clear-authorization|clear-markers) ;;
+    *) return 2 ;;
+  esac
+  case "$command_status" in ''|*[!0-9]*) return 2 ;; esac
+  [ "${#command_status}" -le 3 ] || return 2
+  command_status=$((10#$command_status))
+  [ "$command_status" -ge 1 ] && [ "$command_status" -le 255 ] || return 2
+  [ ! -L "$receipt" ] || return 1
+  if [ -e "$receipt" ]; then
+    [ -f "$receipt" ] || return 1
+    size="$(wc -c <"$receipt")" || return 1
+    [ "$size" -le 8192 ] || return 1
+    count="$(awk 'END { print NR+0 }' "$receipt")" || return 1
+  else
+    (umask 077; : >"$receipt") || return 1
+  fi
+  if [ "$count" -ge 32 ]; then
+    [ ! -L "$out/p2p-cleanup-failures.truncated" ] || return 1
+    [ ! -e "$out/p2p-cleanup-failures.truncated" ] || [ -f "$out/p2p-cleanup-failures.truncated" ] || return 1
+    (umask 077; printf 'true\n' >"$out/p2p-cleanup-failures.truncated") || return 1
+    chmod 600 "$out/p2p-cleanup-failures.truncated" || return 1
+    return 0
+  fi
+  chmod 600 "$receipt" || return 1
+  printf '{"schemaVersion":1,"role":"%s","operation":"%s","exitCode":%s}\n' \
+    "$role" "$operation" "$command_status" >>"$receipt"
+}
+
+# Existing platform-shell ownership functions stay in their original caller.
+# This wrapper records only a failed result and returns its exact status; it
+# adds no retries, authorization changes, device calls or policy decisions.
+p2p_cleanup_operation() {
+  local out="$1" role="$2" operation="$3" command_status=0
+  shift 3
+  if "$@"; then
+    return 0
+  else
+    command_status=$?
+  fi
+  record_p2p_cleanup_failure "$out" "$role" "$operation" "$command_status" || p2p_cleanup_failed=1
+  return "$command_status"
+}
+
+# Finish is an application receipt, not an instrumentation result. Give its
+# finally/logout path the existing 30-second natural-exit grace even if a
+# diagnostic read failed. Stop an app only after that deadline and a fresh
+# ownership proof; a lost ADB stream remains failed even if finish is recovered.
+finish_physical_session() {
+  local target_serial="$1" role="$2" session_pid="$3" out="$4"
+  local finish_status=0 child_status=0 wait_pid="$session_pid"
+  case "$role" in client|provider) ;; *) return 2 ;; esac
+  case "$session_pid" in ''|0*|*[!0-9]*) return 2 ;; esac
+  # These are local to the P2P invocation, not reusable evidence from a prior
+  # cell. Only guest completion or an owned successful stop discharges them.
+  printf -v "p2p_${role}_quiesced" '%s' 0
+  if ! android_acceptance_session_running "$session_pid"; then
+    if ! p2p_cleanup_operation "$out" "$role" finish-instrumentation-before \
+        android_acceptance_verify_p2p_instrumentation "$out/$role-instrumentation.log"; then
+      record_p2p_failure "$out" "$role" instrumentation-stream-lost || p2p_cleanup_failed=1
+      finish_status=1
+      observe_p2p_owned_guest "$target_serial" after-break instrumentation-stream-lost || true
+    fi
+    # The app can outlive a disconnected `am instrument -w` host process.
+    # Its bounded finish command must not fail immediately on that dead PID.
+    wait_pid=""
+  fi
+  # The optional recovery read may only consume this invocation's successful
+  # finish proof. Reset even when a different authorization branch is selected.
+  android_acceptance_emulator_ownership_stage=unreported
+  if ! p2p_cleanup_operation "$out" "$role" finish-authorization \
+      authorize_selected_device "$target_serial"; then
+    record_p2p_failure "$out" "$role" ownership-unavailable || p2p_cleanup_failed=1
+    finish_status=1
+  elif ! {
+    observe_p2p_owned_guest "$target_serial" after-recovery finish-authorized "$role" || true
+    p2p_cleanup_operation "$out" "$role" finish-command \
+      send_physical_command "$target_serial" "$role-finish|finish|"
+  }; then
+    record_p2p_failure "$out" "$role" finish-command-failed || p2p_cleanup_failed=1
+    finish_status=1
+  elif ! p2p_cleanup_operation "$out" "$role" finish-ack \
+      wait_physical_status "$target_serial" "$role-finish" complete none 120 "$wait_pid"; then
+    record_p2p_failure "$out" "$role" finish-ack-failed || p2p_cleanup_failed=1
+    finish_status=1
+  fi
+
+  if p2p_cleanup_operation "$out" "$role" finish-natural-exit \
+      android_acceptance_wait_for_session_exit "$session_pid" 150 "$out/$role-instrumentation.log"; then
+    printf -v "p2p_${role}_quiesced" '%s' 1
+  else
+    record_p2p_failure "$out" "$role" natural-exit-timeout || p2p_cleanup_failed=1
+    finish_status=1
+    collect_physical_artifacts "$target_serial" "$out/$role-before-force-stop" live || true
+    # Collection can itself take time; ownership must be checked after it,
+    # immediately before the mutation, not merely before the grace period.
+    if p2p_cleanup_operation "$out" "$role" force-stop-authorization authorize_selected_device "$target_serial"; then
+      if p2p_cleanup_operation "$out" "$role" force-stop-command \
+        timeout 30 "$adb" -s "$target_serial" shell am force-stop com.bringyour.network \
+          >"$out/$role-force-stop.log" 2>&1; then
+        printf -v "p2p_${role}_quiesced" '%s' 1
+      else
+        p2p_cleanup_failed=1
+      fi
+    else
+      p2p_cleanup_failed=1
+      printf 'selected-device ownership unavailable; force-stop refused\n' >"$out/$role-force-stop.log"
+    fi
+    if android_acceptance_session_running "$session_pid"; then
+      kill -TERM "$session_pid" 2>/dev/null || true
+      if ! p2p_cleanup_operation "$out" "$role" finish-term-exit \
+          android_acceptance_wait_for_session_exit "$session_pid" 25; then
+        kill -KILL "$session_pid" 2>/dev/null || true
+      fi
+    fi
+  fi
+  wait "$session_pid" || child_status=$?
+  if ! p2p_cleanup_operation "$out" "$role" finish-receipt \
+      android_acceptance_record_session_exit "$out" "$role" "$session_pid" "$child_status" finish; then
+    record_p2p_failure "$out" "$role" artifact-collection || true
+    p2p_cleanup_failed=1
+    finish_status=1
+  fi
+  if [ "$child_status" -ne 0 ]; then
+    record_p2p_cleanup_failure "$out" "$role" finish-child-exit "$child_status" || p2p_cleanup_failed=1
+    record_p2p_failure "$out" "$role" child-exit-failed || p2p_cleanup_failed=1
+    finish_status=1
+    observe_p2p_owned_guest "$target_serial" after-break child-exit-failed || true
+  fi
+  if ! p2p_cleanup_operation "$out" "$role" finish-instrumentation-after \
+      android_acceptance_verify_p2p_instrumentation "$out/$role-instrumentation.log"; then
+    record_p2p_failure "$out" "$role" instrumentation-stream-lost || p2p_cleanup_failed=1
+    finish_status=1
+    observe_p2p_owned_guest "$target_serial" after-break instrumentation-stream-lost || true
+  fi
+  return "$finish_status"
+}
+
+# A lost/reused serial must not contribute a different app's client IDs to a
+# destructive API cleanup, nor receive removal of its private ownership files.
+retain_physical_cleanup_ownership() {
+  local target_serial="$1" role="$2" out="$3" marker="$4"
+  p2p_cleanup_operation "$out" "$role" retain-authorization authorize_selected_device "$target_serial" || return 1
+  p2p_cleanup_operation "$out" "$role" retain-active-ledger pull_android_acceptance_active_clients \
+    "$adb" "$target_serial" "$run_dir" "$out/$role-ownership" || return 1
+  p2p_cleanup_operation "$out" "$role" retain-reauthorization authorize_selected_device "$target_serial" || return 1
+  p2p_cleanup_operation "$out" "$role" retain-client-id pull_android_acceptance_private_client_id \
+    "$adb" "$target_serial" com.bringyour.network files/acceptance/physical-active-client-id \
+    "$out/active-client-id-$marker"
+}
+
+clear_physical_cleanup_ownership() {
+  local target_serial="$1" out="$2" role="$3"
+  p2p_cleanup_operation "$out" "$role" clear-authorization authorize_selected_device "$target_serial" || return 1
+  p2p_cleanup_operation "$out" "$role" clear-markers timeout 30 "$adb" -s "$target_serial" shell run-as com.bringyour.network \
+    rm -f files/acceptance/physical-active-client-id \
+    files/acceptance/active-client-ids >/dev/null 2>&1
+}
+
+cleanup_physical_sessions() {
+  local out="$1" client_serial="$2" provider_serial="$3"
+  local cleanup_status=0 ownership_status=0 quiescence_status=0
+  p2p_cleanup_operation "$out" client cleanup-quiescence \
+    test "${p2p_client_quiesced:-0}" = 1 || quiescence_status=1
+  p2p_cleanup_operation "$out" provider cleanup-quiescence \
+    test "${p2p_provider_quiesced:-0}" = 1 || quiescence_status=1
+  retain_physical_cleanup_ownership "$client_serial" client "$out" 1 || {
+    cleanup_status=1; ownership_status=1
+  }
+  retain_physical_cleanup_ownership "$provider_serial" provider "$out" 2 || {
+    cleanup_status=1; ownership_status=1
+  }
+  # A live guest can allocate another client after a ledger pull. Keep both
+  # device and host ownership markers until both session owners are quiescent;
+  # EXIT cleanup can still retain them before uninstalling the owned packages.
+  if [ "$quiescence_status" -ne 0 ]; then
+    cleanup_status=1
+  elif ! p2p_cleanup_operation "$out" pair release-clients release_active_clients "$out"; then
+    cleanup_status=1
+  elif [ "$ownership_status" -eq 0 ]; then
+    # Do not erase a device ledger after a failed/incomplete pull: EXIT cleanup
+    # must still be able to recover IDs not retained by this attempt.
+    clear_physical_cleanup_ownership "$client_serial" "$out" client || cleanup_status=1
+    clear_physical_cleanup_ownership "$provider_serial" "$out" provider || cleanup_status=1
+  fi
+  if [ "$cleanup_status" -ne 0 ]; then
+    p2p_cleanup_failed=1
+    record_p2p_failure "$out" pair cleanup-ownership-failed || true
+  fi
+  return "$cleanup_status"
+}
+
+# Keep raw diagnostics in the artifact directory, but publish a compact JSON
+# event as the first context for a debugging model. A failure event records a
+# bounded, redacted log window and an index of the full artifacts; passing
+# events carry no log excerpt and therefore consume no model context.
+record_acceptance_result() {
+  local out="$1" target="$2" phase="$3" status="$4" exit_code="$5"
+  local repro_command="$6" build_id="$7" input_fingerprint="$8" log_file="${9:-}"
+  local test_scope="${10:-$main_test_scope}"
+  local result_file="$out/result-${phase}.json"
+
+  mkdir -p "$out" || return 1
+  if ! UR_ACCEPT_RESULT_RUN_ID="$timestamp" \
+    UR_ACCEPT_RESULT_PROFILE="$profile" \
+    UR_ACCEPT_RESULT_TARGET="$target" \
+    UR_ACCEPT_RESULT_PHASE="$phase" \
+    UR_ACCEPT_RESULT_STATUS="$status" \
+    UR_ACCEPT_RESULT_EXIT_CODE="$exit_code" \
+    UR_ACCEPT_RESULT_BUILD_ID="$build_id" \
+    UR_ACCEPT_RESULT_INPUT_FINGERPRINT="$input_fingerprint" \
+    UR_ACCEPT_RESULT_TEST_SCOPE="$test_scope" \
+    UR_ACCEPT_RESULT_REPRO_COMMAND="$repro_command" \
+    UR_ACCEPT_RESULT_ARTIFACT_ROOT="$out" \
+    UR_ACCEPT_RESULT_LOG="$log_file" \
+    node "$result_summary_script" "$result_file"; then
+    echo "[android acceptance] could not write result event for $target/$phase" >&2
     return 1
   fi
-  peer_serial="emulator-$port"
-  peer_args=(-avd "$avd_name" -read-only -gpu host -port "$port" -no-snapshot -no-boot-anim -netdelay none -netspeed full)
-  [ "$headless" -eq 1 ] && peer_args+=(-no-window)
-  mkdir -p "$artifacts/peer-emulator"
-  run_android_acceptance_shared_avd_emulator \
-    "$emulator" "$artifacts/peer-emulator/emulator.log" "${peer_args[@]}" &
-  peer_emulator_pid=$!
-  if ! android_acceptance_prepare_owned_emulator \
+  if ! cat "$result_file" >>"$results_ndjson"; then
+    echo "[android acceptance] could not append result event for $target/$phase" >&2
+    return 1
+  fi
+  chmod 600 "$result_file" "$results_ndjson" || return 1
+  if [ "$status" = failed ]; then
+    cp "$result_file" "$out/failure.json" || return 1
+    chmod 600 "$out/failure.json" || return 1
+  fi
+}
+
+write_target_diagnostic() {
+  local out="$1"
+  shift
+  mkdir -p "$out" || return 1
+  printf '%s\n' "$@" >"$out/runner-error.log"
+  chmod 600 "$out/runner-error.log"
+}
+
+boot_peer_emulator() {
+  local port="" readiness_attempt readiness_status=1
+  # Only this invocation's attempt can be attached to a failed cell. Early
+  # ownership/launch failure must not attach a previous flavor's ready receipt.
+  peer_readiness_attempt_dir=""
+  if [ -n "$peer_serial" ] || [ -n "$peer_emulator_pid" ]; then
+    if ! runner_owns_peer_emulator; then
+      echo "existing peer emulator no longer proves ownership by this acceptance invocation" >&2
+      return 1
+    fi
+  else
+    port="$(available_emulator_console_port 5556 5584 || true)"
+    if [ -z "$port" ]; then
+      echo "no free Android emulator console port for peer-to-peer acceptance" >&2
+      return 1
+    fi
+    peer_serial="emulator-$port"
+    peer_emulator_owner_token="peer-${timestamp}-$$-$RANDOM"
+    peer_args=(-avd "$avd_name" -read-only -gpu host -port "$port" -no-snapshot -no-boot-anim -netdelay none -netspeed full)
+    [ "$headless" -eq 1 ] && peer_args+=(-no-window)
+    mkdir -p "$artifacts/peer-emulator" || return 1
+    run_android_acceptance_shared_avd_emulator \
+      "$emulator" "$artifacts/peer-emulator/emulator.log" \
+      "$peer_emulator_owner_token" "${peer_args[@]}" &
+    peer_emulator_pid=$!
+  fi
+
+  # A live owned child may never have completed readiness, or may have lost
+  # API/network access since the last flavor. Re-run the bounded preparation
+  # before any package/credential mutation on every reuse. Keep each attempt
+  # so recovery cannot overwrite the first failure's diagnostic evidence.
+  mkdir -p "$artifacts/peer-emulator" || return 1
+  readiness_attempt="$(mktemp -d "$artifacts/peer-emulator/readiness-attempt.XXXXXX")" || return 1
+  peer_readiness_attempt_dir="$readiness_attempt"
+  : >"$readiness_attempt/readiness.txt" || return 1
+  : >"$readiness_attempt/interactive.txt" || return 1
+  if ANDROID_ACCEPTANCE_EMULATOR_OWNER_TOKEN="$peer_emulator_owner_token" \
+      android_acceptance_prepare_owned_emulator \
       "$adb" "$peer_serial" "$avd_name" "$peer_emulator_pid" \
-      "$run_dir/peer-device" "$artifacts/peer-emulator/readiness.txt" \
-      "$artifacts/peer-emulator/interactive.txt"; then
-    echo "peer Android emulator did not become ready; see $artifacts/peer-emulator/readiness.txt" >&2
+      "$run_dir/peer-device" "$readiness_attempt/readiness.txt" \
+      "$readiness_attempt/interactive.txt"; then
+    if [ -f "$readiness_attempt/readiness.txt" ] && \
+       [ ! -L "$readiness_attempt/readiness.txt" ] && \
+       [ "$(cat "$readiness_attempt/readiness.txt")" = status=ready ]; then
+      readiness_status=0
+    fi
+  fi
+  printf 'exit_status=%s\n' "$readiness_status" >"$readiness_attempt/result.txt" || return 1
+  cp "$readiness_attempt/readiness.txt" "$artifacts/peer-emulator/readiness.txt" || return 1
+  cp "$readiness_attempt/interactive.txt" "$artifacts/peer-emulator/interactive.txt" || return 1
+  if [ "$readiness_status" -ne 0 ]; then
+    echo "peer Android emulator did not become ready; see $readiness_attempt/readiness.txt" >&2
     return 1
   fi
+}
+
+# A boot failure precedes both instrumentation streams, so there is no client
+# log to summarize. Retain its finite cause and only the exact small host-owned
+# readiness receipts in the failed P2P cell, not a mutable shared alias.
+retain_peer_readiness_failure() {
+  local out="$1" attempt_dir="${peer_readiness_attempt_dir:-}" diagnostic size
+  mkdir -p "$out/provider-readiness" || return 1
+  record_p2p_failure "$out" provider peer-readiness-failed || return 1
+  if [ -z "$attempt_dir" ]; then
+    printf 'status=preparation-not-started\n' >"$out/provider-readiness/readiness.txt"
+    return
+  fi
+  case "$attempt_dir" in "$artifacts/peer-emulator/readiness-attempt."*) ;; *) return 1 ;; esac
+  [ -d "$attempt_dir" ] && [ ! -L "$attempt_dir" ] || return 1
+  for diagnostic in readiness.txt interactive.txt result.txt; do
+    [ -f "$attempt_dir/$diagnostic" ] && [ ! -L "$attempt_dir/$diagnostic" ] || return 1
+    size="$(wc -c <"$attempt_dir/$diagnostic" | tr -d ' ')" || return 1
+    [ "$size" -le 4096 ] || return 1
+    cp "$attempt_dir/$diagnostic" "$out/provider-readiness/$diagnostic" || return 1
+  done
 }
 
 wait_physical_status() {
@@ -941,30 +1878,30 @@ pull_physical_client() {
 }
 
 stop_peer_emulator() {
-  local peer_cleanup_status=0 package_label
+  local peer_cleanup_status=0 package_label cleanup_grace=0
   [ -n "$peer_serial" ] || return 0
   mkdir -p "$artifacts/cleanup-clients/peer"
-  for package_name in com.bringyour.network com.bringyour.network.test; do
-    package_label="${package_name##*.}"
-    android_acceptance_uninstall_package \
-      "$android_acceptance_timeout_executable" "$adb" "$peer_serial" "$package_name" \
-      "$artifacts/cleanup-clients/peer/uninstall-$package_label.log" || \
-      peer_cleanup_status=1
-  done
-  timeout 15 "$adb" -s "$peer_serial" emu kill >/dev/null 2>&1 || true
-  if [ -n "$peer_emulator_pid" ]; then
-    for _ in $(seq 1 150); do
-      kill -0 "$peer_emulator_pid" 2>/dev/null || break
-      sleep 0.2
+  if runner_owns_peer_emulator; then
+    cleanup_grace=150
+    for package_name in com.bringyour.network com.bringyour.network.test; do
+      package_label="${package_name##*.}"
+      android_acceptance_uninstall_package \
+        "$android_acceptance_timeout_executable" "$adb" "$peer_serial" "$package_name" \
+        "$artifacts/cleanup-clients/peer/uninstall-$package_label.log" || \
+        peer_cleanup_status=1
     done
-    if kill -0 "$peer_emulator_pid" 2>/dev/null; then
-      kill -KILL "$peer_emulator_pid" 2>/dev/null || true
-      return 1
-    fi
-    wait "$peer_emulator_pid" 2>/dev/null || true
+    timeout 15 "$adb" -s "$peer_serial" emu kill >/dev/null 2>&1 || true
+  else
+    echo "refusing adb cleanup for a peer emulator no longer owned by this invocation" >&2
+    peer_cleanup_status=1
+  fi
+  if [ -n "$peer_emulator_pid" ]; then
+    android_acceptance_stop_emulator_child \
+      "$peer_emulator_pid" "$cleanup_grace" 50 || peer_cleanup_status=1
   fi
   peer_serial=""
   peer_emulator_pid=""
+  peer_emulator_owner_token=""
   return "$peer_cleanup_status"
 }
 
@@ -974,6 +1911,10 @@ run_android_peer_to_peer() {
   local client_diagnostic_id="$8"
   local provider_id_file="$run_dir/provider-client-id" session_status=0
   local provider_started=0 client_started=0 target_serial iteration app_apk instrumentation_apk install_role
+  local p2p_client_quiesced=0 p2p_provider_quiesced=0
+  local p2p_observation_out="" p2p_observation_avd=""
+  local p2p_observation_client_serial="" p2p_observation_client_pid="" p2p_observation_client_token=""
+  local p2p_observation_provider_serial="" p2p_observation_provider_pid="" p2p_observation_provider_token=""
   p2p_cleanup_failed=0
   mkdir -p "$out"
   if [ ! -f "$client_app_apk" ] || [ ! -f "$client_instrumentation_apk" ] || \
@@ -983,7 +1924,18 @@ run_android_peer_to_peer() {
     return 1
   fi
   if ! boot_peer_emulator; then
+    retain_peer_readiness_failure "$out" || p2p_cleanup_failed=1
     return 1
+  fi
+  if [ "${execution_mode:-}" = diagnostic ] && [ "${diagnostic_owned_avd:-0}" -eq 1 ]; then
+    p2p_observation_out="$out/guest-observation"
+    p2p_observation_avd="$avd_name"
+    p2p_observation_client_serial="$serial"
+    p2p_observation_client_pid="$emulator_pid"
+    p2p_observation_client_token="$emulator_owner_token"
+    p2p_observation_provider_serial="$peer_serial"
+    p2p_observation_provider_pid="$peer_emulator_pid"
+    p2p_observation_provider_token="$peer_emulator_owner_token"
   fi
 
   for target_serial in "$serial" "$peer_serial"; do
@@ -1020,7 +1972,10 @@ run_android_peer_to_peer() {
   done
 
   if [ "$session_status" -eq 0 ]; then
-    if ! android_acceptance_runner_owned_emulator_interactive \
+    observe_p2p_owned_guest "$serial" before-workflow baseline || true
+    observe_p2p_owned_guest "$peer_serial" before-workflow baseline || true
+    if ! ANDROID_ACCEPTANCE_EMULATOR_OWNER_TOKEN="$peer_emulator_owner_token" \
+        android_acceptance_runner_owned_emulator_interactive \
         "$adb" "$peer_serial" "$avd_name" "$peer_emulator_pid" \
         "$out/provider-interactive.txt"; then
       echo "Android peer provider did not reach credential-free interactive state" >&2
@@ -1031,6 +1986,7 @@ run_android_peer_to_peer() {
       echo "Android peer provider failed its final preflight; see $out/provider-preflight.txt" >&2
       session_status=1
     else
+      provider_session_out="$out"
       "$adb" -s "$peer_serial" shell am instrument -w -r \
         -e class com.bringyour.network.acceptance.PhysicalLowbarSessionTest \
         -e acceptanceBuildId "$provider_build_id" \
@@ -1046,7 +2002,8 @@ run_android_peer_to_peer() {
   fi
 
   if [ "$session_status" -eq 0 ]; then
-    if ! selected_device_interactive "$serial" "$out/client-interactive.txt"; then
+    if ! selected_device_interactive \
+        "$serial" "$client_diagnostic_id" client "$out/client-interactive.txt"; then
       echo "Android peer client did not reach its required interactive state" >&2
       session_status=1
     elif ! android_acceptance_preflight_device \
@@ -1055,6 +2012,7 @@ run_android_peer_to_peer() {
       echo "Android peer client failed its final preflight; see $out/client-preflight.txt" >&2
       session_status=1
     else
+      client_session_out="$out"
       "$adb" -s "$serial" shell am instrument -w -r \
         -e class com.bringyour.network.acceptance.PhysicalLowbarSessionTest \
         -e acceptanceBuildId "$client_build_id" \
@@ -1109,80 +2067,62 @@ run_android_peer_to_peer() {
   fi
 
   if [ "$session_status" -eq 0 ]; then
-    collect_physical_artifacts "$serial" "$out/client-before-teardown" || session_status=1
-    collect_physical_artifacts "$peer_serial" "$out/provider-before-teardown" || session_status=1
-    send_physical_command "$serial" 'client-finish|finish|' || session_status=1
-    wait_physical_status "$serial" client-finish complete none 120 "$client_session_pid" || session_status=1
-    send_physical_command "$peer_serial" 'provider-finish|finish|' || session_status=1
-    wait_physical_status "$peer_serial" provider-finish complete none 120 "$provider_session_pid" || session_status=1
-  fi
-  if [ "$session_status" -ne 0 ]; then
-    collect_physical_artifacts "$serial" "$out/client-before-force-stop" || session_status=1
-    collect_physical_artifacts "$peer_serial" "$out/provider-before-force-stop" || session_status=1
-    timeout 30 "$adb" -s "$serial" shell am force-stop com.bringyour.network >/dev/null 2>&1 || true
-    timeout 30 "$adb" -s "$peer_serial" shell am force-stop com.bringyour.network >/dev/null 2>&1 || true
+    if ! collect_physical_artifacts "$serial" "$out/client-before-teardown" live; then
+      record_p2p_failure "$out" client artifact-collection || p2p_cleanup_failed=1
+      session_status=1
+      [ ! -f "$out/client-before-teardown/collection-failed-command.tsv" ] || \
+        observe_p2p_owned_guest "$serial" after-break artifact-read || true
+    fi
+    if ! collect_physical_artifacts "$peer_serial" "$out/provider-before-teardown" live; then
+      record_p2p_failure "$out" provider artifact-collection || p2p_cleanup_failed=1
+      session_status=1
+      [ ! -f "$out/provider-before-teardown/collection-failed-command.tsv" ] || \
+        observe_p2p_owned_guest "$peer_serial" after-break artifact-read || true
+    fi
+  else
+    record_p2p_failure "$out" pair workflow-failed || p2p_cleanup_failed=1
+    if [ "$client_started" -eq 1 ] && ! collect_physical_artifacts "$serial" "$out/client-before-teardown" live; then
+      [ ! -f "$out/client-before-teardown/collection-failed-command.tsv" ] || \
+        observe_p2p_owned_guest "$serial" after-break artifact-read || true
+    fi
+    if [ "$provider_started" -eq 1 ] && ! collect_physical_artifacts "$peer_serial" "$out/provider-before-teardown" live; then
+      [ ! -f "$out/provider-before-teardown/collection-failed-command.tsv" ] || \
+        observe_p2p_owned_guest "$peer_serial" after-break artifact-read || true
+    fi
   fi
 
+  # A diagnostic failure must not immediately kill successful instrumentation.
+  # Both started roles are independently finished and joined, even if the other
+  # role failed; each must produce its own positive terminal success receipt.
   if [ "$client_started" -eq 1 ]; then
-    forced_session_stop=0
-    for _ in $(seq 1 150); do
-      kill -0 "$client_session_pid" 2>/dev/null || break
-      sleep 0.2
-    done
-    if kill -0 "$client_session_pid" 2>/dev/null; then
-      forced_session_stop=1
-      kill -TERM "$client_session_pid" 2>/dev/null || true
-    fi
-    if wait "$client_session_pid"; then :; elif [ "$session_status" -eq 0 ]; then session_status=1; fi
-    [ "$forced_session_stop" -eq 0 ] || session_status=1
+    finish_physical_session "$serial" client "$client_session_pid" "$out" || session_status=1
     client_session_pid=""
+    client_session_out=""
   fi
   if [ "$provider_started" -eq 1 ]; then
-    forced_session_stop=0
-    for _ in $(seq 1 150); do
-      kill -0 "$provider_session_pid" 2>/dev/null || break
-      sleep 0.2
-    done
-    if kill -0 "$provider_session_pid" 2>/dev/null; then
-      forced_session_stop=1
-      kill -TERM "$provider_session_pid" 2>/dev/null || true
-    fi
-    if wait "$provider_session_pid"; then :; elif [ "$session_status" -eq 0 ]; then session_status=1; fi
-    [ "$forced_session_stop" -eq 0 ] || session_status=1
+    finish_physical_session "$peer_serial" provider "$provider_session_pid" "$out" || session_status=1
     provider_session_pid=""
+    provider_session_out=""
   fi
-  if grep -Eq 'FAILURES!!!|INSTRUMENTATION_FAILED|Process crashed|shortMsg=' \
-      "$out/client-instrumentation.log" "$out/provider-instrumentation.log" 2>/dev/null; then
+  if [ "$client_started" -ne 1 ] || [ "$provider_started" -ne 1 ]; then
     session_status=1
   fi
 
-  pull_android_acceptance_active_clients \
-    "$adb" "$serial" "$run_dir" "$out/client-ownership" || {
-      session_status=1
-      p2p_cleanup_failed=1
-    }
-  pull_android_acceptance_active_clients \
-    "$adb" "$peer_serial" "$run_dir" "$out/provider-ownership" || {
-      session_status=1
-      p2p_cleanup_failed=1
-    }
-  pull_android_acceptance_private_client_id \
-    "$adb" "$serial" com.bringyour.network files/acceptance/physical-active-client-id \
-    "$out/active-client-id-1" || p2p_cleanup_failed=1
-  pull_android_acceptance_private_client_id \
-    "$adb" "$peer_serial" com.bringyour.network files/acceptance/physical-active-client-id \
-    "$out/active-client-id-2" || p2p_cleanup_failed=1
-  if ! release_active_clients "$out"; then
+  # Never expose either retained instrumentation stream to the bulk system-log
+  # transfer. Live app evidence above is unchanged; this separate phase keeps
+  # the complete 12,000-line dump after natural completion or an owned stop.
+  if [ "$client_started" -eq 1 ] && ! collect_p2p_quiescent_logcat \
+      "$serial" client "$out/client-after-quiescence"; then
+    record_p2p_failure "$out" client artifact-collection || p2p_cleanup_failed=1
     session_status=1
-    p2p_cleanup_failed=1
-  else
-    timeout 30 "$adb" -s "$serial" shell run-as com.bringyour.network \
-      rm -f files/acceptance/physical-active-client-id \
-      files/acceptance/active-client-ids >/dev/null 2>&1 || true
-    timeout 30 "$adb" -s "$peer_serial" shell run-as com.bringyour.network \
-      rm -f files/acceptance/physical-active-client-id \
-      files/acceptance/active-client-ids >/dev/null 2>&1 || true
   fi
+  if [ "$provider_started" -eq 1 ] && ! collect_p2p_quiescent_logcat \
+      "$peer_serial" provider "$out/provider-after-quiescence"; then
+    record_p2p_failure "$out" provider artifact-collection || p2p_cleanup_failed=1
+    session_status=1
+  fi
+
+  cleanup_physical_sessions "$out" "$serial" "$peer_serial" || session_status=1
   [ "$session_status" -eq 0 ]
 }
 
@@ -1201,7 +2141,20 @@ record_smoke_result() {
   local device_id="$1" target_serial="$2" target="$3" status="$4" detail="$5"
   detail="$(printf '%s' "$detail" | tr '\t\r\n' '   ')"
   printf '%s\t%s\t%s\t%s\t%s\n' \
-    "$device_id" "$target_serial" "$target" "$status" "$detail" >>"$smoke_results"
+      "$device_id" "$target_serial" "$target" "$status" "$detail" >>"$smoke_results"
+}
+
+# Partial profiles still prove every auth/data-plane workflow, but deliberately
+# omit the expensive peer-to-peer proof. Keep their internal result rows honest
+# so the cleanup verifier can require exactly the work that was selected.
+record_full_cases() {
+  local device_id="$1" target_serial="$2" target="$3" status="$4" detail="$5"
+
+  record_device_cases "$device_id" "$target_serial" "$target" "$status" "$detail" \
+    email phone instant password data-plane usdc-quote
+  if [ "$run_peer_to_peer" -eq 1 ]; then
+    record_device_cases "$device_id" "$target_serial" "$target" "$status" "$detail" peer-to-peer
+  fi
 }
 
 record_target_failure() {
@@ -1214,8 +2167,7 @@ record_target_failure() {
     elif [ "$smoke_only" -eq 1 ]; then
       record_smoke_result "$device_id" "$target_serial" "$failed_target" FAIL "$detail"
     else
-      record_device_cases "$device_id" "$target_serial" "$failed_target" FAIL "$detail" \
-        email phone instant password data-plane peer-to-peer
+      record_full_cases "$device_id" "$target_serial" "$failed_target" FAIL "$detail"
     fi
   done 3<"$device_plan"
 }
@@ -1223,6 +2175,10 @@ record_target_failure() {
 uninstall_acceptance_packages() {
   local target_serial="$1" log_dir="$2" uninstall_status=0 package_name package_label
   mkdir -p "$log_dir" || return 2
+  if ! authorize_selected_device "$target_serial"; then
+    printf 'status=ownership-unavailable\n' >"$log_dir/cleanup-status.txt" || return 2
+    return 1
+  fi
   for package_name in com.bringyour.network com.bringyour.network.test; do
     package_label="${package_name##*.}"
     if ! android_acceptance_uninstall_package \
@@ -1232,7 +2188,35 @@ uninstall_acceptance_packages() {
       uninstall_status=1
     fi
   done
+  if [ "$uninstall_status" -eq 0 ]; then
+    printf 'status=complete\n' >"$log_dir/cleanup-status.txt" || return 2
+  else
+    printf 'status=package-removal-unverified\n' >"$log_dir/cleanup-status.txt" || return 2
+  fi
   return "$uninstall_status"
+}
+
+# Preserve whether instrumentation had already failed before package cleanup.
+# A later infrastructure failure must explain an otherwise successful test,
+# but must never replace an earlier app crash/assertion as the primary cause.
+record_acceptance_cleanup_failure() {
+  local out="$1" preceding_status="$2" reason=cleanup-result-unavailable status_file size
+  [[ "$preceding_status" =~ ^(0|[1-9][0-9]{0,2})$ ]] && \
+    [ "$preceding_status" -le 255 ] || return 2
+  [ ! -L "$out/cleanup-failure.json" ] || return 1
+  [ ! -e "$out/cleanup-failure.json" ] || return 0
+  status_file="$out/post-acceptance-cleanup/cleanup-status.txt"
+  if [ -f "$status_file" ] && [ ! -L "$status_file" ]; then
+    size="$(wc -c <"$status_file" | tr -d ' ')" || return 1
+    if [ "$size" -le 128 ]; then
+      case "$(cat "$status_file")" in
+        status=ownership-unavailable) reason=ownership-unavailable ;;
+        status=package-removal-unverified) reason=package-removal-unverified ;;
+      esac
+    fi
+  fi
+  printf '{"schemaVersion":1,"phase":"post-acceptance-cleanup","reason":"%s","classification":"infrastructure","precedingTestExitCode":%s}\n' \
+    "$reason" "$preceding_status" >"$out/cleanup-failure.json"
 }
 
 overall=0
@@ -1246,8 +2230,11 @@ for target in $build_targets; do
   source_target="$target"
   [ "$target" = fdroid ] && { prepare_fdroid_tree; tree="$fdroid_tree"; source_target=github; }
   flavor="$(gradle_flavor "$target")"
-  target_cache="$here/tests/__acceptance__/build/$target"
+  target_cache="$(acceptance_target_cache_dir "$target")"
   sidecar="$target_cache/build-id"
+  input_fingerprint=""
+  build_phase=build
+  [ "$skip_build" -eq 1 ] && build_phase=cache
   target_ready=1
 
   echo
@@ -1261,7 +2248,7 @@ for target in $build_targets; do
         ":app:assemble${flavor}Debug" \
         ":app:assemble${flavor}DebugAndroidTest" \
         -PurnetworkAcceptanceBuildId="$build_id" \
-        "${gradle_worker_args[@]}"
+        ${gradle_worker_args[@]+"${gradle_worker_args[@]}"}
     ) 2>&1 | tee "$build_out/build.log"
     build_status=${PIPESTATUS[0]}
     set -e
@@ -1270,15 +2257,26 @@ for target in $build_targets; do
     elif ! locate_apks "$tree" "$source_target" "$flavor"; then
       echo "could not locate target and test APKs for $target" >&2
       target_ready=0
+    elif ! input_fingerprint="$(acceptance_target_input_fingerprint "$target" "$flavor")"; then
+      echo "could not fingerprint inputs for $target" >&2
+      target_ready=0
     elif ! android_acceptance_cache_apks "$target_apk" "$test_apk" "$target_cache"; then
       echo "could not cache target and test APKs for $target" >&2
       target_ready=0
-    else
-      printf '%s\n' "$build_id" >"$sidecar"
+    elif ! android_acceptance_write_cache_metadata \
+        "$target_cache" "$build_id" "$input_fingerprint"; then
+      echo "could not write cache metadata for $target" >&2
+      target_ready=0
     fi
   else
-    if [ ! -f "$sidecar" ]; then
-      echo "missing build-id sidecar $sidecar" >&2
+    if ! input_fingerprint="$(acceptance_target_input_fingerprint "$target" "$flavor")"; then
+      echo "could not fingerprint inputs for cached $target APKs" >&2
+      target_ready=0
+    elif ! android_acceptance_cache_is_current "$target_cache" "$input_fingerprint"; then
+      echo "cached APKs for $target do not match current inputs; run without --skip-build" >&2
+      target_ready=0
+    elif [ ! -s "$sidecar" ]; then
+      echo "missing validated build-id sidecar $sidecar" >&2
       target_ready=0
     else
       build_id="$(tr -d '\r\n' <"$sidecar")"
@@ -1286,6 +2284,15 @@ for target in $build_targets; do
   fi
   target_apk="$target_cache/app.apk"
   test_apk="$target_cache/test.apk"
+  if [ "$target_ready" -eq 1 ] && ! [[ "$build_id" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "invalid build-id sidecar for $target" >&2
+    target_ready=0
+  fi
+  if [ "$target_ready" -eq 1 ] && \
+     ! android_acceptance_cache_is_current "$target_cache" "$input_fingerprint"; then
+    echo "APK cache for $target is incomplete" >&2
+    target_ready=0
+  fi
   if [ "$target_ready" -eq 1 ] && { [ ! -f "$target_apk" ] || [ ! -f "$test_apk" ]; }; then
     echo "missing cached target and test APKs for $target" >&2
     target_ready=0
@@ -1313,10 +2320,19 @@ for target in $build_targets; do
     fi
   fi
   if [ "$target_ready" -ne 1 ]; then
+    write_target_diagnostic "$build_out" "build, cache, or APK contract failed for $target"
+    record_acceptance_result \
+      "$build_out" "$target" "$build_phase" failed 1 \
+      "./test-main.sh --profile=$profile --flavor=$target" \
+      "$build_id" "$input_fingerprint" "$build_out/runner-error.log" || overall=1
     record_target_failure "$target" "build or APK contract failed"
     overall=1
     continue
   fi
+  record_acceptance_result \
+    "$build_out" "$target" "$build_phase" passed 0 \
+    "./test-main.sh --profile=$profile --flavor=$target" \
+    "$build_id" "$input_fingerprint" "$build_out/build.log" || overall=1
   expected_version="$(apk_version "$target_apk")"
 
   # A support-only GitHub build supplies the unrestricted peer app when a
@@ -1341,16 +2357,24 @@ for target in $build_targets; do
 
     echo
     echo "[android acceptance] ════════ $target on $serial ($device_id) ════════"
-    if ! android_acceptance_adb_device_ready "$adb" "$serial"; then
-      echo "selected Android device $serial is no longer available" >&2
+    if ! authorize_selected_device "$serial" "$out/authorization-failure.txt"; then
+      echo "selected Android device $serial is no longer available or authorized" >&2
+      write_target_diagnostic "$out" "Android device authorization failed; see authorization-failure.txt"
+      authorization_repro="./test-main.sh --profile=$profile --flavor=$target"
+      if [ "$execution_mode" = diagnostic ]; then
+        authorization_repro="./test-main.sh $diagnostic_selector --diagnostic-case=$diagnostic_case --flavor=$target"
+      fi
+      record_acceptance_result \
+        "$out" "$target" device failed 1 \
+        "$authorization_repro" \
+        "$build_id" "$input_fingerprint" "$out/runner-error.log" || overall=1
       if [ "$execution_mode" = diagnostic ]; then
         record_device_cases "$device_id" "$serial" "$target" FAIL "device became unavailable" \
           "$diagnostic_case"
       elif [ "$smoke_only" -eq 1 ]; then
         record_smoke_result "$device_id" "$serial" "$target" FAIL "device became unavailable"
       else
-        record_device_cases "$device_id" "$serial" "$target" FAIL "device became unavailable" \
-          email phone instant password data-plane peer-to-peer
+        record_full_cases "$device_id" "$serial" "$target" FAIL "device became unavailable"
       fi
       overall=1
       continue
@@ -1375,9 +2399,19 @@ for target in $build_targets; do
         p2p_status=1
       fi
       if [ "$p2p_status" -eq 0 ]; then
+        record_acceptance_result \
+          "$out/peer-to-peer" "$target" peer-to-peer passed 0 \
+          "./test-main.sh $diagnostic_selector --diagnostic-case=peer-to-peer --flavor=$target" \
+          "$build_id" "$input_fingerprint" "$out/peer-to-peer/client-instrumentation.log" \
+          com.bringyour.network.acceptance.PhysicalLowbarSessionTest || overall=1
         record_device_cases "$device_id" "$serial" "$target" PASS \
           "bidirectional peer proof and full cleanup completed" "$diagnostic_case"
       else
+        record_acceptance_result \
+          "$out/peer-to-peer" "$target" peer-to-peer failed 1 \
+          "./test-main.sh $diagnostic_selector --diagnostic-case=peer-to-peer --flavor=$target" \
+          "$build_id" "$input_fingerprint" "$out/peer-to-peer/client-instrumentation.log" \
+          com.bringyour.network.acceptance.PhysicalLowbarSessionTest || overall=1
         record_device_cases "$device_id" "$serial" "$target" FAIL \
           "peer-to-peer diagnostic or cleanup failed" "$diagnostic_case"
         overall=1
@@ -1386,11 +2420,15 @@ for target in $build_targets; do
     fi
     if ! uninstall_acceptance_packages "$serial" "$out/preinstall-cleanup"; then
       echo "stale acceptance package cleanup failed for $target on $serial" >&2
+      write_target_diagnostic "$out" "stale acceptance package cleanup failed"
+      record_acceptance_result \
+        "$out" "$target" cleanup failed 1 \
+        "adb -s $serial uninstall com.bringyour.network" \
+        "$build_id" "$input_fingerprint" "$out/runner-error.log" || overall=1
       if [ "$smoke_only" -eq 1 ]; then
         record_smoke_result "$device_id" "$serial" "$target" FAIL "stale package cleanup failed"
       else
-        record_device_cases "$device_id" "$serial" "$target" FAIL "stale package cleanup failed" \
-          email phone instant password data-plane peer-to-peer
+        record_full_cases "$device_id" "$serial" "$target" FAIL "stale package cleanup failed"
       fi
       overall=1
       continue
@@ -1401,11 +2439,15 @@ for target in $build_targets; do
         "$adb" "$serial" "$target_apk" "$test_apk" \
         "$out/install-app.log" "$out/install-test.log"; then
       echo "install failed for $target on $serial" >&2
+      cat "$out/install-app.log" "$out/install-test.log" >"$out/install.log" 2>&1 || true
+      record_acceptance_result \
+        "$out" "$target" install failed 1 \
+        "adb -s $serial install -r -t <app.apk>; adb -s $serial install -r -t <test.apk>" \
+        "$build_id" "$input_fingerprint" "$out/install.log" || overall=1
       if [ "$smoke_only" -eq 1 ]; then
         record_smoke_result "$device_id" "$serial" "$target" FAIL "APK install failed"
       else
-        record_device_cases "$device_id" "$serial" "$target" FAIL "APK install failed" \
-          email phone instant password data-plane peer-to-peer
+        record_full_cases "$device_id" "$serial" "$target" FAIL "APK install failed"
       fi
       overall=1
       if ! uninstall_acceptance_packages "$serial" "$out/install-failure-cleanup"; then
@@ -1419,6 +2461,12 @@ for target in $build_targets; do
     installed_version="$(timeout 30 "$adb" -s "$serial" shell dumpsys package com.bringyour.network | sed -n 's/.*versionName=//p' | sed -n '1p' | tr -d '\r')"
     if [ -z "$expected_version" ] || [ "$installed_version" != "$expected_version" ]; then
       echo "installed version mismatch on $serial: APK=$expected_version installed=$installed_version" >&2
+      write_target_diagnostic \
+        "$out" "installed version mismatch: APK=$expected_version installed=$installed_version"
+      record_acceptance_result \
+        "$out" "$target" validation failed 1 \
+        "adb -s $serial shell dumpsys package com.bringyour.network" \
+        "$build_id" "$input_fingerprint" "$out/runner-error.log" || overall=1
       test_status=1
     fi
     timeout 30 "$adb" -s "$serial" logcat -c || test_status=1
@@ -1438,9 +2486,17 @@ for target in $build_targets; do
         </dev/null >/dev/null 2>&1 || test_status=1
       uninstall_acceptance_packages "$serial" "$out/post-smoke-cleanup" || test_status=1
       if [ "$test_status" -eq 0 ]; then
+        record_acceptance_result \
+          "$out" "$target" smoke passed 0 \
+          "./test-main.sh --smoke --flavor=$target" \
+          "$build_id" "$input_fingerprint" "$out/launch.log" || overall=1
         record_smoke_result "$device_id" "$serial" "$target" PASS "local APK installed, launched, and remained alive"
         echo "[android acceptance] $target smoke accepted on $serial"
       else
+        record_acceptance_result \
+          "$out" "$target" smoke failed "$test_status" \
+          "./test-main.sh --smoke --flavor=$target" \
+          "$build_id" "$input_fingerprint" "$out/launch.log" || overall=1
         record_smoke_result "$device_id" "$serial" "$target" FAIL "install, launch, version, or cleanup failed"
         overall=1
       fi
@@ -1473,6 +2529,24 @@ for target in $build_targets; do
     else
       : >"$out/instrumentation.log"
     fi
+
+    # The payment the client builds. It spends nothing and talks to nothing --
+    # the quote is injected -- so it runs even when the main lifecycle failed,
+    # and reports separately.
+    usdc_status=0
+    set +e
+    timeout 600 \
+      "$adb" -s "$serial" shell am instrument -w -r \
+        -e class "$usdc_test_scope" \
+        -e acceptanceBuildId "$build_id" \
+        com.bringyour.network.test/androidx.test.runner.AndroidJUnitRunner \
+        2>&1 | tee "$out/usdc-instrumentation.log"
+    usdc_status=${PIPESTATUS[0]}
+    set -e
+    if grep -Eq 'FAILURES!!!|INSTRUMENTATION_FAILED|Process crashed|shortMsg=' "$out/usdc-instrumentation.log"; then
+      usdc_status=1
+    fi
+
     collect_target_artifacts "$out" || test_status=1
     if [ "$test_status" -eq 0 ] && \
        ! android_acceptance_verify_workflow_artifacts "$out" "$repeat_count"; then
@@ -1491,11 +2565,8 @@ for target in $build_targets; do
       test_status=1
       fixture_missing=1
     fi
-    result_text="$(timeout 30 "$adb" -s "$serial" exec-out run-as com.bringyour.network cat files/acceptance/result 2>/dev/null | tr -d '\r' || true)"
-    result_build="$(printf '%s\n' "$result_text" | sed -n '1p')"
-    result_repeat="$(printf '%s\n' "$result_text" | sed -n '2p')"
-    if [ "$result_build" != "$build_id" ] || [ "$result_repeat" != "$repeat_count" ]; then
-      echo "instrumentation did not write the expected completion record for $target on $serial" >&2
+    if ! read_acceptance_completion_record "$serial" "$out/completion" "$build_id" "$repeat_count"; then
+      echo "completion record read or verification failed for $target on $serial (see completion receipts)" >&2
       test_status=1
     fi
     if grep -Eq 'FAILURES!!!|INSTRUMENTATION_FAILED|Process crashed|shortMsg=' "$out/instrumentation.log"; then
@@ -1503,7 +2574,8 @@ for target in $build_targets; do
       test_status=1
     fi
 
-    if [ "$fixture_missing" -eq 0 ] && [ "$client_cleanup_failed" -eq 0 ]; then
+    if [ "$run_peer_to_peer" -eq 1 ] && \
+       [ "$fixture_missing" -eq 0 ] && [ "$client_cleanup_failed" -eq 0 ]; then
       echo "[android acceptance] peer-to-peer: $target on $serial"
       provider_target="$target"
       case "$target" in play|solana_dapp) provider_target=github ;; esac
@@ -1521,29 +2593,65 @@ for target in $build_targets; do
         client_cleanup_failed=1
         p2p_status=1
       fi
-    else
+    elif [ "$run_peer_to_peer" -eq 1 ]; then
       p2p_status=1
+    else
+      write_target_diagnostic "$out/peer-to-peer" "peer-to-peer skipped by profile=$profile"
+      record_acceptance_result \
+        "$out/peer-to-peer" "$target" peer-to-peer skipped 0 \
+        "./test-main.sh --profile=$profile --flavor=$target" \
+        "$build_id" "$input_fingerprint" "$out/peer-to-peer/runner-error.log" \
+        com.bringyour.network.acceptance.PhysicalLowbarSessionTest || overall=1
     fi
     if ! uninstall_acceptance_packages "$serial" "$out/post-acceptance-cleanup"; then
+      record_acceptance_cleanup_failure "$out" "$test_status" || overall=1
       echo "could not clean acceptance packages from $serial" >&2
       test_status=1
-      p2p_status=1
+      [ "$run_peer_to_peer" -eq 0 ] || p2p_status=1
     fi
 
     if [ "$test_status" -eq 0 ]; then
+      record_acceptance_result \
+        "$out" "$target" instrumentation passed 0 \
+        "adb -s $serial shell am instrument -w -r -e class $main_test_scope com.bringyour.network.test/androidx.test.runner.AndroidJUnitRunner" \
+        "$build_id" "$input_fingerprint" "$out/instrumentation.log" || overall=1
       record_device_cases "$device_id" "$serial" "$target" PASS "instrumentation and cleanup completed" \
         email phone instant password data-plane
-      echo "[android acceptance] $target accepted on $serial"
+      echo "[android acceptance] $target auth/data-plane instrumentation passed on $serial (other case results reported separately)"
     else
+      record_acceptance_result \
+        "$out" "$target" instrumentation failed "$test_status" \
+        "adb -s $serial shell am instrument -w -r -e class $main_test_scope com.bringyour.network.test/androidx.test.runner.AndroidJUnitRunner" \
+        "$build_id" "$input_fingerprint" "$out/instrumentation.log" || overall=1
       record_device_cases "$device_id" "$serial" "$target" FAIL "instrumentation or cleanup failed" \
         email phone instant password data-plane
       overall=1
     fi
-    if [ "$p2p_status" -eq 0 ]; then
-      record_device_cases "$device_id" "$serial" "$target" PASS "bidirectional peer proof and cleanup completed" peer-to-peer
+    if [ "$usdc_status" -eq 0 ]; then
+      record_device_cases "$device_id" "$serial" "$target" PASS \
+        "the client built the payment the server quoted" usdc-quote
     else
-      record_device_cases "$device_id" "$serial" "$target" FAIL "peer-to-peer or cleanup failed" peer-to-peer
+      record_device_cases "$device_id" "$serial" "$target" FAIL \
+        "the client built a payment that disagrees with the quote; see usdc-instrumentation.log" usdc-quote
       overall=1
+    fi
+    if [ "$run_peer_to_peer" -eq 1 ]; then
+      if [ "$p2p_status" -eq 0 ]; then
+        record_acceptance_result \
+          "$out/peer-to-peer" "$target" peer-to-peer passed 0 \
+          "adb -s <provider> shell am instrument -w -r -e class com.bringyour.network.acceptance.PhysicalLowbarSessionTest ..." \
+          "$build_id" "$input_fingerprint" "$out/peer-to-peer/client-instrumentation.log" \
+          com.bringyour.network.acceptance.PhysicalLowbarSessionTest || overall=1
+        record_device_cases "$device_id" "$serial" "$target" PASS "bidirectional peer proof and cleanup completed" peer-to-peer
+      else
+        record_acceptance_result \
+          "$out/peer-to-peer" "$target" peer-to-peer failed 1 \
+          "adb -s <provider> shell am instrument -w -r -e class com.bringyour.network.acceptance.PhysicalLowbarSessionTest ..." \
+          "$build_id" "$input_fingerprint" "$out/peer-to-peer/client-instrumentation.log" \
+          com.bringyour.network.acceptance.PhysicalLowbarSessionTest || overall=1
+        record_device_cases "$device_id" "$serial" "$target" FAIL "peer-to-peer or cleanup failed" peer-to-peer
+        overall=1
+      fi
     fi
     if [ "$fixture_missing" -eq 1 ] || [ "$client_cleanup_failed" -eq 1 ]; then
       echo "[android acceptance] stopping: continuing could leak or replace the shared account fixture" >&2
@@ -1565,6 +2673,45 @@ if android_acceptance_manages_account_fixture "$execution_mode" "$smoke_only" &&
     rm -f "$fixture"
   else
     echo "could not delete instant-account fixture; retained at $fixture" >&2
+    overall=1
+  fi
+fi
+
+# The tabletop job, measured on its own like the USDC quote case, once the
+# peer emulator is gone and the account fixture is settled: its result never
+# decides whether the fixture is kept. It reuses the target's build id, so
+# Gradle reuses the APKs the cell above built.
+if [ "$unsafe_stop" -eq 0 ] && [ -n "$tabletop_target" ]; then
+  tabletop_flavor="$(gradle_flavor "$tabletop_target")"
+  tabletop_build_id="${timestamp}-${tabletop_target}"
+  tabletop_out="$artifacts/tabletop/$tabletop_target"
+  tabletop_repro="./gradlew :app:${tabletop_managed_device}${tabletop_flavor}DebugAndroidTest -Pandroid.experimental.androidTest.enableEmulatorControl=true -Pandroid.experimental.testOptions.managedDevices.setupTimeoutMinutes=30 -Pandroid.testInstrumentationRunnerArguments.class=$tabletop_test_scope"
+  mkdir -p "$tabletop_out"
+  echo
+  echo "[android acceptance] ════════ tabletop $tabletop_target on $tabletop_managed_device ════════"
+  set +e
+  android_acceptance_run_tabletop_job \
+    "$here/app" "$root" "$tabletop_flavor" "$tabletop_managed_device" \
+    "$tabletop_test_scope" "$tabletop_build_id" \
+    ${gradle_worker_args[@]+"${gradle_worker_args[@]}"} \
+    2>&1 | tee "$tabletop_out/tabletop.log"
+  tabletop_status=${PIPESTATUS[0]}
+  set -e
+  android_acceptance_collect_tabletop_results \
+    "$here/app/app/build" "$tabletop_flavor" "$tabletop_managed_device" "$tabletop_out" || \
+    echo "[android acceptance] the tabletop job left no managed-device results" >&2
+  if [ "$tabletop_status" -eq 0 ]; then
+    record_acceptance_result \
+      "$tabletop_out" "$tabletop_target" tabletop passed 0 \
+      "$tabletop_repro" "$tabletop_build_id" "" "$tabletop_out/tabletop.log" \
+      "$tabletop_test_scope" || overall=1
+    echo "[android acceptance] tabletop split passed on $tabletop_managed_device"
+  else
+    record_acceptance_result \
+      "$tabletop_out" "$tabletop_target" tabletop failed "$tabletop_status" \
+      "$tabletop_repro" "$tabletop_build_id" "" "$tabletop_out/tabletop.log" \
+      "$tabletop_test_scope" || overall=1
+    echo "[android acceptance] tabletop job failed on $tabletop_managed_device; see $tabletop_out" >&2
     overall=1
   fi
 fi

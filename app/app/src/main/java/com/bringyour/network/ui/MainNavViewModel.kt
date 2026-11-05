@@ -1,6 +1,8 @@
 package com.bringyour.network.ui
 
+import androidx.annotation.StringRes
 import androidx.lifecycle.ViewModel
+import androidx.navigation.NavController
 import com.bringyour.network.DeviceManager
 import com.bringyour.network.R
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -24,6 +26,20 @@ class MainNavViewModel @Inject constructor(
 
     private val _currentRoute = MutableStateFlow<Route?>(null)
     val currentRoute: StateFlow<Route?> = _currentRoute.asStateFlow()
+
+    // Earnings' "See the Protocol leaderboard": the leaderboard shows its
+    // Protocol tab once, then the request is consumed, so a later visit keeps
+    // the tab the user chose
+    private val _protocolTabRequested = MutableStateFlow(false)
+    val protocolTabRequested: StateFlow<Boolean> = _protocolTabRequested.asStateFlow()
+
+    val requestProtocolTab: () -> Unit = {
+        _protocolTabRequested.value = true
+    }
+
+    val consumeProtocolTabRequest: () -> Unit = {
+        _protocolTabRequested.value = false
+    }
 
     private val _displayIntroFunnel = MutableStateFlow<Boolean>(false)
     val displayIntroFunnel: StateFlow<Boolean> = _displayIntroFunnel.asStateFlow()
@@ -73,6 +89,7 @@ sealed class IntroRoute {
     @Serializable object IntroductionSettings: Route()
     @Serializable object IntroductionReferral: Route()
     @Serializable object IntroductionQuickConnect: Route()
+    @Serializable object IntroductionOffer: Route()
 
 }
 
@@ -96,15 +113,26 @@ sealed class Route {
     @Serializable object Leaderboard: Route()
 
     @Serializable object Upgrade: Route()
+    // a legacy guest adds a sign-in method to its network (GuestConversionSheet)
+    @Serializable object GuestConversion: Route()
     @Serializable object Account : Route()
     @Serializable object Support : Route()
     @Serializable object Profile : Route()
+    // Account -> Sessions: the account's sign-ins, with sign out
+    @Serializable object Sessions : Route()
+    // Account -> API keys: the network's API keys, with create and delete
+    @Serializable object ApiKeys : Route()
     @Serializable object Settings : Route()
     @Serializable object Earnings : Route()
+    // Earnings › Top 200 › Sign fleet binding (also opened by ur://top200/sign)
+    @Serializable object Top200Sign : Route()
     @Serializable object Referrals : Route()
     @Serializable object Widgets : Route()
     @Serializable object BlockedRegions: Route()
+    @Serializable object Vless: Route()
     @Serializable object Developer: Route()
+    @Serializable object Licenses: Route()
+    @Serializable data class LicenseDetail(val index: Int): Route()
     @Serializable object BalanceCodes: Route()
     @Serializable data class ContractStats(val provider: Boolean) : Route()
     @Serializable object SplitRules : Route()
@@ -116,37 +144,63 @@ sealed class Route {
 
     @Serializable object MockLocationGuide : Route()
     @Serializable object ProviderIdentities : Route()
+
+    @Serializable object Extenders : Route()
+    @Serializable object ShareExtenders : Route()
+    @Serializable object ImportExtenders : Route()
+}
+
+// Set on the upgrade destination's saved state when a start connect blocked by
+// insufficient balance opened it (see upgradeShowsFreeRefresh). Route.Upgrade
+// stays an object, so Route.fromString keeps resolving it.
+const val UPGRADE_OPENED_BY_BALANCE_BLOCK = "upgrade_opened_by_balance_block"
+
+/**
+ * Opens the upgrade screen for a start connect blocked by insufficient
+ * balance: the screen then leads with when the free data refreshes and offers
+ * Wait for refresh. Other upgrade entries navigate to Route.Upgrade directly.
+ */
+fun NavController.navigateToUpgradeForBalanceBlock() {
+    navigate(Route.Upgrade)
+    currentBackStackEntry?.savedStateHandle?.set(UPGRADE_OPENED_BY_BALANCE_BLOCK, true)
 }
 
 
 enum class TopLevelScaffoldRoutes(
     val selectedIcon: Int,
     val unselectedIcon: Int,
-    val description: String,
+    // the tab's name for screen readers, since the bar shows only icons
+    @StringRes val descriptionId: Int,
+    // how the device tests find the tab; never shown or read out
+    val testTag: String,
     val route: Route
 ) {
     CONNECT_CONTAINER(
         R.drawable.main_nav_globe_filled,
         R.drawable.main_nav_globe,
-        "Connect",
+        R.string.connect,
+        "acceptance.nav.connect",
         route = Route.ConnectContainer
     ),
     ACCOUNT_CONTAINER(
         R.drawable.main_nav_user_filled,
         R.drawable.main_nav_user,
-        "Account",
+        R.string.account,
+        "acceptance.nav.account",
         route = Route.AccountContainer
     ),
     LEADERBOARD(
         R.drawable.main_nav_user_filled,
         R.drawable.main_nav_user,
-        "Leaderboard",
+        R.string.leaderboard,
+        "acceptance.nav.leaderboard",
         route = Route.Leaderboard
     ),
     SUPPORT(
         R.drawable.main_nav_chat_filled,
         R.drawable.main_nav_chat,
-        "Support",
+        R.string.support,
+        "acceptance.nav.support",
         route = Route.Support
     )
 }

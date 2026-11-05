@@ -1,5 +1,6 @@
 package com.bringyour.network.ui.shared.viewmodels
 
+import com.bringyour.network.ui.connection_region.CantReachPrompt
 import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
@@ -16,9 +17,20 @@ import com.bringyour.network.ForegroundWorkOwner
 import com.bringyour.network.ForegroundPollingResume
 import com.bringyour.network.ForegroundPollingSession
 import com.bringyour.network.JwtManager
+import com.bringyour.network.ui.account.GuestAccount
+import com.bringyour.network.ui.upgrade.PastDueRenewal
 import com.bringyour.network.TAG
-import com.bringyour.network.ui.shared.models.ProvideControlMode
+import com.bringyour.sdk.AuthCodeCreateArgs
+import com.bringyour.sdk.ExperimentAssignmentList
+import com.bringyour.sdk.OnboardingOffer
+import com.bringyour.sdk.OnboardingOfferIssueArgs
+import com.bringyour.sdk.WinbackOffer
+import com.bringyour.sdk.PriceTier
+import com.bringyour.sdk.Sdk
+import com.bringyour.sdk.Api
+import com.bringyour.sdk.PurchaseConfirmationListener
 import com.bringyour.sdk.SubscriptionBalanceCallback
+import com.bringyour.sdk.SubscriptionBalanceResult
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -26,6 +38,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
@@ -35,13 +48,170 @@ import kotlinx.coroutines.isActive
 
 @HiltViewModel
 class SubscriptionBalanceViewModel @Inject constructor(
-    deviceManager: DeviceManager,
+    private val deviceManager: DeviceManager,
     jwtManager: JwtManager,
     @dagger.hilt.android.qualifiers.ApplicationContext private val appContext: android.content.Context,
 ): ViewModel(), DefaultLifecycleObserver {
 
     private val _currentStore = MutableStateFlow<String?>(null)
     val currentStore: StateFlow<String?> get() = _currentStore
+
+    /**
+     * The onboarding plan data the balance response carries (mmm/onboarding/
+     * PLAN.md): the caller's price tier, the welcome offer when one was issued,
+     * and the experiment variants per surface. Every plan surface renders from
+     * these; the store's localized prices only refine the printed figures.
+     */
+    private val _priceTier = MutableStateFlow<PriceTier?>(null)
+    val priceTier: StateFlow<PriceTier?> = _priceTier.asStateFlow()
+
+    private val _onboardingOffer = MutableStateFlow<OnboardingOffer?>(null)
+    val onboardingOffer: StateFlow<OnboardingOffer?> = _onboardingOffer.asStateFlow()
+
+    /**
+     * A returning subscriber's win-back offer (mmm/reengagement/PLAN.md "THE
+     * STORES"): the monthly plan's first month at a discount on one store,
+     * until its deadline. Null when there is none, and from an older server.
+     */
+    private val _winbackOffer = MutableStateFlow<WinbackOffer?>(null)
+    val winbackOffer: StateFlow<WinbackOffer?> = _winbackOffer.asStateFlow()
+
+    private val _experiments = MutableStateFlow<ExperimentAssignmentList?>(null)
+    val experiments: StateFlow<ExperimentAssignmentList?> = _experiments.asStateFlow()
+
+    /**
+     * The last balance the server answered, for flavor code that reads fields
+     * this shared view model does not (the non-Play flavors' crypto payment
+     * methods and crypto term, src/cryptoPay). One [BalanceAnswer] per answer:
+     * the sdk's generated equals compares no list contents, so a state holding
+     * the result itself would drop an answer whose lists alone changed.
+     */
+    private val _balanceAnswer = MutableStateFlow<BalanceAnswer?>(null)
+    val balanceAnswer: StateFlow<BalanceAnswer?> = _balanceAnswer.asStateFlow()
+
+    /**
+     * Whether the past-due notice shows (PastDueRenewal): exactly while the
+     * latest balance answer carries payment_past_due, a renewal the store is
+     * still retrying. Absent from an older server, which hides it.
+     */
+    val isPaymentPastDue: StateFlow<Boolean> = _balanceAnswer
+        .map { answer -> PastDueRenewal.noticeShows(answer?.result?.paymentPastDue) }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
+
+    private val _isOpeningUpdatePayment = MutableStateFlow(false)
+
+    /** An "Update payment method" tap is waiting for its one-time auth code. */
+    val isOpeningUpdatePayment: StateFlow<Boolean> = _isOpeningUpdatePayment.asStateFlow()
+
+    /**
+     * "Update payment method" (PastDueRenewal): creates a one-time auth code
+     * (one use, five minutes, as Settings' auth code) and hands [open] ur.io's
+     * Manage Subscription signed in with it, on the main thread. When no code
+     * can be created (an error, a blank code, or no api yet) [open] gets the
+     * page without one, where ur.io asks the user to sign in. A tap while a
+     * code is being created does nothing.
+     */
+    fun openUpdatePayment(open: (url: String) -> Unit) {
+        if (_isOpeningUpdatePayment.value) {
+            return
+        }
+        _isOpeningUpdatePayment.value = true
+
+        val opened: (String?) -> Unit = { authCode ->
+            viewModelScope.launch {
+                _isOpeningUpdatePayment.value = false
+                open(PastDueRenewal.manageSubscriptionUrl(authCode))
+            }
+        }
+
+        val api = deviceManager.device?.api
+        if (api == null) {
+            opened(null)
+            return
+        }
+        val args = AuthCodeCreateArgs()
+        args.durationMinutes = 5.0
+        args.uses = 1
+        api.authCodeCreate(args) { result, err ->
+            val authCode = if (err != null) {
+                Log.i(TAG, "update payment auth code error: ${err.message}")
+                null
+            } else if (result?.error != null) {
+                Log.i(TAG, "update payment auth code refused: ${result.error.message}")
+                null
+            } else {
+                result?.authCode
+            }
+            opened(authCode)
+        }
+    }
+
+    /**
+     * The store's storefront country (Play's billing country on the play
+     * flavor), sent with the balance request so the server resolves the tier
+     * from it instead of the IP estimate. Null where the app has no store.
+     */
+    @Volatile
+    var storefrontCountry: String? = null
+        private set
+
+    fun setStorefrontCountry(country: String?) {
+        val normalized = country?.trim()?.uppercase()?.takeIf { it.isNotEmpty() }
+        if (normalized != storefrontCountry) {
+            storefrontCountry = normalized
+            // re-resolve the tier for the store's country
+            fetchSubscriptionBalance()
+        }
+    }
+
+    /** The in-app offer holdout: the regular picker, no offer, no issue call. */
+    val isOfferHoldout: Boolean
+        get() = _experiments.value?.isHoldout(Sdk.ExperimentSurfaceOfferInApp) == true
+
+    /** The in-app experiment assignment, for the offer events. */
+    val offerExperiment: Pair<String, String>
+        get() {
+            val a = _experiments.value?.forSurface(Sdk.ExperimentSurfaceOfferInApp)
+            return Pair(a?.experimentId ?: "", a?.variant ?: "")
+        }
+
+    private var issuingOffer = false
+
+    /** A Solana Pay purchase the wallet was opened for; completed when the poll sees Pro. */
+    @Volatile
+    private var pendingSolanaPurchase: Pair<String, Double>? = null
+
+    fun expectSolanaPurchase(plan: String, amountUsd: Double) {
+        pendingSolanaPurchase = Pair(plan, amountUsd)
+    }
+
+    /**
+     * Issues the welcome offer for a surface (idempotent on the server; the
+     * existing record comes back when one exists) and publishes it. Not called
+     * for the holdout.
+     */
+    fun issueOnboardingOffer(surface: String) {
+        if (issuingOffer || isOfferHoldout) {
+            return
+        }
+        val api = deviceManager.device?.api ?: return
+        issuingOffer = true
+        val args = OnboardingOfferIssueArgs()
+        args.surface = surface
+        args.storefrontCountry = storefrontCountry ?: ""
+        api.onboardingOfferIssue(args) { result, err ->
+            viewModelScope.launch {
+                issuingOffer = false
+                if (err != null) {
+                    CantReachPrompt.shared.report(err)
+                    Log.i(TAG, "offer issue error: ${err.message}")
+                    return@launch
+                }
+                result?.offer?.let { _onboardingOffer.value = it }
+                result?.error?.let { Log.i(TAG, "offer issue refused: ${it.message}") }
+            }
+        }
+    }
 
     private val _isInitialized = MutableStateFlow<Boolean>(false)
     val isInitialized: StateFlow<Boolean> get() = _isInitialized
@@ -72,6 +242,78 @@ class SubscriptionBalanceViewModel @Inject constructor(
         },
     )
 
+    /**
+     * The SDK confirmation for Stripe sheet / pay page / checkout-return purchases
+     * (PurchaseConfirmation). Its state callbacks arrive on a Go thread and are
+     * handed to the main thread here.
+     */
+    private val purchaseConfirmation = PurchaseConfirmation(
+        openSource = { onState ->
+            deviceManager.device?.api?.let { api ->
+                SdkPurchaseConfirmationSource(api) { state ->
+                    viewModelScope.launch { onState(state) }
+                }
+            }
+        },
+        onConfirmed = { isPro ->
+            isConfirmingPurchase = false
+            if (isPro) {
+                // the overlay's premium copy reads this; the fetch below refreshes the rest
+                _hasActiveSubscription.value = true
+            }
+            _purchaseConfirmedSequence.update { it + 1L }
+            fetchSubscriptionBalance()
+            createBackgroundPollingJob()
+        },
+        onGaveUp = {
+            isConfirmingPurchase = false
+            _confirmationTimedOutSequence.update { it + 1L }
+            fetchSubscriptionBalance()
+            createBackgroundPollingJob()
+        },
+    )
+
+    /** The server confirmed a purchase handed to confirmPurchase: the overlay may celebrate. */
+    private val _purchaseConfirmedSequence = MutableStateFlow(0L)
+    val purchaseConfirmedSequence: StateFlow<Long> = _purchaseConfirmedSequence.asStateFlow()
+    private var consumedPurchaseConfirmedSequence = 0L
+
+    fun consumePurchaseConfirmedSequence(sequence: Long): Boolean {
+        if (sequence == 0L || sequence <= consumedPurchaseConfirmedSequence) {
+            return false
+        }
+        consumedPurchaseConfirmedSequence = sequence
+        return true
+    }
+
+    var isConfirmingPurchase by mutableStateOf(false)
+        private set
+
+    /** A purchase UI is opening: load the confirmation baseline before the payment. */
+    fun preparePurchaseConfirmation() {
+        purchaseConfirmation.prepare()
+    }
+
+    /** The purchase UI closed without a purchase. */
+    fun cancelPurchaseConfirmation() {
+        purchaseConfirmation.cancel()
+    }
+
+    /**
+     * The purchase UI reported success. Polls until the server confirms; the overlay
+     * launches from purchaseConfirmedSequence, the delayed notice from
+     * confirmationTimedOutSequence. Without an api there is nothing to confirm
+     * against, so the plain bounded poll (and its timeout notice) runs instead.
+     */
+    fun confirmPurchase() {
+        if (purchaseConfirmation.confirm()) {
+            isConfirmingPurchase = true
+            stopBackgroundPolling()
+        } else {
+            pollSubscriptionBalance()
+        }
+    }
+
     var isPollingSubscriptionBalance by mutableStateOf(false)
         private set
 
@@ -79,7 +321,7 @@ class SubscriptionBalanceViewModel @Inject constructor(
     val isCheckingSolanaTransaction: StateFlow<Boolean> = _isCheckingSolanaTransaction.asStateFlow()
 
     val isPolling: Boolean
-        get() = _isCheckingSolanaTransaction.value || isPollingSubscriptionBalance
+        get() = _isCheckingSolanaTransaction.value || isPollingSubscriptionBalance || isConfirmingPurchase
 
 
     private val _isLoading = MutableStateFlow(false)
@@ -104,13 +346,73 @@ class SubscriptionBalanceViewModel @Inject constructor(
     val errorFetchingSubscriptionBalance: StateFlow<Boolean> = _errorFetchingSubscriptionBalance
 
     /**
-     * True exactly when the SERVER reports an active subscription
+     * True exactly when the server reports an active subscription
      * (`currentSubscription != null`). This -- not payment evidence, not the jwt's
      * baked-in `pro` claim -- is what the post-purchase overlay is allowed to
      * celebrate. Until it flips true the overlay stays processing-shaped.
      */
     private val _hasActiveSubscription = MutableStateFlow(false)
     val hasActiveSubscription: StateFlow<Boolean> = _hasActiveSubscription.asStateFlow()
+
+    // the server's `guest`: the network has no login method (read from the live
+    // auth methods, so it survives the token refresh that clears guest_mode)
+    private val _serverGuest = MutableStateFlow(false)
+    // a balance (and so the server's `guest`) has loaded at least once
+    private val _serverGuestLoaded = MutableStateFlow(false)
+
+    // re-signs the jwt for the same network (a converted guest's guest_mode clears)
+    val refreshJwt: () -> Unit = {
+        deviceManager.device?.refreshToken(0)
+    }
+
+    /**
+     * A legacy guest network (GuestAccount): the jwt's guest_mode claim or the
+     * server's `guest`. A guest is never sold a plan; it adds a sign-in method
+     * to this network first.
+     */
+    val isGuestNetwork: StateFlow<Boolean> = combine(jwtManager.jwtFlow, _serverGuest) { jwt, serverGuest ->
+        GuestAccount.isGuest(guestModeClaim = jwt?.guestMode == true, serverGuest = serverGuest)
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, false)
+
+    /**
+     * Whether `isGuestNetwork` is settled (GuestAccount.guestStatusKnown): a
+     * refreshed guest has no claim, so it reads as an account until the first
+     * balance load. What opens by itself at startup and sells a plan (the intro
+     * funnel) waits for this.
+     */
+    val guestStatusKnown: StateFlow<Boolean> = combine(jwtManager.jwtFlow, _serverGuestLoaded) { jwt, loaded ->
+        GuestAccount.guestStatusKnown(guestModeClaim = jwt?.guestMode == true, serverGuestLoaded = loaded)
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, false)
+
+    /**
+     * The server refused a payment sheet or a Solana payment intent with
+     * `guest_sign_in_required` (GuestAccount.purchaseRefusal): the network is a
+     * guest the app did not know about. The refusal reads the same live auth
+     * methods as the balance's `guest`, so the network is marked a guest now
+     * (the next balance read keeps it so until a sign-in method is added), and
+     * MainNavHost opens the add-sign-in sheet from guestSignInRequiredSequence.
+     */
+    fun guestSignInRequired() {
+        _serverGuest.value = true
+        _serverGuestLoaded.value = true
+        _guestSignInRequiredSequence.update { it + 1L }
+    }
+
+    private val _guestSignInRequiredSequence = MutableStateFlow(0L)
+    val guestSignInRequiredSequence: StateFlow<Long> = _guestSignInRequiredSequence.asStateFlow()
+    private var consumedGuestSignInRequiredSequence = 0L
+
+    /**
+     * True the first time it sees [sequence] of a refusal, which it then marks
+     * handled, so the add-sign-in sheet opens once per refusal.
+     */
+    fun consumeGuestSignInRequiredSequence(sequence: Long): Boolean {
+        if (sequence == 0L || sequence <= consumedGuestSignInRequiredSequence) {
+            return false
+        }
+        consumedGuestSignInRequiredSequence = sequence
+        return true
+    }
 
     /**
      * The confirmation poll ran out its budget (2 minutes) without the server
@@ -135,6 +437,41 @@ class SubscriptionBalanceViewModel @Inject constructor(
         return true
     }
 
+    /**
+     * The Solana return-path check (SolanaPaymentCheck): passed the old 20 s cap
+     * without the payment landing, so the user is told it is still checking; and
+     * ran out its two minutes, so the user gets the confirmation-delayed notice
+     * instead of silence. Consumed-sequence pattern, like the timeout above.
+     */
+    private val _solanaStillCheckingSequence = MutableStateFlow(0L)
+    val solanaStillCheckingSequence: StateFlow<Long> = _solanaStillCheckingSequence.asStateFlow()
+    private var consumedSolanaStillCheckingSequence = 0L
+
+    fun consumeSolanaStillCheckingSequence(sequence: Long): Boolean {
+        if (sequence == 0L || sequence <= consumedSolanaStillCheckingSequence) {
+            return false
+        }
+        consumedSolanaStillCheckingSequence = sequence
+        return true
+    }
+
+    private val _solanaCheckTimedOutSequence = MutableStateFlow(0L)
+    val solanaCheckTimedOutSequence: StateFlow<Long> = _solanaCheckTimedOutSequence.asStateFlow()
+    private var consumedSolanaCheckTimedOutSequence = 0L
+
+    fun consumeSolanaCheckTimedOutSequence(sequence: Long): Boolean {
+        if (sequence == 0L || sequence <= consumedSolanaCheckTimedOutSequence) {
+            return false
+        }
+        consumedSolanaCheckTimedOutSequence = sequence
+        return true
+    }
+
+    private var solanaStillCheckingShown = false
+
+    // ends the persisted pending payment once the check reaches an end
+    private var solanaCheckFinished: (() -> Unit)? = null
+
     val setErrorReachingSubscriptionBalance: (Boolean) -> Unit = {
         _errorFetchingSubscriptionBalance.value = it
     }
@@ -154,7 +491,7 @@ class SubscriptionBalanceViewModel @Inject constructor(
 
             /**
              * If the device or its api is not up yet, the call below dispatches
-             * NOTHING and no callback ever arrives to clear `_isLoading`. It would stay
+             * nothing and no callback ever arrives to clear `_isLoading`. It would stay
              * true forever, and because every fetch is guarded on `!_isLoading.value`,
              * both poll loops -- and every later refresh -- would become silent no-ops
              * for the life of this view model. The balance and the Pro label would then
@@ -168,10 +505,11 @@ class SubscriptionBalanceViewModel @Inject constructor(
                 isRefreshingSubscriptionBalance = false
             } else {
 
-                api.subscriptionBalance( SubscriptionBalanceCallback { result, err ->
+                api.subscriptionBalanceForStorefront(storefrontCountry ?: "", SubscriptionBalanceCallback { result, err ->
 
                     viewModelScope.launch {
                         if (err != null) {
+                            CantReachPrompt.shared.report(err)
 
                             _isLoading.value = false
                             isRefreshingSubscriptionBalance = false
@@ -189,7 +527,7 @@ class SubscriptionBalanceViewModel @Inject constructor(
                              * The server is the source of truth for Pro, and
                              * `currentSubscription` is non-null exactly when the network is
                              * Pro. The jwt's `pro` claim is baked in when the token is
-                             * issued, so it goes stale on BOTH an upgrade and a lapse.
+                             * issued, so it goes stale on both an upgrade and a lapse.
                              * Refresh the token whenever the two disagree, in either
                              * direction.
                              *
@@ -201,21 +539,39 @@ class SubscriptionBalanceViewModel @Inject constructor(
                              */
                             val serverIsPro = result.currentSubscription != null
                             _hasActiveSubscription.value = serverIsPro
+                            _serverGuest.value = result.guest
+                            _serverGuestLoaded.value = true
+                            if (serverIsPro) {
+                                pendingSolanaPurchase?.let { (plan, amountUsd) ->
+                                    pendingSolanaPurchase = null
+                                    com.bringyour.network.analytics.ClientEvents.purchaseCompleted(
+                                        Sdk.EventStoreSolana,
+                                        com.bringyour.network.analytics.ClientEvents.PRODUCT_SOLANA_PRO_YEARLY,
+                                        plan, false, amountUsd, "USD",
+                                    )
+                                }
+                            }
                             val jwtIsPro = jwtManager.jwtFlow.value?.pro == true
 
-                            if (serverIsPro && !jwtIsPro) {
-                                // free -> paid: reset provide mode to never once at the
-                                // upgrade; the user can opt back in and that choice persists
-                                deviceManager.provideControlMode = ProvideControlMode.NEVER
+                            val provideControlMode = deviceManager.provideControlMode
+                            val sync = ProStatusSync.plan(serverIsPro, jwtIsPro, provideControlMode)
+                            if (sync.provideControlMode != provideControlMode) {
+                                deviceManager.provideControlMode = sync.provideControlMode
                             }
-
-                            if (serverIsPro != jwtIsPro) {
+                            if (sync.refreshToken) {
                                 deviceManager.device?.refreshToken(0)
                             }
 
                             result.currentSubscription?.store.let { store ->
                                 _currentStore.value = store
                             }
+
+                            // the onboarding plan data: absent on an older server
+                            result.priceTier?.let { _priceTier.value = it }
+                            _onboardingOffer.value = result.onboardingOffer
+                            _winbackOffer.value = result.winbackOffer
+                            result.experiments?.let { _experiments.value = it }
+                            _balanceAnswer.value = BalanceAnswer(result)
 
                             _availableBalanceByteCount.value = result.balanceByteCount
                             pendingBalanceByteCount = result.openTransferByteCount
@@ -275,13 +631,49 @@ class SubscriptionBalanceViewModel @Inject constructor(
     /**
      * When we regain focus from a wallet, and there is a solana payment reference id (in SolanaPaymentViewModel), start polling
      * This is different than pollSubscriptionBalance, as do not know if the user submitted a transaction or not
-     * So we want to display a different pending message, and poll for a little less time
+     * So we want to display a different pending message. The check runs for up to
+     * two minutes (finality plus webhook latency); `onFinished` runs once it is
+     * confirmed or timed out, not when it is merely paused.
      */
-    fun pollSolanaTransaction(maxDurationMs: Long = 20_000L) {
+    fun pollSolanaTransaction(
+        maxDurationMs: Long = SolanaPaymentCheck.MAX_DURATION_MILLIS,
+        onFinished: () -> Unit = {},
+    ) {
         if (isPolling) return
 
         _isCheckingSolanaTransaction.value = true
+        solanaStillCheckingShown = false
+        solanaCheckFinished = onFinished
         startPolling(maxDurationMs)
+    }
+
+    private fun emitSolanaNotice(expired: Boolean) {
+        if (!_isCheckingSolanaTransaction.value) {
+            return
+        }
+        val notice = SolanaPaymentCheck.noticeFor(
+            elapsedMillis = pollingSession.elapsedMillis(),
+            expired = expired,
+            confirmed = _hasActiveSubscription.value || isSupporterWithBalance(),
+            stillCheckingShown = solanaStillCheckingShown,
+        )
+        when (notice) {
+            SolanaPaymentCheck.Notice.StillChecking -> {
+                solanaStillCheckingShown = true
+                _solanaStillCheckingSequence.update { it + 1L }
+            }
+            SolanaPaymentCheck.Notice.TimedOut -> _solanaCheckTimedOutSequence.update { it + 1L }
+            SolanaPaymentCheck.Notice.None -> Unit
+        }
+    }
+
+    private fun finishSolanaCheck() {
+        if (!_isCheckingSolanaTransaction.value) {
+            return
+        }
+        val onFinished = solanaCheckFinished
+        solanaCheckFinished = null
+        onFinished?.invoke()
     }
 
     private fun startPolling(maxDurationMs: Long) {
@@ -300,6 +692,8 @@ class SubscriptionBalanceViewModel @Inject constructor(
                 // ending the bounded confirmation session.
                 fetchSubscriptionBalance()
                 emitConfirmationTimedOutIfUnconfirmed()
+                emitSolanaNotice(expired = true)
+                finishSolanaCheck()
                 stopPolling()
                 return
             }
@@ -309,6 +703,7 @@ class SubscriptionBalanceViewModel @Inject constructor(
         pollingJob = viewModelScope.launch {
             fetchSubscriptionBalance()
             if (isSupporterWithBalance()) {
+                finishSolanaCheck()
                 stopPolling()
                 return@launch
             }
@@ -318,14 +713,18 @@ class SubscriptionBalanceViewModel @Inject constructor(
                 delay(pollingInterval)
                 fetchSubscriptionBalance()
                 if (isSupporterWithBalance()) {
+                    finishSolanaCheck()
                     stopPolling()
                     break
                 }
+                emitSolanaNotice(expired = false)
             }
 
             if (isPolling) {
                 Log.i(TAG, "polling timed out")
                 emitConfirmationTimedOutIfUnconfirmed()
+                emitSolanaNotice(expired = true)
+                finishSolanaCheck()
                 stopPolling()
             }
         }
@@ -333,7 +732,7 @@ class SubscriptionBalanceViewModel @Inject constructor(
 
     /**
      * The poll gave up. If it was backed by payment evidence and the server still has
-     * not confirmed, that MUST reach the user as more than a log line. (The last
+     * not confirmed, that must reach the user as more than a log line. (The last
      * fetch may still be in flight -- the dialog copy tolerates the race: "your plan
      * will update automatically".)
      */
@@ -388,25 +787,62 @@ class SubscriptionBalanceViewModel @Inject constructor(
 
     init {
         processLifecycle.addObserver(this)
-        foregroundWork.setForeground(
-            processLifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
-        )
+        val foreground = processLifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+        foregroundWork.setForeground(foreground)
+        purchaseConfirmation.setForeground(foreground)
     }
 
     override fun onStart(owner: LifecycleOwner) {
         foregroundWork.setForeground(true)
+        purchaseConfirmation.setForeground(true)
     }
 
     override fun onStop(owner: LifecycleOwner) {
         foregroundWork.setForeground(false)
+        purchaseConfirmation.setForeground(false)
     }
 
     override fun onCleared() {
         processLifecycle.removeObserver(this)
+        purchaseConfirmation.close()
         foregroundWork.close()
         stopPolling()
         stopBackgroundPolling()
         super.onCleared()
     }
 
+}
+
+/**
+ * One balance answer (SubscriptionBalanceViewModel.balanceAnswer). Deliberately
+ * not a data class: each answer is a new value, whatever the generated equals
+ * of the result says.
+ */
+class BalanceAnswer(val result: SubscriptionBalanceResult)
+
+/** PurchaseConfirmation.Source over the SDK's SubscriptionBalanceViewController. */
+private class SdkPurchaseConfirmationSource(
+    api: Api,
+    onState: (String) -> Unit,
+) : PurchaseConfirmation.Source {
+    private val controller = Sdk.newSubscriptionBalanceViewController(api)
+    private val listenerSub = controller.addPurchaseConfirmationListener(
+        PurchaseConfirmationListener { state -> onState(state) }
+    )
+
+    override fun start() = controller.start()
+
+    override fun setForeground(foreground: Boolean) = controller.setForeground(foreground)
+
+    override fun startPurchaseConfirmation() = controller.startPurchaseConfirmation()
+
+    override fun clearPurchaseConfirmation() = controller.clearPurchaseConfirmation()
+
+    override fun isPro(): Boolean = controller.isPro
+
+    override fun close() {
+        listenerSub.close()
+        controller.stop()
+        controller.close()
+    }
 }

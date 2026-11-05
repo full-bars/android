@@ -3,6 +3,7 @@ package com.bringyour.network.ui.stats
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -31,6 +32,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.pluralStringResource
@@ -41,14 +43,18 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
+import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import androidx.core.graphics.drawable.toBitmap
 import androidx.navigation.NavController
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import com.bringyour.network.R
 import com.bringyour.network.ui.Route
+import com.bringyour.network.ui.components.SkeletonGroup
+import com.bringyour.network.ui.components.SkeletonText
 import com.bringyour.network.ui.components.URSwitch
 import com.bringyour.network.ui.theme.Green
+import com.bringyour.network.ui.theme.MainBorderBase
 import com.bringyour.network.ui.theme.MainTintedBackgroundBase
 import com.bringyour.network.ui.theme.Pink
 import com.bringyour.network.ui.theme.Red
@@ -68,11 +74,16 @@ fun ConnectStatsSections(
     blockActionsViewModel: BlockActionsViewModel,
     dnsSettingsViewModel: DnsSettingsViewModel,
     blockerViewModel: BlockerViewModel,
+    // the window's providers with their state and IP version, for the
+    // family status row under the transport bar
+    ipFamilyPoints: List<IpFamilyPoint> = listOf(),
+    // the device's extender network, for the panel under the status row
+    extenderStatusViewModel: ExtenderStatusViewModel = hiltViewModel(),
 ) {
 
     /**
      * Client statistics: remote and blocked traffic.
-     * Tap to open the client contract details.
+     * Tap to open the client contract details (not on the blocked plot).
      */
     StatsCard(
         title = stringResource(id = R.string.client_statistics),
@@ -104,14 +115,48 @@ fun ConnectStatsSections(
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        TransferChart(
-            points = throughputViewModel.clientPoints,
-            route = ThroughputRoute.BLOCK,
-            title = stringResource(id = R.string.blocked),
-            windowSeconds = throughputViewModel.windowSeconds,
-            byteColor = Red,
-            packetColor = MutedCoral,
+        /**
+         * The window's providers by the IP version they carry: Dualstack,
+         * IPv4 and IPv6 columns, each with its connected and connecting
+         * counts, under the transports. Tapping it does nothing.
+         */
+        IpFamilyStatusRow(
+            points = ipFamilyPoints,
+            modifier = Modifier.blocksCardTap(),
         )
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        /**
+         * The extenders carrying this client right now, the usable reserve
+         * behind them and the gossip network's state, under the families.
+         * Nothing to show until a space runs an extender network. Tapping it
+         * does nothing.
+         */
+        val extenderPanel = extenderStatusViewModel.panel
+        if (extenderPanel.present) {
+            ExtenderPanel(
+                panel = extenderPanel,
+                modifier = Modifier.blocksCardTap(),
+            )
+
+            Spacer(modifier = Modifier.height(12.dp))
+        }
+
+        /**
+         * Tapping the blocked plot does nothing: it is not part of the
+         * client contracts.
+         */
+        Box(modifier = Modifier.blocksCardTap()) {
+            TransferChart(
+                points = throughputViewModel.clientPoints,
+                route = ThroughputRoute.BLOCK,
+                title = stringResource(id = R.string.blocked),
+                windowSeconds = throughputViewModel.windowSeconds,
+                byteColor = Red,
+                packetColor = MutedCoral,
+            )
+        }
 
     }
 
@@ -192,7 +237,22 @@ fun ConnectStatsSections(
             Spacer(modifier = Modifier.height(8.dp))
             DnsStatusRow(stringResource(id = R.string.local_dns), settings.localDnsEnabled)
             Spacer(modifier = Modifier.height(8.dp))
-            DnsStatusRow(stringResource(id = R.string.local_dns_fallback), settings.localDnsFallbackEnabled)
+            DnsStatusRow(stringResource(id = FastDnsOnConnectToggle.labelRes), settings.fastDnsOnConnectEnabled)
+        } else if (!dnsSettingsViewModel.reported) {
+            // the device has not reported its resolver settings yet: the four
+            // status rows as placeholders in their exact layout, so the card
+            // and the connect drawer measure their final height at first open
+            // (mmm/DESIGNSTYLE.md "Placeholders, not pop-in"). A device that
+            // reports no settings resolves to the unavailable line below.
+            SkeletonGroup {
+                DnsStatusRow(stringResource(id = R.string.dns_over_https), false, placeholder = true)
+                Spacer(modifier = Modifier.height(8.dp))
+                DnsStatusRow(stringResource(id = R.string.unencrypted_dns), false, placeholder = true)
+                Spacer(modifier = Modifier.height(8.dp))
+                DnsStatusRow(stringResource(id = R.string.local_dns), false, placeholder = true)
+                Spacer(modifier = Modifier.height(8.dp))
+                DnsStatusRow(stringResource(id = FastDnsOnConnectToggle.labelRes), false, placeholder = true)
+            }
         } else {
             Text(
                 stringResource(id = R.string.dns_settings_unavailable),
@@ -233,7 +293,8 @@ fun BlockerTogglePanel(
                 MainTintedBackgroundBase,
                 shape = RoundedCornerShape(12.dp)
             )
-            .padding(16.dp),
+            // the switch's 48 dp touch target fills the rest of the height
+            .padding(horizontal = 16.dp, vertical = 2.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -486,10 +547,16 @@ private fun countryColor(countryCode: String): Color {
     }
 }
 
+/**
+ * One dns status row: dot + label, and on / off at the end. As a placeholder
+ * the same layout renders skeleton bars sized by the same texts, so the row
+ * height is identical before and after the settings load.
+ */
 @Composable
 private fun DnsStatusRow(
     label: String,
     enabled: Boolean,
+    placeholder: Boolean = false,
 ) {
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -504,23 +571,38 @@ private fun DnsStatusRow(
                 modifier = Modifier
                     .size(6.dp)
                     .background(
-                        color = if (enabled) Green else TextFaint.copy(alpha = 0.4f),
+                        color = when {
+                            placeholder -> MainBorderBase
+                            enabled -> Green
+                            else -> TextFaint.copy(alpha = 0.4f)
+                        },
                         shape = CircleShape
                     )
             )
             Spacer(modifier = Modifier.width(8.dp))
-            Text(
-                label,
-                style = MaterialTheme.typography.bodyMedium,
-                color = Color.White
-            )
+            if (placeholder) {
+                SkeletonText(label, style = MaterialTheme.typography.bodyMedium)
+            } else {
+                Text(
+                    label,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Color.White
+                )
+            }
         }
 
-        Text(
-            stringResource(id = if (enabled) R.string.on else R.string.off),
-            style = MaterialTheme.typography.bodyMedium,
-            color = if (enabled) Green else TextMuted
-        )
+        if (placeholder) {
+            SkeletonText(
+                stringResource(id = R.string.off),
+                style = MaterialTheme.typography.bodyMedium
+            )
+        } else {
+            Text(
+                stringResource(id = if (enabled) R.string.on else R.string.off),
+                style = MaterialTheme.typography.bodyMedium,
+                color = if (enabled) Green else TextMuted
+            )
+        }
     }
 }
 
@@ -563,3 +645,11 @@ private fun StatsCard(
         content()
     }
 }
+
+/**
+ * Keeps a tap on an informational panel inside a stats card from opening the
+ * card's details. The panel sees the pointer before the card's clickable, like
+ * the transport bar, and consumes the tap without doing anything with it.
+ */
+private fun Modifier.blocksCardTap(): Modifier =
+    pointerInput(Unit) { detectTapGestures(onTap = {}) }

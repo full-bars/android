@@ -1,6 +1,21 @@
 package com.bringyour.network.ui.leaderboard
 
 import com.bringyour.network.ui.components.tabletReadableColumn
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.VerticalDivider
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.unit.LayoutDirection
+import com.bringyour.network.ui.components.LocalWindowLayout
+import com.bringyour.network.ui.components.sideBySideSplit
+import com.bringyour.network.ui.components.sidePaneWidth
+import com.bringyour.network.ui.theme.MainBorderBase
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -14,6 +29,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -48,6 +64,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import com.bringyour.network.R
 import com.bringyour.network.ui.indexedLazyListKey
 import com.bringyour.network.ui.components.URSwitch
+import com.bringyour.network.ui.components.keyboardScrollable
 import com.bringyour.network.ui.theme.Green500
 import com.bringyour.network.ui.theme.HeadingLargeCondensed
 import com.bringyour.network.ui.theme.MainTintedBackgroundBase
@@ -61,26 +78,78 @@ private const val LEADERBOARD_TAB_DATA = 0
 /** the Points tab: the all-time points leaderboard */
 private const val LEADERBOARD_TAB_POINTS = 1
 
+/** the Protocol tab: the SN25-aligned Top 200 board (apple/LEADERTOP.md) */
+private const val LEADERBOARD_TAB_PROTOCOL = 2
+
 /**
- * The leaderboard: one title, a Data | Points tab row, and the tab's content.
- * Data is the existing last-4-payments leaderboard; Points is the all-time
- * points leaderboard (android/POINTSLEADERBOARD.md). The points view model
- * (and its sdk view controller) is only created once that tab is opened.
+ * The leaderboard: one title, a Protocol | Points | Data tab row, and the
+ * tab's content (Q14). Protocol, the first tab and the default, is the board
+ * of apple/LEADERTOP.md; Points is the all-time points leaderboard
+ * (android/POINTSLEADERBOARD.md); Data is the last-4-payments leaderboard,
+ * frozen since the 2026-10-06 cutoff. The points view model (and its sdk
+ * view controller) is only created once that tab is opened.
+ *
+ * `onOpenEarnings` opens Earnings at its Top 200 tile: the Protocol card's
+ * "Claim on Earnings". `protocolTabRequested` (Earnings' "See the Protocol
+ * leaderboard") shows the Protocol tab at its top, once: `onProtocolTabShown`
+ * consumes the request.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun LeaderboardScreen(
     leaderboardViewModel: LeaderboardViewModel = hiltViewModel(),
+    onOpenEarnings: () -> Unit = {},
+    protocolTabRequested: Boolean = false,
+    onProtocolTabShown: () -> Unit = {},
 ) {
 
     val refreshState = rememberPullToRefreshState()
     val snackbarHostState = remember { SnackbarHostState() }
     val leaderboardEntries = leaderboardViewModel.leaderboardEntries.collectAsState()
-    var selectedTab by rememberSaveable { mutableIntStateOf(LEADERBOARD_TAB_DATA) }
+    var selectedTab by rememberSaveable { mutableIntStateOf(LEADERBOARD_TAB_PROTOCOL) }
+    // a tab tap, including a re-tap of the selected tab, scrolls that tab's
+    // list to the top (mmm/DESIGNSTYLE.md "Long ranked lists"). The Data list
+    // keeps its state here so the tap can reach it; the Points tab counts the
+    // taps and resets itself (it also reloads after a seek)
+    val dataListState = rememberLazyListState()
+    var pointsTabTaps by remember { mutableIntStateOf(0) }
+    var protocolTabTaps by remember { mutableIntStateOf(0) }
+    LaunchedEffect(protocolTabRequested) {
+        if (protocolTabRequested) {
+            selectedTab = LEADERBOARD_TAB_PROTOCOL
+            protocolTabTaps += 1
+            onProtocolTabShown()
+        }
+    }
+    // the Points tab's emoji tag editor, opened from its own-stats header,
+    // which sits beside the list at medium width and up
+    var showEmojiSheet by rememberSaveable { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+
+    // medium width and up is a list-detail layout: the ranking with its tabs
+    // at the start, "Your network" beside it instead of above the list
+    val windowLayout = LocalWindowLayout.current
+    val listDetail = windowLayout.isMediumWidthOrWider
+    var paneRowInWindow by remember { mutableStateOf(Rect.Zero) }
+    val density = LocalDensity.current
+    val listOnLeft = LocalLayoutDirection.current == LayoutDirection.Ltr
+    val paneRowWidth = paneRowInWindow.width / density.density
+    val listWidth = sidePaneWidth(
+        split = sideBySideSplit(
+            containerStart = paneRowInWindow.left / density.density,
+            width = paneRowWidth,
+            fold = windowLayout.hinge,
+            sidePaneOnLeft = listOnLeft,
+        ),
+        width = paneRowWidth,
+        sidePaneOnLeft = listOnLeft,
+    ).dp
 
     val genericErrorMessage = stringResource(id = R.string.something_went_wrong)
-    LaunchedEffect(leaderboardViewModel.displayErrorMsg) {
-        if (leaderboardViewModel.displayErrorMsg) {
+    // the Data tab loads with the screen, behind the default Protocol tab: its
+    // failure shows once the Data tab does, never over another tab
+    LaunchedEffect(leaderboardViewModel.displayErrorMsg, selectedTab) {
+        if (leaderboardViewModel.displayErrorMsg && selectedTab == LEADERBOARD_TAB_DATA) {
             snackbarHostState.showSnackbar(
                 message = genericErrorMessage,
                 withDismissAction = true,
@@ -95,108 +164,251 @@ fun LeaderboardScreen(
         },
     ) { innerPadding ->
 
-        Column(
+        Row(
             modifier = Modifier
                 .padding(innerPadding)
-                .tabletReadableColumn()
                 .fillMaxSize()
+                .onGloballyPositioned { paneRowInWindow = it.boundsInWindow() }
         ) {
 
-            LeaderboardTabs(
-                selectedTab = selectedTab,
-                setSelectedTab = { selectedTab = it },
-            )
-
-            when (selectedTab) {
-                LEADERBOARD_TAB_POINTS -> {
-                    PointsLeaderboardTab(snackbarHostState = snackbarHostState)
+            Column(
+                modifier = if (listDetail) {
+                    Modifier
+                        .width(listWidth.coerceAtLeast(0.dp))
+                        .fillMaxHeight()
+                } else {
+                    Modifier
+                        .tabletReadableColumn()
+                        .fillMaxSize()
                 }
-                else -> {
-                    if (leaderboardViewModel.isInitializing) {
+            ) {
 
-                        Column(
-                            modifier = Modifier
-                                .fillMaxSize(),
-                            verticalArrangement = Arrangement.Center,
-                            horizontalAlignment = Alignment.CenterHorizontally
-                        ) {
-                            CircularProgressIndicator()
-                        }
-
-                    } else {
-                        /**
-                         * Data initialized
-                         */
-
-                        PullToRefreshBox(
-                            isRefreshing = leaderboardViewModel.isLoading,
-                            state = refreshState,
-                            onRefresh = {
-                                leaderboardViewModel.fetchLeaderboardData()
-                            },
-                        ) {
-
-                            LazyColumn(
-                                modifier = Modifier
-                                    .tabletReadableColumn()
-                                    .fillMaxSize()
-                            ) {
-
-                                item {
-                                    LeaderboardHeader(
-                                        networkRank = leaderboardViewModel.networkRank,
-                                        netProvidedFormatted = leaderboardViewModel.netProvidedFormatted,
-                                        networkRankingPublic = leaderboardViewModel.isNetworkRankingPublic,
-                                        toggleNetworkRankingPublic = leaderboardViewModel::toggleNetworkRankingVisibility
-                                    )
+                LeaderboardTabs(
+                    selectedTab = selectedTab,
+                    onTabTap = { tab ->
+                        val changed = tab != selectedTab
+                        selectedTab = tab
+                        when (tab) {
+                            LEADERBOARD_TAB_POINTS -> pointsTabTaps += 1
+                            LEADERBOARD_TAB_PROTOCOL -> protocolTabTaps += 1
+                            else -> scope.launch {
+                                // the list is not composed yet right after a
+                                // switch, so it is placed rather than animated
+                                if (changed) {
+                                    dataListState.scrollToItem(0)
+                                } else {
+                                    dataListState.animateScrollToItem(0)
                                 }
-
-                                itemsIndexed(
-                                    leaderboardEntries.value,
-                                    // the server blanks out network_id for networks that opted out
-                                    // of the public leaderboard, so private rows all share the
-                                    // same empty id; the indexed key keeps every row unique
-                                    key = { index, entry ->
-                                        indexedLazyListKey("leaderboard", index, entry.networkId)
-                                    },
-                                ) { index, entry ->
-                                    Column {
-                                        HorizontalDivider()
-                                        LeaderboardEntry(
-                                            entry,
-                                            rank = index + 1,
-                                            netProvidedFormatted = remember(entry.netMiBCount) {
-                                                leaderboardViewModel.formatDataProvided(entry.netMiBCount)
-                                            },
-                                            isNetworkRow = leaderboardViewModel.networkId == entry.networkId.toString()
-                                        )
-                                    }
-                                }
-                                item {
-                                    HorizontalDivider()
-                                }
-
                             }
                         }
+                    },
+                )
 
+                when (selectedTab) {
+                    LEADERBOARD_TAB_PROTOCOL -> {
+                        ProtocolLeaderboardTab(
+                            snackbarHostState = snackbarHostState,
+                            onOpenEarnings = onOpenEarnings,
+                            resetToTop = protocolTabTaps,
+                            showHeader = !listDetail,
+                        )
+                    }
+                    LEADERBOARD_TAB_POINTS -> {
+                        PointsLeaderboardTab(
+                            snackbarHostState = snackbarHostState,
+                            resetToTop = pointsTabTaps,
+                            showHeader = !listDetail,
+                            showEmojiSheet = showEmojiSheet,
+                            setShowEmojiSheet = { showEmojiSheet = it },
+                        )
+                    }
+                    else -> {
+                        if (leaderboardViewModel.isInitializing) {
+
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxSize(),
+                                verticalArrangement = Arrangement.Center,
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                CircularProgressIndicator()
+                            }
+
+                        } else {
+                            /**
+                             * Data initialized
+                             */
+
+                            PullToRefreshBox(
+                                isRefreshing = leaderboardViewModel.isLoading,
+                                state = refreshState,
+                                onRefresh = {
+                                    leaderboardViewModel.fetchLeaderboardData()
+                                },
+                            ) {
+
+                                LazyColumn(
+                                    state = dataListState,
+                                    modifier = Modifier
+                                        .tabletReadableColumn()
+                                        .fillMaxSize()
+                                        // its rows take no focus: the keyboard
+                                        // scrolls the list itself
+                                        .keyboardScrollable(
+                                            state = dataListState,
+                                            scope = scope,
+                                            linePx = with(density) { LeaderboardKeyboardLine.toPx() },
+                                        )
+                                ) {
+
+                                    item {
+                                        // beside the list in the list-detail layout
+                                        if (!listDetail) {
+                                            LeaderboardHeader(
+                                                networkRank = leaderboardViewModel.networkRank,
+                                                netProvidedFormatted = leaderboardViewModel.netProvidedFormatted,
+                                                networkRankingPublic = leaderboardViewModel.isNetworkRankingPublic,
+                                                toggleNetworkRankingPublic = leaderboardViewModel::toggleNetworkRankingVisibility
+                                            )
+                                        }
+                                    }
+
+                                    itemsIndexed(
+                                        leaderboardEntries.value,
+                                        // the server blanks out network_id for networks that opted out
+                                        // of the public leaderboard, so private rows all share the
+                                        // same empty id; the indexed key keeps every row unique
+                                        key = { index, entry ->
+                                            indexedLazyListKey("leaderboard", index, entry.networkId)
+                                        },
+                                    ) { index, entry ->
+                                        Column {
+                                            HorizontalDivider()
+                                            LeaderboardEntry(
+                                                entry,
+                                                rank = index + 1,
+                                                netProvidedFormatted = remember(entry.netMiBCount) {
+                                                    leaderboardViewModel.formatDataProvided(entry.netMiBCount)
+                                                },
+                                                isNetworkRow = leaderboardViewModel.networkId == entry.networkId.toString()
+                                            )
+                                        }
+                                    }
+                                    item {
+                                        HorizontalDivider()
+                                    }
+
+                                }
+                            }
+
+                        }
                     }
                 }
             }
+
+            if (listDetail) {
+                VerticalDivider(
+                    modifier = Modifier
+                        .width(1.dp)
+                        .fillMaxHeight(),
+                    color = MainBorderBase
+                )
+
+                YourNetworkPane(
+                    leaderboardViewModel = leaderboardViewModel,
+                    selectedTab = selectedTab,
+                    onEditEmoji = { showEmojiSheet = true },
+                    onOpenEarnings = onOpenEarnings,
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight(),
+                )
+            }
+
         }
 
     }
 
 }
 
+/**
+ * "Your network" beside the ranking in the list-detail layout: the network's
+ * standing and its leaderboard settings, which sit above the list on a phone.
+ * With Protocol chosen it is the Protocol tab's banners, own-status card and
+ * explainer (LEADERTOP §3); with Data, the current ranking, data provided,
+ * points, the longest streak and the visibility toggle; with Points, the
+ * Points tab's own card with its sort ranks, emoji tag and opt-in.
+ */
+@Composable
+private fun YourNetworkPane(
+    leaderboardViewModel: LeaderboardViewModel,
+    selectedTab: Int,
+    onEditEmoji: () -> Unit,
+    onOpenEarnings: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    if (selectedTab == LEADERBOARD_TAB_PROTOCOL) {
+        Column(
+            modifier = modifier
+                .verticalScroll(rememberScrollState())
+                .padding(top = 16.dp)
+        ) {
+            ProtocolHeader(
+                viewModel = hiltViewModel(),
+                onOpenEarnings = onOpenEarnings,
+            )
+        }
+        return
+    }
+    val pointsViewModel: PointsLeaderboardViewModel = hiltViewModel()
+    Column(
+        modifier = modifier
+            .verticalScroll(rememberScrollState())
+            .padding(top = 16.dp)
+    ) {
+        Text(
+            stringResource(id = R.string.your_network),
+            style = MaterialTheme.typography.labelLarge,
+            color = TextMuted,
+            modifier = Modifier.padding(horizontal = 16.dp),
+        )
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        when (selectedTab) {
+            LEADERBOARD_TAB_POINTS -> {
+                val jwtNetworkName by pointsViewModel.ownNetworkName.collectAsState()
+                PointsHeader(
+                    viewModel = pointsViewModel,
+                    ownName = pointsViewModel.me?.row?.displayName?.takeIf { it.isNotEmpty() } ?: jwtNetworkName,
+                    onEditEmoji = onEditEmoji,
+                )
+            }
+            else -> {
+                val ownRow = pointsViewModel.me?.row
+                LeaderboardHeader(
+                    networkRank = leaderboardViewModel.networkRank,
+                    netProvidedFormatted = leaderboardViewModel.netProvidedFormatted,
+                    networkRankingPublic = leaderboardViewModel.isNetworkRankingPublic,
+                    toggleNetworkRankingPublic = leaderboardViewModel::toggleNetworkRankingVisibility,
+                    pointsFormatted = ownRow?.totalPointsText ?: "-",
+                    longestStreakFormatted = ownRow?.longestStreakText ?: "-",
+                )
+            }
+        }
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun LeaderboardTabs(
     selectedTab: Int,
-    setSelectedTab: (Int) -> Unit,
+    onTabTap: (Int) -> Unit,
 ) {
     val tabs = listOf(
-        LEADERBOARD_TAB_DATA to stringResource(id = R.string.data),
+        LEADERBOARD_TAB_PROTOCOL to stringResource(id = R.string.leaderboard_tab_protocol),
         LEADERBOARD_TAB_POINTS to stringResource(id = R.string.points),
+        LEADERBOARD_TAB_DATA to stringResource(id = R.string.data),
     )
 
     Column(
@@ -218,7 +430,9 @@ private fun LeaderboardTabs(
                         index = index,
                         count = tabs.size
                     ),
-                    onClick = { setSelectedTab(id) },
+                    // fires on a re-tap of the selected tab too: that is the
+                    // scroll-to-top gesture
+                    onClick = { onTabTap(id) },
                     selected = selectedTab == id,
                     label = {
                         Text(label, maxLines = 1)
@@ -236,7 +450,11 @@ private fun LeaderboardHeader(
     networkRank: Int,
     netProvidedFormatted: String,
     networkRankingPublic: Boolean,
-    toggleNetworkRankingPublic: suspend () -> Unit
+    toggleNetworkRankingPublic: suspend () -> Unit,
+    // "Your network" beside the list adds the network's points and longest
+    // streak (the Points tab's); above the list on a phone they are left out
+    pointsFormatted: String? = null,
+    longestStreakFormatted: String? = null,
 ) {
     val scope = rememberCoroutineScope()
 
@@ -252,7 +470,9 @@ private fun LeaderboardHeader(
                 .padding(
                     start = 16.dp,
                     top = 16.dp,
-                    bottom = 10.dp, // hacky due to line-height issue
+                    // hacky due to line-height issue; the last row's switch
+                    // fills the rest with its 48 dp touch target
+                    bottom = 6.dp,
                     end = 16.dp
                 )
         ) {
@@ -295,7 +515,28 @@ private fun LeaderboardHeader(
 
                 HorizontalDivider()
 
-                Spacer(modifier = Modifier.height(16.dp))
+                listOfNotNull(
+                    pointsFormatted?.let { R.string.points to it },
+                    longestStreakFormatted?.let { R.string.longest_streak to it },
+                ).forEach { (labelId, value) ->
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    Text(
+                        stringResource(id = labelId),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = TextMuted
+                    )
+
+                    Text(
+                        value,
+                        style = HeadingLargeCondensed,
+                    )
+
+                    HorizontalDivider()
+                }
+
+                // the switch's 48 dp touch target fills the rest
+                Spacer(modifier = Modifier.height(4.dp))
 
                 Row(
                     modifier = Modifier
@@ -320,9 +561,6 @@ private fun LeaderboardHeader(
                         },
                     )
                 }
-
-                Spacer(modifier = Modifier.height(8.dp))
-
 
             }
         }
@@ -415,3 +653,6 @@ private fun LeaderboardEntry(
     }
 
 }
+
+/** One arrow press over a leaderboard: about one of its rows. */
+internal val LeaderboardKeyboardLine = 56.dp

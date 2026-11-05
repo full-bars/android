@@ -1,9 +1,25 @@
 package com.bringyour.network.ui.connect.providerlocations
 
 import com.bringyour.network.ui.components.tabletReadableColumn
+import com.bringyour.network.ui.components.isTabletWidth
+import com.bringyour.network.ui.components.TabletLayout
+import androidx.compose.foundation.layout.BoxWithConstraints
 import android.widget.Toast
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.background
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.text.font.FontWeight
+import com.bringyour.network.ui.connect.EXTENDER_RING_GAP_DP
+import com.bringyour.network.ui.connect.EXTENDER_RING_STROKE_DP
+import com.bringyour.network.ui.connect.ExtenderRingGeometry
+import com.bringyour.network.ui.connect.drawExtenderDot
+import com.bringyour.network.ui.connect.extenderRingGeometry
+import com.bringyour.network.ui.stats.ExtenderRing
+import com.bringyour.network.ui.stats.IpFamilyColumn
+import com.bringyour.network.ui.stats.tagResId
+import com.bringyour.network.ui.theme.MainBorderBase
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -20,6 +36,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
+import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -28,11 +45,13 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -44,6 +63,8 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
@@ -57,13 +78,17 @@ import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import androidx.navigation.NavController
 import com.bringyour.network.R
 import com.bringyour.network.ui.components.Identicon
+import com.bringyour.network.ui.components.RowRemoveControl
+import com.bringyour.network.ui.components.providerLocationRemoveControls
 import com.bringyour.network.ui.components.SwipeToRevealRow
 import com.bringyour.network.ui.indexedLazyListKey
 import com.bringyour.network.ui.shared.viewmodels.PostQuantumIdentityViewModel
 import com.bringyour.network.ui.theme.Black
+import com.bringyour.network.ui.theme.Pink
 import com.bringyour.network.ui.theme.TextFaint
 import com.bringyour.network.ui.theme.TextMuted
 import com.bringyour.network.ui.theme.TopBarTitleTextStyle
+import com.bringyour.sdk.ConnectLocation
 import kotlinx.coroutines.delay
 
 /**
@@ -71,6 +96,10 @@ import kotlinx.coroutines.delay
  * sheet: the list is the point of the view, and a sheet dismisses itself on
  * the same downward drag used to scroll it. Dismissal is the explicit control
  * in the top bar, matching the contract details screen.
+ *
+ * The selected row offers "Stay on this exit" (see [stayOnExitState]), which
+ * hands the provider's client id location to [onStayOnExit]. [stayingClientId]
+ * is the client id of the current location when it is one.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -78,6 +107,8 @@ fun ProviderLocationsScreen(
     navController: NavController,
     getLocationColor: (String) -> Color,
     mockLocationSection: @Composable (() -> Unit)? = null,
+    stayingClientId: String? = null,
+    onStayOnExit: ((ConnectLocation) -> Unit)? = null,
     viewModel: ProviderLocationsViewModel = hiltViewModel(),
     postQuantumIdentityViewModel: PostQuantumIdentityViewModel = hiltViewModel(),
 ) {
@@ -140,7 +171,7 @@ fun ProviderLocationsScreen(
                     IconButton(onClick = { navController.popBackStack() }) {
                         Icon(
                             Icons.AutoMirrored.Filled.KeyboardArrowLeft,
-                            contentDescription = "Back",
+                            contentDescription = stringResource(id = R.string.back),
                         )
                     }
                 },
@@ -150,29 +181,43 @@ fun ProviderLocationsScreen(
         containerColor = Black,
     ) { innerPadding ->
         // The toggle and globe are fixed; only the list scrolls, in the space
-        // left below them.
-        Column(
+        // left below them. The container's size decides how big the globe may
+        // be (see providerGlobeWidth), so it never outgrows the sheet.
+        BoxWithConstraints(
             modifier = Modifier
                 .padding(innerPadding)
                 .fillMaxSize()
         ) {
+        val globeWidth = providerGlobeWidth(
+            maxWidth = maxWidth,
+            maxHeight = maxHeight,
+            contentWidth = if (isTabletWidth()) TabletLayout.contentWidth else null,
+        )
+        Column(
+            modifier = Modifier.fillMaxSize()
+        ) {
             mockLocationSection?.let {
-                Column(modifier = Modifier.padding(horizontal = 16.dp)) {
+                // the toggle sits in the same column as the globe and the rows
+                Column(modifier = Modifier.tabletReadableColumn().padding(horizontal = 16.dp)) {
                     it()
                 }
             }
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // full bleed: the globe spans the screen width, outside the
-            // horizontal padding the rows use. The sphere is scaled to fit
-            // and centered inside that square, so it never overflows.
+            // On a phone the globe spans the screen width, outside the
+            // horizontal padding the rows use; on a tablet it is capped to the
+            // content column and to half the height, centered. The sphere is
+            // scaled to fit and centered inside that box, so it never overflows.
             ProviderGlobe(
                 rows = rows,
                 selectedClientId = selectedClientId,
                 onSelect = { viewModel.select(it) },
                 onStep = { viewModel.step(it) },
                 getLocationColor = getLocationColor,
+                modifier = Modifier
+                    .width(globeWidth)
+                    .align(Alignment.CenterHorizontally),
             )
 
             Spacer(modifier = Modifier.height(16.dp))
@@ -202,15 +247,39 @@ fun ProviderLocationsScreen(
                         indexedLazyListKey("provider-location", index, row.clientId)
                     },
                 ) { _, row ->
-                    SwipeToRevealRow(onDelete = { viewModel.removeProvider(row.clientId) }) {
+                    val stayState = if (onStayOnExit != null) {
+                        stayOnExitState(row, selectedClientId, stayingClientId)
+                    } else {
+                        StayOnExitState.NONE
+                    }
+                    val rowContent: @Composable () -> Unit = {
                         ProviderLocationRowItem(
                             row = row,
                             selected = row.clientId == selectedClientId,
                             nowMillis = nowMillis,
                             getLocationColor = getLocationColor,
                             onSelect = { viewModel.select(row.clientId) },
+                            stayState = stayState,
+                            onStay = {
+                                viewModel.stayOnExitLocation(row)?.let { location ->
+                                    onStayOnExit?.invoke(location)
+                                }
+                            },
+                            onRemove = if (RowRemoveControl.Button in providerLocationRemoveControls) {
+                                { viewModel.removeProvider(row.clientId) }
+                            } else {
+                                null
+                            },
                             pqIdenticon = pqIdenticonByClientId[row.clientId],
                         )
+                    }
+                    if (RowRemoveControl.Swipe in providerLocationRemoveControls) {
+                        SwipeToRevealRow(
+                            onAction = { viewModel.removeProvider(row.clientId) },
+                            content = rowContent,
+                        )
+                    } else {
+                        rowContent()
                     }
                     HorizontalDivider()
                 }
@@ -219,6 +288,7 @@ fun ProviderLocationsScreen(
                     Spacer(modifier = Modifier.height(32.dp))
                 }
             }
+        }
         }
     }
 }
@@ -230,10 +300,14 @@ private fun ProviderLocationRowItem(
     nowMillis: Long,
     getLocationColor: (String) -> Color,
     onSelect: () -> Unit,
+    // a visible remove button at the end of the row, when non-null
+    onRemove: (() -> Unit)? = null,
     // the provider's post-quantum identity identicon at badge size, non-null
     // only when the provider has an identity-verified end-to-end encrypted
     // session; rendered as a small badge to the right of the client id
     pqIdenticon: ImageBitmap? = null,
+    stayState: StayOnExitState = StayOnExitState.NONE,
+    onStay: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val clipboardManager = LocalClipboardManager.current
@@ -248,7 +322,7 @@ private fun ProviderLocationRowItem(
     ) {
         // fixed-size column so rows stay aligned whether or not the provider
         // is selected — the selection ring is drawn inside this same box
-        ProviderDot(color = color, selected = selected)
+        ProviderDot(row = row, color = color, selected = selected)
 
         // The same padding on both sides of the dot, so it reads as centered
         // in its column: the sheet edge and the detail text are each
@@ -295,12 +369,19 @@ private fun ProviderLocationRowItem(
 
             Spacer(modifier = Modifier.height(2.dp))
 
-            Text(
-                placeLabel(row).ifEmpty { stringResource(R.string.provider_location_unknown) },
-                style = MaterialTheme.typography.bodyMedium,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
+            // the place, with the IP versions the provider carries as a small
+            // tag after it (both / v4 / v6)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    placeLabel(row).ifEmpty { stringResource(R.string.provider_location_unknown) },
+                    style = MaterialTheme.typography.bodyMedium,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                IpFamilyTag(row)
+            }
 
             Spacer(modifier = Modifier.height(2.dp))
 
@@ -319,6 +400,65 @@ private fun ProviderLocationRowItem(
                 color = TextMuted,
                 maxLines = 1,
             )
+
+            // the extenders carrying the connection to this provider, one line
+            // each with its ring color (EXTENDER.md K9): usually none, one
+            // through an extender, briefly two across a transport migration
+            row.extenders.forEach { extender ->
+                key(extender.ip) {
+                    Spacer(modifier = Modifier.height(2.dp))
+                    ProviderExtenderLine(
+                        extender = extender,
+                        selected = selected,
+                        onCopy = {
+                            clipboardManager.setText(AnnotatedString(extender.ip))
+                            Toast.makeText(context, R.string.extender_address_copied, Toast.LENGTH_SHORT)
+                                .show()
+                        },
+                    )
+                }
+            }
+
+            when (stayState) {
+                StayOnExitState.OFFER -> {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        stringResource(R.string.stay_on_this_exit_note),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TextMuted,
+                    )
+                    TextButton(
+                        onClick = onStay,
+                        contentPadding = PaddingValues(horizontal = 0.dp),
+                    ) {
+                        Text(
+                            stringResource(R.string.stay_on_this_exit),
+                            color = Pink,
+                        )
+                    }
+                }
+                StayOnExitState.STAYING -> {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        stringResource(R.string.staying_on_this_exit),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TextMuted,
+                    )
+                }
+                StayOnExitState.NONE -> {}
+            }
+        }
+
+        // swipe-to-reveal alone is unreachable for TalkBack, Switch Access and
+        // keyboard users, and invisible to anyone who does not know to swipe
+        onRemove?.let { remove ->
+            IconButton(onClick = remove) {
+                Icon(
+                    Icons.Filled.Clear,
+                    contentDescription = stringResource(id = R.string.remove),
+                    tint = TextMuted,
+                )
+            }
         }
     }
 }
@@ -336,12 +476,35 @@ private val PROVIDER_DOT_RING_GAP = 4.dp
 private val PROVIDER_DOT_RING_STROKE = 1.5.dp
 private val PROVIDER_DOT_BOX =
     PROVIDER_DOT_DIAMETER + (PROVIDER_DOT_RING_GAP + PROVIDER_DOT_RING_STROKE) * 2f
+// the ring before an extender's address, drawn with K2's stroke
+private val PROVIDER_EXTENDER_RING_SIZE = 10.dp
+
+/**
+ * A row's dot and its extender rings in px at [density]: the connect grid's
+ * geometry (EXTENDER.md K2) at the dot's own size, which holds all three rings
+ * at full stroke (K9).
+ */
+fun providerRowDotGeometry(row: ProviderLocationRow, density: Float): ExtenderRingGeometry =
+    extenderRingGeometry(
+        cellSizePx = PROVIDER_DOT_DIAMETER.value * density,
+        extenderCount = row.extenderRingArgb.size,
+        strokePx = EXTENDER_RING_STROKE_DP * density,
+        gapPx = EXTENDER_RING_GAP_DP * density,
+    )
 
 @Composable
-private fun ProviderDot(color: Color, selected: Boolean) {
+private fun ProviderDot(row: ProviderLocationRow, color: Color, selected: Boolean) {
     Canvas(modifier = Modifier.size(PROVIDER_DOT_BOX)) {
         val dotRadius = PROVIDER_DOT_DIAMETER.toPx() / 2f
-        drawCircle(color = color, radius = dotRadius, center = center)
+        // a provider reached through extenders carries their rings, the
+        // connect grid's glyph: they grow inward from the dot's edge, so a
+        // ringed dot keeps its footprint and the selection ring stays put
+        drawExtenderDot(
+            center = center,
+            geometry = providerRowDotGeometry(row, density),
+            color = color,
+            ringArgb = row.extenderRingArgb,
+        )
         if (selected) {
             val stroke = PROVIDER_DOT_RING_STROKE.toPx()
             drawCircle(
@@ -353,6 +516,65 @@ private fun ProviderDot(color: Color, selected: Boolean) {
         }
     }
 }
+
+/**
+ * One extender on a provider row (EXTENDER.md K9): a small ring in the
+ * extender's color, then its address, which is the extender's id, in the
+ * client id's monospaced style. Tapping it copies the address.
+ */
+@Composable
+private fun ProviderExtenderLine(
+    extender: ProviderExtender,
+    selected: Boolean,
+    onCopy: () -> Unit,
+) {
+    val label = stringResource(R.string.extender_address_label, extender.ip)
+    Row(
+        modifier = Modifier
+            // the row has no context menu, so the copy action's name is the
+            // tap's label: "double tap to copy extender address"
+            .clickable(
+                role = Role.Button,
+                onClickLabel = stringResource(R.string.copy_extender_address),
+                onClick = onCopy,
+            )
+            // one element for assistive tech, read as "Extender <address>";
+            // the click before this is outside what it clears, so it stays
+            .clearAndSetSemantics { contentDescription = label },
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        ExtenderRing(colorHex = extender.colorHex, diameter = PROVIDER_EXTENDER_RING_SIZE)
+        Spacer(modifier = Modifier.width(6.dp))
+        Text(
+            extender.ip,
+            style = TextStyle(fontSize = 11.sp, fontFamily = FontFamily.Monospace),
+            color = if (selected) Color.White else TextFaint,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+/**
+ * The IP versions a provider carries, as a small muted tag: "both", "v4" or
+ * "v6" from the sdk's label, the short form of the status row's columns.
+ */
+@Composable
+private fun IpFamilyTag(row: ProviderLocationRow) {
+    Text(
+        stringResource(ipFamilyTagResId(row)),
+        style = TextStyle(fontSize = 11.sp, fontWeight = FontWeight.Medium),
+        color = TextMuted,
+        maxLines = 1,
+        modifier = Modifier
+            .background(MainBorderBase, RoundedCornerShape(4.dp))
+            .padding(horizontal = 5.dp, vertical = 1.dp),
+    )
+}
+
+/** The label resource for a row's IP family tag; legacy and unknown read as v4. */
+fun ipFamilyTagResId(row: ProviderLocationRow): Int =
+    IpFamilyColumn.fromLabel(row.ipFamilyLabel).tagResId()
 
 /** "City, Region, Country" — omitting whichever parts the server does not know. */
 fun placeLabel(row: ProviderLocationRow): String =

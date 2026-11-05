@@ -1,5 +1,6 @@
 package com.bringyour.network.ui.login
 
+import com.bringyour.network.ui.connection_region.CantReachPrompt
 import com.bringyour.network.ui.components.tabletForm
 import android.util.Patterns
 import androidx.compose.foundation.layout.Arrangement
@@ -30,10 +31,12 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -62,6 +65,7 @@ import com.bringyour.network.ui.theme.Black
 import com.bringyour.network.ui.theme.TextMuted
 import com.bringyour.network.ui.theme.URNetworkTheme
 import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -72,12 +76,18 @@ fun LoginPasswordReset(
 ) {
     val context = LocalContext.current
     val app = context.applicationContext as? MainApplication
-    var user by remember { mutableStateOf(TextFieldValue(userAuth)) }
+    var user by rememberSaveable(stateSaver = TextFieldValue.Saver) { mutableStateOf(TextFieldValue(userAuth)) }
+    // the address the link goes to, and the after-send screen gets, is the field as edited
+    val address = remember { PasswordResetAddress(userAuth) }
     var inProgress by remember { mutableStateOf(false) }
     var passwordResetError by remember { mutableStateOf<String?>(null) }
+    // why the server did not send the link, and after a rate limit, when it will
+    var resetNotice by remember { mutableStateOf<VerifySendNotice>(VerifySendNotice.Sent) }
+    var nowMillis by remember { mutableStateOf(System.currentTimeMillis()) }
+    var resendCooldown by remember { mutableStateOf<ResendCooldown?>(null) }
     val isBtnEnabled by remember {
         derivedStateOf {
-            !inProgress && (Patterns.EMAIL_ADDRESS.matcher(user.text).matches() ||
+            !inProgress && resendCooldown?.canResend(nowMillis) != false && (Patterns.EMAIL_ADDRESS.matcher(user.text).matches() ||
                     Patterns.PHONE.matcher(user.text).matches())
         }
     }
@@ -92,9 +102,14 @@ fun LoginPasswordReset(
         }
 
         passwordResetError = null
+        resetNotice = VerifySendNotice.Sent
 
+        address.typed = user.text
         val args = AuthPasswordResetArgs()
-        args.userAuth = user.text.trim()
+        args.userAuth = address.userAuth
+        val afterSendRoute = address.afterSendRoute(Uri::encode)
+        // a rate limit or failed send comes back in `result.error`, with the retry time
+        args.resultErrors = true
 
         inProgress = true
 
@@ -102,12 +117,18 @@ fun LoginPasswordReset(
             scope.launch {
                 inProgress = false
 
+                val error = result?.error?.toVerifySendError()
                 if (err != null) {
+                    CantReachPrompt.shared.report(err)
                     passwordResetError = err.message
+                } else if (passwordResetNotice(result == null, error) != VerifySendNotice.Sent) {
+                    resetNotice = passwordResetNotice(result == null, error)
+                    nowMillis = System.currentTimeMillis()
+                    resendCooldown = ResendCooldown.after(error, nowMillis)
                 } else {
                     passwordResetError = null
 
-                    navController.navigate("reset-password-after-send/${Uri.encode(userAuth)}") {
+                    navController.navigate(afterSendRoute) {
                         popUpTo("login-initial") { inclusive = false }
                     }
                 }
@@ -118,13 +139,23 @@ fun LoginPasswordReset(
         }
     }
 
+    val resetNoticeText = passwordResetNoticeText(resetNotice.at(resendCooldown, nowMillis))
+
+    // tick the rate-limit countdown until a new link can be requested
+    LaunchedEffect(resendCooldown) {
+        while (resendCooldown?.canResend(nowMillis) == false) {
+            delay(1000L)
+            nowMillis = System.currentTimeMillis()
+        }
+    }
+
     Scaffold(
         topBar = {
             CenterAlignedTopAppBar(
                 title = {},
                 navigationIcon = {
                     IconButton(onClick = { navController.popBackStack() }) {
-                        Icon(Icons.AutoMirrored.Filled.KeyboardArrowLeft, contentDescription = "Back")
+                        Icon(Icons.AutoMirrored.Filled.KeyboardArrowLeft, contentDescription = stringResource(id = R.string.back))
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
@@ -206,7 +237,7 @@ fun LoginPasswordReset(
                             Spacer(modifier = Modifier.width(4.dp))
                             Icon(
                                 imageVector = Icons.AutoMirrored.Filled.ArrowForward,
-                                contentDescription = "Right Arrow",
+                                contentDescription = null,
                                 modifier = Modifier.size(16.dp),
                                 tint = if (isBtnEnabled) Color.White else Color.Gray
                             )
@@ -214,7 +245,7 @@ fun LoginPasswordReset(
                     }
 
                     Spacer(modifier = Modifier.height(8.dp))
-                    URInlineErrorText(passwordResetError)
+                    URInlineErrorText(passwordResetError ?: resetNoticeText)
                 }
             }
         }

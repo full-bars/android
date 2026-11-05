@@ -7,6 +7,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
 import android.net.IpPrefix
 import android.net.ConnectivityManager
 import android.net.VpnService
@@ -14,20 +15,25 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.os.SystemClock
 import android.system.OsConstants.AF_INET
 import android.system.OsConstants.AF_INET6
 import android.util.Log
+import androidx.compose.ui.graphics.toArgb
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import com.bringyour.network.ui.components.tunnelLevelDepths
+import com.bringyour.network.ui.components.tunnelLevelIcon
+import com.bringyour.network.ui.connect.transportDelayUi
+import com.bringyour.network.ui.theme.Amber
 import com.bringyour.network.utils.sdkStringListToList
 import com.bringyour.sdk.DeviceLocal
-import com.bringyour.sdk.IoLoop
 import com.bringyour.sdk.Sdk
 import com.bringyour.sdk.Sub
 import com.bringyour.sdk.WindowStatus
 import java.net.InetAddress
-import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.thread
+import kotlin.math.roundToInt
 
     // see https://developer.android.com/develop/connectivity/vpn
     @SuppressLint("VpnServicePolicy")
@@ -37,7 +43,7 @@ import kotlin.concurrent.thread
         const val NOTIFICATION_CHANNEL_ID = "urnetwork"
         // The pre-unlock guard is a blackhole and never hands packets to the
         // SDK, so it must not load gomobile merely to ask for the normal data
-        // tunnel MTU. 1280 is conservative and valid for this IPv4 interface.
+        // tunnel MTU. 1280 is conservative for IPv4 and the IPv6 minimum.
         const val ALWAYS_ON_GUARD_MTU = 1280
         /**
          * IPv4 used to establish the tunnel when the SDK has not handed back a
@@ -46,6 +52,14 @@ import kotlin.concurrent.thread
          * is a blocking blackhole; with no routes (escape) it routes nothing.
          */
         const val ESCAPE_FALLBACK_ADDRESS = "192.0.2.1"
+        /**
+         * The IPv6 counterpart of ESCAPE_FALLBACK_ADDRESS: used when the SDK has
+         * not handed back an IPv6 tunnel address, so the IPv6 half is always
+         * built too. 2001:db8::/32 is reserved documentation space (RFC 3849).
+         * With the capture route it is a blocking blackhole for IPv6; in escape
+         * mode no IPv6 address is added at all.
+         */
+        const val ESCAPE_FALLBACK_ADDRESS_IPV6 = "2001:db8::1"
 
         fun defaultExcludedPackageNames(): List<String> {
             // TODO grass, spectrum, session, discord
@@ -92,9 +106,32 @@ import kotlin.concurrent.thread
     // 65.49.70.64/27 public subnet and stands in for the UpgradeMux; it is not
     // an upstream DNS resolver.
     val dnsIpv4s = listOf("65.49.70.65")
+    // The IPv6 counterpart of dnsIpv4s: the SDK's IPv6 upgrade-mask stand-in
+    // (Sdk.DefaultTunnelDnsAddressIpv6), which UpgradeMux claims on :53 exactly
+    // like the IPv4 mask. Not an upstream resolver either.
+    val dnsIpv6s = listOf("2001:db8::65:49:70:65")
+
+    // Diagnostics that support needs from "send feedback with logs": logcat plus
+    // the sdk log, which is what feedback uploads (see AppDiagnosticLog). The sdk
+    // writer runs only when called, so holding it loads no SDK code.
+    private val diagnosticLog = AppDiagnosticLog(
+        logcat = { Log.i(TAG, it) },
+        sdkLog = { tag, line -> Sdk.logAppInfo(tag, line) },
+    )
 
     //    private var pfd: ParcelFileDescriptor? = null
     private var packetFlow: PacketFlow? = null
+
+    // Called on the main thread at explicit diagnostic begin/end only.
+    internal fun hasPacketFlowForDiagnostic(): Boolean = packetFlow != null
+
+    // Cold main-thread fence after logout. Retained done-posts see packetFlow
+    // null; canceled configuration retries and detached device cannot rebuild.
+    internal fun requireNoIoLoopForDiagnostic() {
+        check(Looper.myLooper() == mainLooper) { "native-loop fence off main thread" }
+        check(packetFlow == null && boundDevice == null) { "native-loop construction still owned" }
+        check(tunnelRetryKind != TunnelRetryKind.CONFIGURATION) { "native-loop retry still owned" }
+    }
     private var alwaysOnGuardPfd: ParcelFileDescriptor? = null
     private var boundDevice: DeviceLocal? = null
     private var foregroundStarted: Boolean = false
@@ -114,6 +151,20 @@ import kotlin.concurrent.thread
     private var dnsResolverSettingsSub: Sub? = null
     private var connected: Boolean = false
     private var providerCount: Long = 0
+    // the window status the notification says, with providerCount
+    private var windowMinSatisfied: Boolean = false
+    private var windowFailed: Boolean = false
+    /** Refreshes the notification when the tunnel starts or stops. */
+    private var tunnelChangeSub: Sub? = null
+    /** Says in the notification when the connection is slow (apple/DELAY.md §7.2). */
+    private var transportDelaySub: Sub? = null
+    // the slow internet dwell (SlowInternetNoticePolicy), main thread only
+    private var slowInternetNotice = SlowInternetNotice()
+    // observes the dwell again when it can change with no new report, or its
+    // numbers are due a refresh
+    private val slowInternetCheck = Runnable { updateSlowInternetNotice() }
+    // the slow content's large icons by level, 0 for back to normal, made once
+    private val tunnelLargeIcons = arrayOfNulls<Bitmap>(tunnelLevelDepths.size + 1)
 
     // Committed only after Builder.establish() succeeds. A failed seamless
     // handover must remain visibly unapplied so the next listener/recovery
@@ -143,17 +194,25 @@ import kotlin.concurrent.thread
         private var offline: Boolean = false
 
 
+    private fun lifecycle(event: String, detail: String = "") {
+        VpnLifecycleLog.record({ createDeviceProtectedStorageContext().filesDir }, event, detail)
+    }
+
     override fun onCreate() {
         super.onCreate()
+        lifecycle("service created")
         // startForegroundService() gives the service only a few seconds to
         // promote. Do it at the first service lifecycle callback, before SDK
         // admission, device attachment, TUN construction, or OEM scheduling
         // can consume that deadline.
         foregroundPromotionSucceeded = try {
             promoteToForeground("Starting…")
+            lifecycle("foreground promoted")
             (application as MainApplication).vpnServiceDidEnterForeground()
             true
         } catch (e: Exception) {
+            lifecycle("foreground promotion failed", e.javaClass.name)
+            lifecycle("service stop", "promotion failure")
             Log.e(TAG, "[service] foreground promotion failed: ${e.message}", e)
             (application as MainApplication).vpnServiceDidNotStart(this)
             stopSelf()
@@ -171,6 +230,13 @@ import kotlin.concurrent.thread
 
         val stop = intent?.getBooleanExtra("stop", false) ?: false
         val start = intent?.getBooleanExtra("start", true) ?: false
+        // an intent the app sent before a revoke is refused even when the user
+        // has connected since (the fence is down again, its epoch is not)
+        val carriedEpoch = intent
+            ?.takeIf { it.hasExtra(VPN_START_FENCE_EPOCH_EXTRA) }
+            ?.getLongExtra(VPN_START_FENCE_EPOCH_EXTRA, 0L)
+        val revokeFenced = !app.vpnReconnectPermitted(VpnReconnectEntry.SYSTEM_START) ||
+            !vpnStartEpochAdmitted(carriedEpoch) { app.vpnFenceAdmits(it) }
         val redelivered =
             flags and android.app.Service.START_FLAG_REDELIVERY != 0 ||
                 flags and android.app.Service.START_FLAG_RETRY != 0
@@ -187,6 +253,7 @@ import kotlin.concurrent.thread
                 startRequested = start,
                 systemStart = systemStart,
                 commandCompatible = commandCompatible,
+                revokeFenced = revokeFenced,
             )
         ) {
             DirectBootServiceDecision.STOP -> {
@@ -196,7 +263,7 @@ import kotlin.concurrent.thread
                         "systemStart=$systemStart commandCompatible=$commandCompatible",
                 )
                 app.vpnServiceDidNotStart(this, retryRequested = false)
-                stop()
+                stop(if (stop) "user disconnect" else "obsolete flow")
                 return START_NOT_STICKY
             }
             DirectBootServiceDecision.HOLD_ALWAYS_ON_GUARD -> {
@@ -212,8 +279,9 @@ import kotlin.concurrent.thread
             app.ensureApplicationStateInitialized()
         } catch (e: Exception) {
             Log.e(TAG, "[service] application initialization failed after promotion: ${e.message}", e)
+            if (keepRequiredVpnUp("application-init-failure")) return START_REDELIVER_INTENT
             app.vpnServiceDidNotStart(this)
-            stop()
+            stop("command failure: ${e.javaClass.name}")
             return START_NOT_STICKY
         }
         // Read restored SDK state once. A listener can change the device state
@@ -229,6 +297,7 @@ import kotlin.concurrent.thread
                 redelivered = redelivered,
                 systemStart = systemStart,
                 commandCompatible = commandCompatible,
+                revokeFenced = revokeFenced,
             ),
         )
 
@@ -239,10 +308,14 @@ import kotlin.concurrent.thread
                     "systemStart=$systemStart appActive=${app.serviceActive} " +
                     "deviceRequiresVpn=$deviceRequiresVpn",
             )
+            // Only a stale intent ("obsolete flow") may be held; the user's stop,
+            // an incompatible command and the revoke fence always stop.
+            val obsoleteFlow = !stop && start && commandCompatible && !revokeFenced
+            if (obsoleteFlow && keepRequiredVpnUp("obsolete-flow")) return START_REDELIVER_INTENT
             if (app.service?.get() !== this) {
                 app.vpnServiceDidNotStart(this, retryRequested = false)
             }
-            stop()
+            stop(if (stop) "user disconnect" else "obsolete flow")
             // A stop/stale intent must not itself be retained for another
             // redelivery. START_REDELIVER_INTENT is only for a service we
             // actually accepted and intend Android to restore.
@@ -252,7 +325,7 @@ import kotlin.concurrent.thread
         if (app.service?.get() != this) {
             app.service?.get().let { currentService ->
                 if (currentService != this) {
-                    currentService?.stop()
+                    currentService?.stop("replacement")
                 }
             }
             app.vpnServiceDidStart(this, systemStart)
@@ -297,7 +370,7 @@ import kotlin.concurrent.thread
         val newlyAdopted = app.service?.get() !== this
         if (newlyAdopted) {
             app.service?.get()?.let { currentService ->
-                if (currentService !== this) currentService.stop()
+                if (currentService !== this) currentService.stop("replacement")
             }
         }
         app.vpnServiceDidStartDirectBoot(this)
@@ -340,6 +413,8 @@ import kotlin.concurrent.thread
 
         fun updateWindowStatus(windowStatus: WindowStatus) {
             providerCount = windowStatus.providerStateAdded
+            windowMinSatisfied = windowStatus.minSatisfied
+            windowFailed = windowStatus.failed
             connected = 0 < providerCount
             updateForegroundNotification()
             reconcilePfd()
@@ -377,6 +452,8 @@ import kotlin.concurrent.thread
         connectChangeSub = currentDevice.addConnectChangeListener {
             Handler(mainLooper).post {
                 if (boundDevice !== currentDevice) return@post
+                // a connection that ends starts the slow internet dwell over
+                updateSlowInternetNotice(notify = false)
                 updateForegroundNotification()
                 reconcilePfd()
             }
@@ -386,6 +463,21 @@ import kotlin.concurrent.thread
                 if (boundDevice === currentDevice) updateForegroundNotification()
             }
         }
+        // connected only with the tunnel up: say when it starts or stops
+        tunnelChangeSub = currentDevice.addTunnelChangeListener {
+            Handler(mainLooper).post {
+                if (boundDevice === currentDevice) updateForegroundNotification()
+            }
+        }
+        // say when the connection is slow. The listener reports each level
+        // change on the sdk's thread, and nothing else throttles the
+        // notification, so its reports fold into one main thread read. It
+        // does not report the current value: read it once registered
+        val transportDelayUpdate = CoalescedPost(post = { mainHandler.post(it) }) {
+            if (boundDevice === currentDevice) updateSlowInternetNotice()
+        }
+        transportDelaySub = currentDevice.addTransportDelayChangeListener { transportDelayUpdate.request() }
+        updateSlowInternetNotice(notify = false)
         updateForegroundNotification()
         reconcilePfd()
     }
@@ -421,6 +513,10 @@ import kotlin.concurrent.thread
         // address: a DNS entry equal to the bound address is locally terminated.
         val boundIpv4 = clientIpv4 ?: ESCAPE_FALLBACK_ADDRESS
         val deviceDnsIpv4s = tunnelDnsServers()
+        // the IPv6 half, sourced and filtered the same way
+        val clientIpv6 = vpnTunnelIpv6Address(app.device?.tunnelLocalAddressIpv6())
+        val boundIpv6 = clientIpv6 ?: ESCAPE_FALLBACK_ADDRESS_IPV6
+        val deviceDnsIpv6s = tunnelDnsServersIpv6()
         return VpnPacketFlowConfiguration(
             offline = offline,
             connected = connected,
@@ -430,17 +526,36 @@ import kotlin.concurrent.thread
             excludedAppIds = excludedAppIds.toSet(),
             dnsIpv4s = vpnDnsServersForClient(boundIpv4, deviceDnsIpv4s, dnsIpv4s),
             clientIpv4 = clientIpv4,
+            dnsIpv6s = vpnDnsServersIpv6ForClient(boundIpv6, deviceDnsIpv6s, dnsIpv6s),
+            clientIpv6 = clientIpv6,
         )
     }
 
+    /**
+     * The Always-on guard replaces the tunnel only while there is no device or
+     * the tunnel the device wants would escape; a provider dip under a connect
+     * request keeps the capture tunnel, which already fails closed.
+     */
+    private fun alwaysOnGuardRequired(
+        app: MainApplication,
+        desired: VpnPacketFlowConfiguration?,
+    ): Boolean = vpnAlwaysOnGuardRequired(
+        systemAlwaysOn = app.isSystemAlwaysOnVpnActive(),
+        deviceAvailable = desired != null,
+        wouldEscape = desired?.packetFlowMode == VpnPacketFlowMode.ESCAPE,
+    )
+
     private fun reconcilePfd() {
         val app = application as MainApplication
-        val guardRequired = vpnAlwaysOnGuardRequired(
-                systemAlwaysOn = app.isSystemAlwaysOnVpnActive(),
-                deviceAvailable = boundDevice != null,
-                providerConnected = connected,
-            )
-        if (guardRequired) {
+        if (app.vpnRevokeFenced()) {
+            // the user revoked the VPN: neither a tunnel nor the guard comes back
+            Log.i(TAG, "[service]revoke fence raised; stopping")
+            stop("revoke fence")
+            return
+        }
+        // null exactly when no device is bound
+        val desired = boundDevice?.let { desiredTunnelConfiguration() }
+        if (alwaysOnGuardRequired(app, desired)) {
             if (tunnelRetryKind == TunnelRetryKind.CONFIGURATION) cancelTunnelRetry()
             if (
                 alwaysOnGuardPfd == null &&
@@ -451,12 +566,11 @@ import kotlin.concurrent.thread
             return
         }
         if (tunnelRetryKind == TunnelRetryKind.ALWAYS_ON_GUARD) cancelTunnelRetry()
-        if (boundDevice == null) {
+        if (desired == null) {
             Log.i(TAG, "[service]device unavailable outside Always-on; stopping")
-            stop()
+            stop("missing device")
             return
         }
-        val desired = desiredTunnelConfiguration()
         if (
             tunnelRetryKind == TunnelRetryKind.CONFIGURATION &&
             tunnelRetryConfiguration != desired
@@ -482,34 +596,46 @@ import kotlin.concurrent.thread
         configuration: VpnPacketFlowConfiguration? = null,
         reason: String,
     ) {
-        if (stopping) return
+        if (stopping) {
+            lifecycle("retry refused", "kind=$kind reason=service stopping")
+            return
+        }
         val sameTarget =
             tunnelRetryKind == kind && tunnelRetryConfiguration == configuration
         if (!sameTarget) {
-            cancelTunnelRetry()
+            // A recovered loop can fail again shortly after we cleared the
+            // runnable. Keep its history until it has stayed up long enough.
+            cancelTunnelRetry(resetFailureCount = tunnelRetryKind != null)
             tunnelRetryKind = kind
             tunnelRetryConfiguration = configuration
         }
         if (tunnelRetryRunnable != null) return
 
-        val delayMillis = tunnelRetryDelayMillis(tunnelRetryFailureCount)
+        val delayMillis = tunnelRetryDelayMillis(
+            (application as MainApplication).vpnTunnelTimingSettings,
+            tunnelRetryFailureCount,
+        )
         if (tunnelRetryFailureCount < Int.MAX_VALUE) tunnelRetryFailureCount += 1
         val retryDevice = boundDevice
+        // admitted when scheduled; a revoke before it runs fails it for good,
+        // even if the user's connect has lowered the fence again
+        val admission = (application as MainApplication).vpnFenceAdmission()
         lateinit var runnable: Runnable
         runnable = Runnable {
             if (tunnelRetryRunnable !== runnable) return@Runnable
             tunnelRetryRunnable = null
             val app = application as MainApplication
             if (stopping || app.service?.get() !== this) return@Runnable
+            // asked again at execution: an off-main revoke can raise the fence
+            // while this retry waits, and reconcilePfd stops on a raised fence
+            if (app.vpnRevokeFenced() || !app.vpnFenceAdmits(admission)) {
+                cancelTunnelRetry()
+                reconcilePfd()
+                return@Runnable
+            }
             when (kind) {
                 TunnelRetryKind.ALWAYS_ON_GUARD -> {
-                    if (
-                        vpnAlwaysOnGuardRequired(
-                            systemAlwaysOn = app.isSystemAlwaysOnVpnActive(),
-                            deviceAvailable = boundDevice != null,
-                            providerConnected = connected,
-                        )
-                    ) {
+                    if (alwaysOnGuardRequired(app, boundDevice?.let { desiredTunnelConfiguration() })) {
                         establishAlwaysOnGuard()
                     } else {
                         cancelTunnelRetry()
@@ -533,6 +659,7 @@ import kotlin.concurrent.thread
             }
         }
         tunnelRetryRunnable = runnable
+        lifecycle("retry scheduled", "kind=$kind delayMillis=$delayMillis reason=$reason")
         Log.i(
             TAG,
             "[service] scheduling TUN retry kind=$kind failure=$tunnelRetryFailureCount " +
@@ -551,6 +678,8 @@ import kotlin.concurrent.thread
 
     private fun updatePfd(configuration: VpnPacketFlowConfiguration) {
         val app = application as MainApplication
+        // admitted on entry; the check before establish() asks for this epoch
+        val admission = app.vpnFenceAdmission()
 
         val builder = Builder()
         builder.setSession("URnetwork")
@@ -562,6 +691,7 @@ import kotlin.concurrent.thread
         val tunnelIncludedAppIds = configuration.includedAppIds
         val tunnelExcludedAppIds = configuration.excludedAppIds
         val tunnelDnsIpv4s = configuration.dnsIpv4s
+        val tunnelDnsIpv6s = configuration.dnsIpv6s
 
         // Routing mode is a pure decision so the fail-closed/escape path is
         // unit-testable without an Android runtime. Named args avoid a silent
@@ -569,14 +699,11 @@ import kotlin.concurrent.thread
         // for provide with no live exit) keeps the tunnel established but adds
         // no routes and no DNS, so Android points nothing at it: every app
         // (including the tunnel owner) keeps its native network and DNS, and
-        // there is no dependence on an installed allow-listed package.
-        val mode = vpnPacketFlowMode(
-            offline = configuration.offline,
-            connected = configuration.connected,
-            killSwitch = configuration.killSwitch,
-            connectRequested = configuration.connectRequested,
-            includedAppIds = tunnelIncludedAppIds,
-        )
+        // there is no dependence on an installed allow-listed package. The
+        // owner stays inside the ESCAPE tunnel: MainApplication tracks the
+        // physical default with a VPN-blind callback, not the per-app default.
+        // The same mode decides whether Always-on holds its guard instead.
+        val mode = configuration.packetFlowMode
         when (mode) {
             VpnPacketFlowMode.ESCAPE -> {
                 // no app rules; the escape build below adds routes/DNS only for
@@ -613,12 +740,12 @@ import kotlin.concurrent.thread
         }
 
         when (configuration.ipv6Policy) {
-            VpnIpv6Policy.BLOCK_UNSUPPORTED -> {
-                // For CAPTURE modes (allowlist/denylist): omit IPv6 entirely.
-                // Remote providers are IPv4-only, so the tunnel cannot forward
-                // IPv6; blocking the unconfigured family is correct there.
-                // The ESCAPE path below separately calls allowFamily(AF_INET6)
-                // so the phone's other apps keep their own IPv6 connectivity.
+            VpnIpv6Policy.CAPTURE -> {
+                // For CAPTURE modes (allowlist/denylist): the IPv6 half is
+                // configured below exactly like the IPv4 half (address, ::/0
+                // minus the local scopes, DNS), so IPv6 rides the tunnel and
+                // fails closed with the kill switch. The ESCAPE path adds no
+                // IPv6 address or route: every app keeps its native IPv6.
             }
         }
 
@@ -628,23 +755,25 @@ import kotlin.concurrent.thread
         // tunnel address. Without an address builder.establish() throws and
         // the catch retains the previous interface, or with no prior interface
         // leaves no TUN at all. For a kill-switch or connected state that
-        // fails OPEN (traffic to the ISP in the clear). Use a fixed
+        // fails open (traffic to the ISP in the clear). Use a fixed
         // documentation address (same class the always-on guard uses) as a
         // fail-closed fallback: with capture routes it is a blocking blackhole;
         // with no routes (escape) it routes nothing.
         val tunnelAddress = clientIpv4 ?: ESCAPE_FALLBACK_ADDRESS
-        val ipv6Report = if (isEscape) "on" else "off"
+        val tunnelAddressIpv6 = configuration.clientIpv6 ?: ESCAPE_FALLBACK_ADDRESS_IPV6
+        val ipv6Report = if (isEscape) "bypass" else tunnelAddressIpv6
         if (isEscape) {
-            // Escaping: allow BOTH families. With no app rules every app is in
+            // Escaping: allow both families. With no app rules every app is in
             // scope, so without allowFamily(AF_INET6) the unconfigured IPv6
-            // family would be BLOCKED for every app (the exact bug this fix
-            // removes, on the v6 half). Address only, no routes, no DNS:
-            // Android routes nothing into it and every app keeps its native
-            // network and DNS.
+            // family would be blocked for every app. IPv4 address only, no
+            // IPv6 address, no routes, no DNS: Android routes nothing into it
+            // and every app keeps its native network and DNS.
             builder.allowFamily(AF_INET)
             builder.allowFamily(AF_INET6)
         } else {
+            // Capturing: both families are configured on the tunnel below.
             builder.allowFamily(AF_INET)
+            builder.allowFamily(AF_INET6)
         }
         builder.addAddress(
             tunnelAddress,
@@ -657,6 +786,16 @@ import kotlin.concurrent.thread
                 // PacketFlow can hand them to UpgradeMux.
                 for (dnsIpv4 in tunnelDnsIpv4s) {
                     builder.addDnsServer(dnsIpv4)
+                }
+                // the IPv6 half: the SDK's ULA tunnel address on its /64, and
+                // the IPv6 DNS stand-in, distinct from the address for the same
+                // local-termination reason as IPv4
+                builder.addAddress(
+                    tunnelAddressIpv6,
+                    Sdk.getTunnelLocalPrefixLengthIpv6().toInt()
+                )
+                for (dnsIpv6 in tunnelDnsIpv6s) {
+                    builder.addDnsServer(dnsIpv6)
                 }
             if (Build.VERSION_CODES.TIRAMISU <= Build.VERSION.SDK_INT) {
                 builder.addRoute("0.0.0.0", 0)
@@ -709,8 +848,41 @@ import kotlin.concurrent.thread
                 builder.addRoute("8.0.0.0", 7)
                 builder.addRoute("11.0.0.0", 8)
             }
+            // IPv6: everything except the scopes that must stay on the native
+            // network (link-local, unique-local, multicast, loopback). Use the
+            // split table on every API: excludeRoute also rejects ::1/128.
+            // (see VpnRoutes.kt, which is checked against this v4 table too)
+            vpnSubmitIpv6Routes { route ->
+                builder.addRoute(route.address, route.prefixLength)
+            }
             }
         app.device?.let { device ->
+            // the last check before the interface is built: a revoke on the
+            // binder thread can land during the configuration above
+            //
+            // ACCEPTED RISK, deliberately not closed: a revoke can still land
+            // between this check and builder.establish() below. Closing it
+            // needs a lock held across establish(), and establish() is a
+            // blocking system call on the main thread (an ANR if the system
+            // is slow); the fence's own lock cannot be held across it. What it
+            // costs: a window of microseconds in which one tunnel can be built
+            // after a revoke. It is not left standing: onRevoke posts stop()
+            // to the main thread, which runs after this call returns and tears
+            // the interface down, and any later reconcilePfd sees the raised
+            // fence and stops too.
+            // A device run must show that (1) a revoke fired during an
+            // updatePfd leaves no interface up once the main looper is idle,
+            // and (2) establish() itself stays well under the ANR budget.
+            if (app.vpnRevokeFenced() || !app.vpnFenceAdmits(admission)) {
+                Log.i(TAG, "[service]revoke fence raised before establish; stopping")
+                cancelTunnelRetry()
+                stop("revoke fence")
+                return
+            }
+            // Uploaded logs then show whether strict Private DNS (DoT) was in
+            // force for a "connected but no DNS" report (see PrivateDnsMode).
+            // Written to the sdk log too, which is what feedback uploads.
+            diagnosticLog.info(SERVICE_LOG_TAG, privateDnsModeLogLine(app.privateDnsMode.value))
             val pfd = try {
                 builder.establish()
             } catch (e: Exception) {
@@ -725,12 +897,19 @@ import kotlin.concurrent.thread
             pfd?.let { descriptor ->
                 // cancel the previous packet flow after the new fd is in place, to avoid leaking packets
                 val replacedPacketFlow = packetFlow
+                val flowStartedAt = SystemClock.elapsedRealtime()
                 val replacementPacketFlow = try {
-                    PacketFlow(device, descriptor) { endedPacketFlow ->
+                    createPacketFlow(device, descriptor, app.ioLoopDiagnostics) { endedPacketFlow ->
                         mainHandler.post {
                             if (packetFlow === endedPacketFlow) {
+                                lifecycle("tunnel loop end", "active flow")
                                 packetFlow = null
                                 if (app.service?.get() == this@MainService) {
+                                    tunnelRetryFailureCount = packetFlowRetryFailureCount(
+                                        tunnelRetryFailureCount,
+                                        SystemClock.elapsedRealtime() - flowStartedAt,
+                                        retryPending = tunnelRetryRunnable != null,
+                                    )
                                     device.tunnelStarted = false
                                     scheduleTunnelRetry(
                                         TunnelRetryKind.CONFIGURATION,
@@ -752,7 +931,7 @@ import kotlin.concurrent.thread
                     return
                 }
                 packetFlow = replacementPacketFlow
-                cancelTunnelRetry()
+                cancelTunnelRetry(resetFailureCount = false)
                 appliedTunnelConfiguration = configuration
                 val replacedGuard = alwaysOnGuardPfd
                 alwaysOnGuardPfd = null
@@ -763,12 +942,12 @@ import kotlin.concurrent.thread
                     "[service]tunnel applied offline=${configuration.offline} connected=${configuration.connected} " +
                         "included=${configuration.includedAppIds.size} excluded=${configuration.excludedAppIds.size} " +
                         "dns=${configuration.dnsIpv4s} address=${configuration.clientIpv4} " +
-                        "tunnelIpv6=${ipv6Report}",
+                        "dnsIpv6=${configuration.dnsIpv6s} tunnelIpv6=${ipv6Report}",
                 )
                 if (app.service?.get() == this@MainService) {
                     device.tunnelStarted = true
                 } else {
-                    stop()
+                    stop("obsolete flow")
                 }
             } ?: run {
                 Log.i(TAG, "[service]WARNING tunnel was not started. Another existing tunnel may be blocking the start.")
@@ -783,19 +962,22 @@ import kotlin.concurrent.thread
                 Log.i(TAG, "[service]device disappeared during tunnel handover; retaining Always-on guard")
                 establishAlwaysOnGuard()
             } else {
-                stop()
+                stop("missing device")
             }
         }
     }
 
     /**
      * Android can start an Always-on VPN before the user has authenticated (or
-     * keep it selected after logout). Hold a real IPv4 VPN interface so the OS
-     * does not enter a restart loop. Traffic is intentionally fail-closed until
+     * keep it selected after logout). Hold a real dual-stack VPN interface so
+     * the OS does not enter a restart loop. Traffic is intentionally fail-closed until
      * a DeviceLocal is restored; the VPN app itself is excluded so login and
      * provider discovery can recover the session.
      */
     private fun establishAlwaysOnGuard(): Boolean {
+        if (!(application as MainApplication).vpnReconnectPermitted(VpnReconnectEntry.ALWAYS_ON_GUARD)) {
+            return false
+        }
         if (alwaysOnGuardPfd != null) {
             if (tunnelRetryKind == TunnelRetryKind.ALWAYS_ON_GUARD) cancelTunnelRetry()
             packetFlow?.close()
@@ -812,15 +994,34 @@ import kotlin.concurrent.thread
             .addAddress("192.0.2.1", 32)
             .addRoute("0.0.0.0", 0)
             .addDnsServer("192.0.2.2")
+            // the IPv6 half of the guard, so lockdown blackholes IPv6 too
+            // instead of leaving the family unconfigured and bypassing
+            .addAddress(ESCAPE_FALLBACK_ADDRESS_IPV6, 128)
+            .addRoute("::", 0)
+            .addDnsServer("2001:db8::2")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             builder.setMetered(false)
         }
+        // logcat only: the guard also runs before first unlock, where no SDK
+        // object may be loaded (see holdDirectBootAlwaysOnGuard)
+        Log.i(TAG, privateDnsModeLogLine((application as MainApplication).privateDnsMode.value))
+        // ACCEPTED RISK, deliberately not closed: the fence is asked once at
+        // the top of this function and not again before establish(), so a
+        // revoke landing in between still builds the guard interface. Same
+        // trade as in updatePfd: a lock held across establish() would turn a
+        // microsecond window into main-thread ANR exposure, so there is none.
+        // The guard is the fail-closed interface (it blackholes traffic, it
+        // does not route it), and onRevoke's stop() on the main thread runs
+        // after this call returns and tears it down. A device run must show that a revoke during guard setup leaves no
+        // guard interface up once the main looper is idle.
         val established = try {
             builder.establish()
         } catch (e: Exception) {
+            lifecycle("always-on guard failed", e.javaClass.name)
             Log.i(TAG, "[service]could not establish Always-on authentication guard: ${e.message}")
             null
         } ?: run {
+            lifecycle("always-on guard failed", "establish returned null or threw")
             scheduleTunnelRetry(
                 TunnelRetryKind.ALWAYS_ON_GUARD,
                 reason = "always-on-guard-establish-failed",
@@ -836,6 +1037,7 @@ import kotlin.concurrent.thread
         appliedTunnelConfiguration = null
         previous?.close()
         replacedPacketFlow?.close()
+        lifecycle("always-on guard applied")
         Log.i(TAG, "[service]Always-on authentication guard established")
         return true
     }
@@ -871,8 +1073,17 @@ import kotlin.concurrent.thread
         connectChangeSub = null
         connectLocationSub?.close()
         connectLocationSub = null
+        tunnelChangeSub?.close()
+        tunnelChangeSub = null
+        transportDelaySub?.close()
+        transportDelaySub = null
+        mainHandler.removeCallbacks(slowInternetCheck)
+        slowInternetNotice = SlowInternetNotice()
+        (application as MainApplication).widgetSnapshotWriter?.publishSlowInternet(null)
         boundDevice = null
         providerCount = 0
+        windowMinSatisfied = false
+        windowFailed = false
         connected = false
         updateForegroundNotification()
         if (tunnelRetryKind == TunnelRetryKind.CONFIGURATION) {
@@ -901,12 +1112,12 @@ import kotlin.concurrent.thread
         // installing a lookup is not free on the go side: it invalidates the
         // flow-owner cache and the recorded app placements, so every live
         // flow's next packet pays a fresh platform call on the single tun
-        // reader for an answer only a NEW flow consumes. This fires on any
+        // reader for an answer only a new flow consumes. This fires on any
         // block-action change and on any package broadcast -- a play store
         // batch update would otherwise replay that burst dozens of times.
         //
         // force bypasses the memo: a package event never changes the pinned
-        // package-name SET, only the uid map frozen inside the lookup, so
+        // package-name set, only the uid map frozen inside the lookup, so
         // the receiver's rebuild would otherwise always be a no-op -- and a
         // reinstalled (uid-recycled) pinned app would keep a stale map.
         if (!force && pinnedPackages == appliedPinnedAppIds) {
@@ -933,7 +1144,7 @@ import kotlin.concurrent.thread
 
     /**
      * Rebuilds the pinned-app lookup when packages change. The lookup maps
-     * uid -> package once at construction, and uids are NOT stable across an
+     * uid -> package once at construction, and uids are not stable across an
      * uninstall/reinstall -- worse, Android recycles them, so a stale map can
      * attribute a newly installed app's flows to a pinned package. Cheap to
      * rebuild, so rebuild on any package event.
@@ -999,14 +1210,14 @@ import kotlin.concurrent.thread
     /**
      * The (allow-list, deny-list) app sets for the tunnel builder.
      *
-     * The sdk names these from the ROUTE's point of view and this inverts
+     * The sdk names these from the route's point of view and this inverts
      * them: a local-routed app bypasses the vpn (builder disallow), a
      * remote-routed app uses it (builder allow).
      *
-     * Pinned apps need care. Pinning holds an app to one exit INSIDE the
+     * Pinned apps need care. Pinning holds an app to one exit inside the
      * tunnel -- it is placement, not membership -- so the sdk deliberately
      * omits pinned apps from both sets. But "allowlist mode" is built from
-     * the allow set ALONE ("excluded by omission" below), so simply omitting
+     * the allow set alone ("excluded by omission" below), so simply omitting
      * a pinned app drops it out of the vpn entirely the moment any other app
      * is included. Union the pinned apps into the allow set exactly when
      * allowlist mode is active; in denylist mode omission is correct, since
@@ -1058,13 +1269,19 @@ import kotlin.concurrent.thread
 
     /**
      * The IPv4 DNS servers for the tunnel builder, from the SDK device like the
-     * tunnel address. The tunnel deliberately does not consume the SDK's IPv6
-     * DNS list until remote providers can forward IPv6.
+     * tunnel address.
      */
     private fun tunnelDnsServers(): List<String> {
         val app = application as MainApplication
         val device = app.device ?: return dnsIpv4s
         return sdkStringListToList(device.tunnelDnsAddressesIpv4()).ifEmpty { dnsIpv4s }
+    }
+
+    /** The IPv6 DNS servers for the tunnel builder, from the SDK device. */
+    private fun tunnelDnsServersIpv6(): List<String> {
+        val app = application as MainApplication
+        val device = app.device ?: return dnsIpv6s
+        return sdkStringListToList(device.tunnelDnsAddressesIpv6()).ifEmpty { dnsIpv6s }
     }
 
     private fun sdkStringListToSet(list: com.bringyour.sdk.StringList?): Set<String> {
@@ -1080,17 +1297,23 @@ import kotlin.concurrent.thread
     }
 
     override fun onDestroy() {
-        stop()
+        lifecycle("service destroyed", "onDestroy")
+        stop("onDestroy")
         super.onDestroy()
     }
 
     override fun onRevoke() {
+        // The user disconnected the VPN in the system settings, or another VPN
+        // took its place: the connection is disconnected first, so the service
+        // stop below does not restart it (support inbox 8018)
+        lifecycle("vpn revoked", "onRevoke")
+        (application as MainApplication).vpnServiceRevoked()
         // The framework does not guarantee this callback on our main-looper
         // state owner. Serialize teardown with listener and TUN callbacks.
         if (Looper.myLooper() == mainLooper) {
-            stop()
+            stop("revoke")
         } else {
-            mainHandler.post { stop() }
+            mainHandler.post { stop("revoke") }
         }
     }
 
@@ -1100,12 +1323,58 @@ import kotlin.concurrent.thread
 //        Sdk.freeMemory()
 //    }
 
-    fun stop() {
+    /**
+     * An internal stop of a promoted service (a stale start, the close monitor,
+     * an init failure) must not end a required VPN while the app is in the
+     * background: nothing can start the service again from there. Tear the flow
+     * down and schedule the bounded CONFIGURATION retry, keeping the service
+     * and its foreground notification. Returns false when the service should
+     * stop as before (not required, no device, not the adopted service, revoke
+     * fence). Main thread only.
+     */
+    private fun keepRequiredVpnUp(reason: String): Boolean {
+        val app = application as MainApplication
+        val device = boundDevice
+        // the same intent the reconcile path uses: the provide MODE, not the
+        // provider pointer, and the pending connect request rather than the raw
+        // flag, so the stop path and the restart path cannot disagree
+        val inputs = device?.let { app.vpnRequirementInputs(it) }
+        val decision = decideInternalStop(
+            foregroundPromoted = foregroundPromotionSucceeded,
+            ownsService = !stopping && app.service?.get() === this,
+            deviceBound = device != null,
+            revokeFenced = app.vpnRevokeFenced(),
+            provideEnabled = inputs?.let { it.provideMode != it.provideModeNone } ?: false,
+            connectEnabled = inputs?.connectRequested ?: false,
+            routeLocal = inputs?.routeLocal ?: true,
+        )
+        if (decision != VpnInternalStopDecision.KEEP_AND_RETRY || device == null) return false
+        Log.i(TAG, "[service]internal stop ($reason) held: VPN still required; retrying TUN")
+        // Known gap: the TUN fd is detached into the native io loop, so closing
+        // the flow closes the interface and there is no handle to keep it up
+        // across the retry (the packet-flow-ended retry has the same shape).
+        // Traffic is on the native network until updatePfd re-establishes, so
+        // kill-switch continuity is not guaranteed in that window.
+        val endedPacketFlow = packetFlow
+        packetFlow = null
+        appliedTunnelConfiguration = null
+        endedPacketFlow?.close()
+        device.tunnelStarted = false
+        scheduleTunnelRetry(
+            TunnelRetryKind.CONFIGURATION,
+            desiredTunnelConfiguration(),
+            "internal-stop-$reason",
+        )
+        return true
+    }
+
+    fun stop(reason: String = "unspecified") {
         if (Looper.myLooper() != mainLooper) {
-            mainHandler.post { stop() }
+            mainHandler.post { stop(reason) }
             return
         }
         if (stopping) return
+        lifecycle("service stop", reason)
         stopping = true
         val app = application as MainApplication
 
@@ -1170,6 +1439,55 @@ import kotlin.concurrent.thread
         }
     }
 
+    /**
+     * Observes the slow internet dwell with the bound device's transport delay
+     * now, schedules its next check, and, with [notify], updates the
+     * notification when what it says changed. Main thread.
+     */
+    private fun updateSlowInternetNotice(notify: Boolean = true) {
+        val device = boundDevice
+        val nowMillis = SystemClock.elapsedRealtime()
+        val previous = slowInternetNotice
+        val next = previous.observe(
+            delay = transportDelayUi(device?.transportDelay),
+            active = device?.connectEnabled == true,
+            nowMillis = nowMillis,
+        )
+        slowInternetNotice = next
+        // the dashboard widget's pill follows the slow content; the writer
+        // re-renders it only when it comes or goes, or its tunnel or label changes
+        (application as MainApplication).widgetSnapshotWriter?.publishSlowInternet(next.slowReading)
+        mainHandler.removeCallbacks(slowInternetCheck)
+        next.nextCheckAtMillis(nowMillis)?.let { atMillis ->
+            mainHandler.postDelayed(slowInternetCheck, atMillis - nowMillis)
+        }
+        if (notify && slowInternetNoticeChanged(previous, next)) {
+            updateForegroundNotification()
+        }
+    }
+
+    /**
+     * The words the notification is made of (vpnNotificationText), read from
+     * the resources at each build, so a locale change shows at the next update.
+     */
+    private val notificationStrings = object : VpnNotificationStrings {
+        override val appName: String get() = getString(R.string.app_name)
+        override val on: String get() = getString(R.string.on)
+        override fun protectedAt(location: String): String = getString(R.string.vpn_notification_protected, location)
+        override fun providerCount(count: Int): String =
+            resources.getQuantityString(R.plurals.provider_count, count, count)
+        override val connecting: String get() = getString(R.string.connecting_status_indicator)
+        override val connectFailed: String get() = getString(R.string.conn_failed)
+        override val tunnelDisconnected: String get() = getString(R.string.reconnect_tunnel_status_indicator)
+        override val slowInternet: String get() = getString(R.string.slow_internet)
+        override val slowInternetFallback: String get() = getString(R.string.slow_internet_fallback_title)
+        override val slowInternetStillConnected: String get() = getString(R.string.slow_internet_still_connected)
+        override val uploadDelay: String get() = getString(R.string.slow_internet_upload_delay)
+        override val downloadDelay: String get() = getString(R.string.slow_internet_download_delay)
+        override val recovered: String get() = getString(R.string.slow_internet_recovered)
+        override val recoveredDetail: String get() = getString(R.string.slow_internet_recovered_detail)
+    }
+
     private fun buildForegroundNotification(messageOverride: String? = null): Notification {
         val contentPendingIntent: PendingIntent =
             Intent(this, MainActivity::class.java).let { notificationIntent ->
@@ -1181,52 +1499,56 @@ import kotlin.concurrent.thread
                 )
             }
 
-        val presentation = if (messageOverride == null) {
+        val presentation: VpnNotificationPresentation?
+        val content: VpnNotificationText
+        if (messageOverride != null) {
+            // before the service reads the device: the app's name and the message
+            presentation = null
+            content = VpnNotificationText(
+                title = getString(R.string.app_name),
+                text = messageOverride,
+                bigText = messageOverride,
+            )
+        } else {
             val currentDevice = boundDevice
             val location = currentDevice?.connectLocation
-            vpnNotificationPresentation(
+            presentation = vpnNotificationPresentation(
                 connectRequested = currentDevice?.connectEnabled == true,
                 systemAlwaysOn = (application as MainApplication).isSystemAlwaysOnVpnActive(),
                 providerCount = providerCount,
+                minSatisfied = windowMinSatisfied,
+                failed = windowFailed,
+                locationProviderCount = location?.providerCount ?: 0,
+                tunnelStarted = currentDevice?.tunnelStarted == true,
                 locationName = location?.name,
                 city = location?.city,
                 region = location?.region,
                 country = location?.country,
                 bestAvailableLabel = getString(R.string.best_available_provider),
+                slowInternetPhase = slowInternetNotice.phase,
+                transportDelay = slowInternetNotice.delay,
             )
-        } else {
-            null
+            // short for a Flip's cover screen and the lock screen: the status
+            // first, then the place; the slow content swapped in while slow
+            content = vpnNotificationText(presentation, notificationStrings)
         }
 
-        val contentTitle: String
-        val contentText: String
-        if (messageOverride != null) {
-            contentTitle = getString(R.string.app_name)
-            contentText = messageOverride
-        } else {
-            when (presentation!!.status) {
-                VpnNotificationStatus.CONNECTED -> {
-                    contentTitle = presentation.locationLabel ?: getString(R.string.app_name)
-                    contentText = resources.getQuantityString(
-                        R.plurals.connected_provider_count,
-                        presentation.providerCount,
-                        presentation.providerCount,
-                    )
-                }
-                VpnNotificationStatus.CONNECTING -> {
-                    contentTitle = presentation.locationLabel ?: getString(R.string.app_name)
-                    val providers = resources.getQuantityString(
-                        R.plurals.provider_count,
-                        presentation.providerCount,
-                        presentation.providerCount,
-                    )
-                    contentText = "${getString(R.string.connecting_status_indicator)} • $providers"
-                }
-                VpnNotificationStatus.ACTIVE -> {
-                    contentTitle = getString(R.string.app_name)
-                    contentText = getString(R.string.on)
-                }
+        // a slow connection swaps the connected content in place: the same
+        // notification and channel, and the Disconnect action stays
+        var smallIcon = R.drawable.ic_status
+        var largeIcon: Bitmap? = null
+        var accentColor: Int? = null
+        when (val slowInternet = presentation?.slowInternet) {
+            is SlowInternetPresentation.Slow -> {
+                // static per level: the status bar cannot animate it
+                smallIcon = tunnelLevelIcon(slowInternet.level)
+                largeIcon = tunnelLargeIcon(slowInternet.level)
+                accentColor = Amber.toArgb()
             }
+            SlowInternetPresentation.Recovered -> {
+                largeIcon = tunnelLargeIcon(0)
+            }
+            null -> Unit
         }
 
         val builder = NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
@@ -1236,12 +1558,14 @@ import kotlin.concurrent.thread
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
-            .setSmallIcon(R.drawable.ic_status)
+            .setSmallIcon(smallIcon)
             .setBadgeIconType(NotificationCompat.BADGE_ICON_NONE)
-            .setContentText(contentText)
-            .setContentTitle(contentTitle)
+            .setContentText(content.text)
+            .setContentTitle(content.title)
             .setContentIntent(contentPendingIntent)
-            .setStyle(NotificationCompat.BigTextStyle().bigText(contentText))
+            .setStyle(NotificationCompat.BigTextStyle().bigText(content.bigText))
+        largeIcon?.let { builder.setLargeIcon(it) }
+        accentColor?.let { builder.setColor(it) }
 
         if (messageOverride == null && presentation?.showDisconnect == true) {
             val disconnectIntent = Intent(
@@ -1262,6 +1586,15 @@ import kotlin.concurrent.thread
         }
 
         return builder.build()
+    }
+
+    /** The slow content's large icon at [level], 0 for back to normal, made once per level. Main thread. */
+    private fun tunnelLargeIcon(level: Int): Bitmap {
+        val index = level.coerceIn(0, tunnelLevelDepths.size)
+        return tunnelLargeIcons[index] ?: tunnelLargeIconBitmap(
+            sizePx = (TUNNEL_LARGE_ICON_DP * resources.displayMetrics.density).roundToInt(),
+            depth = if (index == 0) TUNNEL_RECOVERED_LARGE_ICON_DEPTH else tunnelLevelDepths[index - 1].toFloat(),
+        ).also { tunnelLargeIcons[index] = it }
     }
 
 
@@ -1297,7 +1630,7 @@ import kotlin.concurrent.thread
                 Handler(mainLooper).post {
                     // Only stop if no newer monitor has been started since this one.
                     if (closeMonitorGeneration.get() == generation) {
-                        stop()
+                        if (!keepRequiredVpnUp("close-monitor")) stop("close monitor")
                         closeMonitorStarted = false
                     }
                 }
@@ -1307,33 +1640,22 @@ import kotlin.concurrent.thread
 }
 
 
-private class PacketFlow(deviceLocal: DeviceLocal, pfd: ParcelFileDescriptor, endCallback: (packetFlow: PacketFlow)->Unit) {
-
-    val stateLock = ReentrantLock()
-//    val closed: Condition = stateLock.newCondition()
-    var active: Boolean = true
-
-    val ioLoop: IoLoop = Sdk.newIoLoop(deviceLocal, pfd.detachFd()) {
-        close()
-        endCallback(this@PacketFlow)
-    }
-
-    fun close() {
-        stateLock.lock()
-        try {
-            active = false
-        } finally {
-            stateLock.unlock()
+// The native worker may complete before its constructor returns. PacketFlow
+// owns only the eventual close action; native done never reads that initializer.
+private fun createPacketFlow(
+    deviceLocal: DeviceLocal,
+    pfd: ParcelFileDescriptor,
+    diagnostic: com.bringyour.sdk.IoLoopDiagnosticSession?,
+    endCallback: (PacketFlow) -> Unit,
+): PacketFlow = PacketFlow(
+    createIoLoop = { done ->
+        val doneCallback = com.bringyour.sdk.IoLoopDoneCallback { done() }
+        val ioLoop = if (diagnostic == null) {
+            Sdk.newIoLoop(deviceLocal, pfd.detachFd(), doneCallback)
+        } else {
+            diagnostic.newIoLoop(deviceLocal, pfd.detachFd(), doneCallback)
         }
-        ioLoop.close()
-    }
-
-    fun isActive(): Boolean {
-        stateLock.lock()
-        try {
-            return active
-        } finally {
-            stateLock.unlock()
-        }
-    }
-}
+        ioLoop::close
+    },
+    endCallback = endCallback,
+)

@@ -85,9 +85,12 @@ enum class TransportTypeUi(
      * not localized; the queued bucket is a plain word and is.
      */
     @Composable
-    fun label(): String {
-        return literalName ?: stringResource(id = labelRes ?: R.string.transport_queued)
+    fun label(h1PlusActive: Boolean = false): String {
+        return productLabel(h1PlusActive) ?: stringResource(id = labelRes ?: R.string.transport_queued)
     }
+
+    fun productLabel(h1PlusActive: Boolean = false): String? =
+        if (this == H1 && h1PlusActive) "H1+" else literalName
 
     val isSelectable: Boolean
         get() = selectable.contains(this)
@@ -451,16 +454,29 @@ class TransportSettingsViewModel @Inject constructor(
     }
 
     /**
-     * Applies a policy to the device. The device persists it and the applied
-     * (normalized) policy comes back through the change listener.
+     * Applies a policy to the device, edited from `original`, only while
+     * `original` is still the policy in force ([settingsEditApplies]);
+     * otherwise publishes the policy in force, for the editor to re-seed
+     * from, and applies nothing. The device persists it and the applied
+     * (normalized) policy comes back through the change listener. True when
+     * it applied.
      */
-    fun apply(sdkSettings: TransportSettings, kind: TransportSettingsKind) {
-        val device = deviceManager.device ?: return
+    fun apply(sdkSettings: TransportSettings, kind: TransportSettingsKind, original: TransportSettingsUi): Boolean {
+        val device = deviceManager.device ?: return false
+        val current = when (kind) {
+            TransportSettingsKind.CLIENT -> device.transportSettings
+            TransportSettingsKind.PROVIDER -> device.providerTransportSettings
+        }?.let { TransportSettingsUi(it) }
+        if (!settingsEditApplies(original, current)) {
+            refresh(device)
+            return false
+        }
         when (kind) {
             TransportSettingsKind.CLIENT -> device.transportSettings = sdkSettings
             TransportSettingsKind.PROVIDER -> device.providerTransportSettings = sdkSettings
         }
         refresh(device)
+        return true
     }
 
     override fun onCleared() {

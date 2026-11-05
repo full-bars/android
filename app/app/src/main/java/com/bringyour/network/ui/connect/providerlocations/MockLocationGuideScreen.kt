@@ -64,6 +64,7 @@ import com.bringyour.network.ui.theme.MainTintedBackgroundBase
 import com.bringyour.network.ui.theme.TextMuted
 import com.bringyour.network.ui.theme.TopBarTitleTextStyle
 import com.bringyour.network.utils.lighten
+import com.bringyour.network.ui.components.tabletReadableColumn
 
 /**
  * Walks the user through making URnetwork the Android mock location app.
@@ -133,7 +134,7 @@ fun MockLocationGuideScreen(
                     IconButton(onClick = { navController.popBackStack() }) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.KeyboardArrowLeft,
-                            contentDescription = "Back",
+                            contentDescription = stringResource(id = R.string.back),
                         )
                     }
                 },
@@ -144,8 +145,9 @@ fun MockLocationGuideScreen(
     ) { innerPadding ->
         Column(
             modifier = Modifier
-                .fillMaxSize()
                 .padding(innerPadding)
+                .tabletReadableColumn()
+                .fillMaxSize()
                 .verticalScroll(rememberScrollState())
                 .padding(16.dp),
         ) {
@@ -253,9 +255,10 @@ fun MockLocationGuideScreen(
                 )
             }
 
-            Spacer(modifier = Modifier.height(24.dp))
-
             if (state.setupComplete && state.status != MockLocationStatus.ORPHANED) {
+                // the switch's 48 dp touch target fills the rest of the 24 dp
+                // above and below its row
+                Spacer(modifier = Modifier.height(10.dp))
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -277,12 +280,15 @@ fun MockLocationGuideScreen(
                         color = Green,
                         modifier = Modifier.weight(1f),
                     )
-                    Spacer(modifier = Modifier.width(8.dp))
+                    // the switch's touch target adds 6 dp of its own
+                    Spacer(modifier = Modifier.width(2.dp))
                     URSwitch(
                         checked = state.enabled,
                         toggle = { viewModel.setEnabled(!state.enabled) },
                     )
                 }
+                Spacer(modifier = Modifier.height(10.dp))
+            } else {
                 Spacer(modifier = Modifier.height(24.dp))
             }
 

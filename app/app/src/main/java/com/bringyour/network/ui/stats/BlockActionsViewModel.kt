@@ -39,7 +39,7 @@ private const val BLOCK_ACTIONS_COALESCE_MILLIS = 100L
 data class BlockActionUi(
     val id: String,
     val timeMillis: Long,
-    // cluster hosts/ips that did NOT match an override (disjoint from the matched sets)
+    // cluster hosts/ips that did not match an override (disjoint from the matched sets)
     val hosts: List<String>,
     val ips: List<String>,
     // the exact hosts/ips that matched an override rule, shown as green chips at the
@@ -55,7 +55,13 @@ data class BlockActionUi(
     // the deciding route override id, when a rule determined the decision
     val overrideId: String?,
     val byteCount: Long,
-    // short client ids of the exits CURRENTLY carrying flows to this
+    // the URnetwork safety rules decided this action (sdk BlockAction.isSecurity)
+    val safetyRule: Boolean = false,
+    // a local split rule makes this traffic work outside the tunnel
+    // (sdk BlockAction.routeLocalOverridable). BitTorrent and non-public
+    // destinations are never overridable
+    val routeLocalOverridable: Boolean = false,
+    // short client ids of the exits currently carrying flows to this
     // cluster's ips (live join against the flow table). One id is the normal
     // healthy shape; two ids on one row is a site split across egress IPs --
     // the exact event the affinity work exists to prevent
@@ -72,6 +78,18 @@ data class BlockActionUi(
      */
     val hostValues: List<String>
         get() = allHostNames + allIps
+
+    /**
+     * offer "Route locally": a safety rule that a local split rule can
+     * override, with no override already deciding this action
+     */
+    val offersRouteLocal: Boolean
+        get() = safetyRule &&
+            routeLocalOverridable &&
+            overrideId == null &&
+            !hasBlockOverride &&
+            !hasRouteOverride &&
+            hostValues.isNotEmpty()
 
     /** count of unmatched ips, rendered as a single "X IPs" pill */
     val ipCount: Int
@@ -92,42 +110,19 @@ data class SplitRuleUi(
     val ipValues: List<String>,
 )
 
-/**
- * What an app split rule does with the app's traffic.
- *
- * EXCLUDED and INCLUDED are tunnel MEMBERSHIP (enforced by the VpnService
- * builder's disallow/allow lists). PINNED is not membership at all: the app
- * uses the tunnel like any other, but all of its flows are held to one exit,
- * so its API session and its CDNs present a single egress IP -- the fix for
- * apps whose images fail to load behind a multi-exit VPN. A pinned app must
- * never reach the builder's allow list, or the VPN would flip to
- * allowlist mode and route ONLY pinned apps.
- */
-enum class AppRuleMode {
-    EXCLUDED,
-    INCLUDED,
-    PINNED;
+typealias AppRuleMode = AppSplitMode
 
-    fun toRouteOverride(): RouteOverride {
-        val route = RouteOverride()
-        when (this) {
-            EXCLUDED -> route.local = true
-            INCLUDED -> route.local = false
-            PINNED -> {
-                route.local = false
-                route.pin = true
-            }
-        }
-        return route
-    }
-
-    companion object {
-        fun of(local: Boolean, pin: Boolean): AppRuleMode = when {
-            local -> EXCLUDED
-            pin -> PINNED
-            else -> INCLUDED
+fun AppRuleMode.toRouteOverride(): RouteOverride {
+    val route = RouteOverride()
+    when (this) {
+        AppRuleMode.EXCLUDED -> route.local = true
+        AppRuleMode.INCLUDED -> route.local = false
+        AppRuleMode.PINNED -> {
+            route.local = false
+            route.pin = true
         }
     }
+    return route
 }
 
 /**
@@ -167,6 +162,11 @@ class BlockActionsViewModel @Inject constructor(
     // the exit-attribution re-poll (see openLiveUpdates); canceled with the
     // rest of the live updates
     private var exitAttributionJob: Job? = null
+    private val actionProjection = BlockActionsProjection(
+        readRows = { readBlockActions() },
+        readExits = { readDestinationExits() },
+        collapseHosts = { collapseHosts(it) },
+    )
 
     /**
      * newest first
@@ -180,6 +180,9 @@ class BlockActionsViewModel @Inject constructor(
     var appRules by mutableStateOf<List<AppSplitRuleUi>>(listOf())
         private set
 
+    var canCreateRule by mutableStateOf(false)
+        private set
+
     var allowedCount by mutableIntStateOf(0)
         private set
 
@@ -187,11 +190,24 @@ class BlockActionsViewModel @Inject constructor(
         private set
 
     /**
+     * The app rules partitioned by tunnel membership, recomputed each time
+     * [appRules] changes. Single source of truth for all three membership
+     * views and the include/exclude mode flags; see [AppRulePartition].
+     */
+    private var appRulePartition by mutableStateOf(
+        AppRulePartition(
+            includedAppIds = emptyList(),
+            excludedAppIds = emptyList(),
+            pinnedAppIds = emptyList(),
+        )
+    )
+
+    /**
      * apps forced through the vpn. when non-empty, they take
      * precedence and the tunnel runs in allowlist mode
      */
     val tunnelIncludedAppIds: List<String>
-        get() = appRules.filter { it.mode == AppRuleMode.INCLUDED }.map { it.appId }
+        get() = appRulePartition.includedAppIds
 
     /**
      * apps that bypass the vpn. PINNED apps are deliberately absent from both
@@ -200,13 +216,25 @@ class BlockActionsViewModel @Inject constructor(
      * bypass it
      */
     val tunnelExcludedAppIds: List<String>
-        get() = appRules.filter { it.mode == AppRuleMode.EXCLUDED }.map { it.appId }
+        get() = appRulePartition.excludedAppIds
 
     /** apps held to a single exit */
     val pinnedAppIds: List<String>
-        get() = appRules.filter { it.mode == AppRuleMode.PINNED }.map { it.appId }
+        get() = appRulePartition.pinnedAppIds
+
+    /** true when any app is INCLUDED, i.e. the tunnel is in allowlist mode */
+    val isIncludeMode: Boolean
+        get() = appRulePartition.isIncludeMode
+
+    /** true when no app is INCLUDED but at least one is EXCLUDED (denylist mode) */
+    val isExcludeMode: Boolean
+        get() = appRulePartition.isExcludeMode
+
+    /** whether a rule of [mode] has a distinct effect under the current partition */
+    fun isRuleActive(mode: AppRuleMode): Boolean = appRulePartition.isRuleActive(mode)
 
     init {
+        updateOverrides()
         processLifecycle.addObserver(this)
         controllerOwner.setForeground(
             processLifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
@@ -233,11 +261,11 @@ class BlockActionsViewModel @Inject constructor(
      * foreground app.
      */
     private fun setupDevice(device: DeviceLocal?) {
+        actionProjection.clear()
         blockActions = listOf()
-        splitRules = listOf()
-        appRules = listOf()
         allowedCount = 0
         blockedCount = 0
+        updateOverrides()
         controllerOwner.setDevice(device)
     }
 
@@ -280,7 +308,9 @@ class BlockActionsViewModel @Inject constructor(
             while (true) {
                 delay(5_000L)
                 if (blockActions.isNotEmpty()) {
-                    updateBlockActions()
+                    // Only the live join changes on this timer; do not fetch all
+                    // SDK rows or run per-row hostname collapse through JNI.
+                    blockActions = actionProjection.refreshExits()
                 }
             }
         }
@@ -303,10 +333,13 @@ class BlockActionsViewModel @Inject constructor(
     }
 
     private fun updateBlockActions() {
-        val vc = blockActionVc ?: return
+        if (blockActionVc == null) return
+        blockActions = actionProjection.refreshRows()
+    }
 
+    private fun readDestinationExits(): Map<String, Set<String>> {
         // the live destination->exit attribution, joined onto each cluster's
-        // ips below. Pull-model: this reflects the exit CURRENTLY carrying
+        // ips below. Pull-model: this reflects the exit currently carrying
         // each ip, after any re-race or rebind -- so a row growing a second
         // exit chip is a site split across egress IPs, live
         val exitsByIp = mutableMapOf<String, MutableSet<String>>()
@@ -318,7 +351,11 @@ class BlockActionsViewModel @Inject constructor(
                 exitsByIp.getOrPut(row.destinationIp) { mutableSetOf() }.add(shortId)
             }
         }
+        return exitsByIp
+    }
 
+    private fun readBlockActions(): List<BlockActionUi> {
+        val vc = blockActionVc ?: return emptyList()
         val items = mutableListOf<BlockActionUi>()
         val list = vc.blockActions
         if (list != null) {
@@ -336,23 +373,22 @@ class BlockActionsViewModel @Inject constructor(
                         ips = ips,
                         matchedHosts = sdkStringListToList(action.matchedHosts),
                         matchedIps = matchedIps,
-                        hostBaseNames = collapseHosts(unmatchedHosts),
+                        // Projection reuses these display names while hosts are unchanged.
+                        hostBaseNames = emptyList(),
                         block = action.block,
                         local = action.local,
                         hasBlockOverride = action.blockOverride != null,
                         hasRouteOverride = action.routeOverride != null,
                         overrideId = action.overrideId?.idStr,
                         byteCount = action.byteCount,
-                        exitShortIds = (matchedIps + ips)
-                            .flatMap { exitsByIp[it] ?: emptySet() }
-                            .distinct()
-                            .sorted(),
+                        safetyRule = action.isSecurity(),
+                        routeLocalOverridable = action.routeLocalOverridable(),
                     )
                 )
             }
         }
         // newest first
-        blockActions = items.reversed()
+        return items.reversed()
     }
 
     private fun updateBlockStats() {
@@ -363,10 +399,11 @@ class BlockActionsViewModel @Inject constructor(
     }
 
     private fun updateOverrides() {
-        val device = viewControllerDevice ?: return
+        // the current device, not viewControllerDevice: during a device swap
+        // that is still the retired device until its controller closes
+        val list = deviceManager.blockActionOverrides
         val hostRules = mutableListOf<SplitRuleUi>()
         val appSplitRules = mutableListOf<AppSplitRuleUi>()
-        val list = device.blockActionOverrides
         if (list != null) {
             val n = list.len()
             for (i in 0 until n) {
@@ -406,6 +443,15 @@ class BlockActionsViewModel @Inject constructor(
         }
         splitRules = hostRules
         appRules = appSplitRules
+        appRulePartition = AppSplitRulePolicy.partition(
+            rules = appSplitRules,
+            appIdSelector = { it.appId },
+            modeSelector = { it.mode },
+        )
+        // wherever an edit can land: the live device, or the persisted list,
+        // which can exist before its first rule does
+        canCreateRule = deviceManager.device != null ||
+            deviceManager.asyncLocalState?.localState != null
     }
 
     /**
@@ -433,8 +479,7 @@ class BlockActionsViewModel @Inject constructor(
      * creates a split rule forcing the selected host values to route local
      */
     fun createLocalRule(hosts: List<String>) {
-        val device = deviceManager.device ?: return
-        if (hosts.isEmpty()) {
+        if (hosts.isEmpty() || !canCreateRule) {
             return
         }
         val override = BlockActionOverride()
@@ -443,8 +488,7 @@ class BlockActionsViewModel @Inject constructor(
         val route = RouteOverride()
         route.local = true
         override.routeOverride = route
-        device.addBlockActionOverride(override)
-        updateOverrides()
+        addOverride(override)
     }
 
     /**
@@ -457,9 +501,10 @@ class BlockActionsViewModel @Inject constructor(
         }
         replaceOverrides { override ->
             if (override.overrideId?.idStr == id) {
-                override.hosts = listToSdkStringList(hosts)
+                copyOverride(override).also { it.hosts = listToSdkStringList(hosts) }
+            } else {
+                override
             }
-            override
         }
     }
 
@@ -471,22 +516,21 @@ class BlockActionsViewModel @Inject constructor(
      * creates an app split rule in one of the three modes; see [AppRuleMode]
      */
     fun createAppRule(appId: String, mode: AppRuleMode) {
-        val device = deviceManager.device ?: return
         val override = BlockActionOverride()
         override.overrideId = Sdk.newId()
         val appIds = listToSdkStringList(listOf(appId))
         override.appIds = appIds
         override.routeOverride = mode.toRouteOverride()
-        device.addBlockActionOverride(override)
-        updateOverrides()
+        addOverride(override)
     }
 
     fun updateAppRule(id: String, mode: AppRuleMode) {
         replaceOverrides { override ->
             if (override.overrideId?.idStr == id) {
-                override.routeOverride = mode.toRouteOverride()
+                copyOverride(override).also { it.routeOverride = mode.toRouteOverride() }
+            } else {
+                override
             }
-            override
         }
     }
 
@@ -494,31 +538,87 @@ class BlockActionsViewModel @Inject constructor(
         removeOverride(id)
     }
 
+    /**
+     * The mutations below each land in exactly one place, the live device or
+     * the persisted list; see [DeviceManager.editBlockActionOverrides]
+     */
+    private fun addOverride(override: BlockActionOverride) {
+        val id = override.overrideId?.idStr
+        deviceManager.editBlockActionOverrides(
+            live = { device -> device.addBlockActionOverride(override) },
+            // replaces any override with the same id, as the device does
+            persisted = { current ->
+                rebuildOverrides(current) { it.takeIf { existing -> existing.overrideId?.idStr != id } }
+                    .also { it.add(override) }
+            },
+        )
+        updateOverrides()
+    }
+
     private fun removeOverride(id: String) {
-        val device = deviceManager.device ?: return
-        val list = device.blockActionOverrides ?: return
-        val n = list.len()
-        for (i in 0 until n) {
-            val override = list.get(i) ?: continue
-            if (override.overrideId?.idStr == id) {
-                device.removeBlockActionOverride(override.overrideId)
-                break
-            }
-        }
+        deviceManager.editBlockActionOverrides(
+            live = { device ->
+                val list = device.blockActionOverrides
+                val n = list?.len() ?: 0
+                for (i in 0 until n) {
+                    val override = list?.get(i) ?: continue
+                    if (override.overrideId?.idStr == id) {
+                        device.removeBlockActionOverride(override.overrideId)
+                        break
+                    }
+                }
+            },
+            persisted = { current ->
+                current?.let { list ->
+                    rebuildOverrides(list) { it.takeIf { existing -> existing.overrideId?.idStr != id } }
+                }
+            },
+        )
         updateOverrides()
     }
 
     private fun replaceOverrides(transform: (BlockActionOverride) -> BlockActionOverride) {
-        val device = deviceManager.device ?: return
-        val list = device.blockActionOverrides ?: return
-        val next = BlockActionOverrideList()
-        val n = list.len()
-        for (i in 0 until n) {
-            val override = list.get(i) ?: continue
-            next.add(transform(override))
-        }
-        device.setBlockActionOverrides(next)
+        deviceManager.editBlockActionOverrides(
+            live = { device ->
+                device.blockActionOverrides?.let { list ->
+                    device.setBlockActionOverrides(rebuildOverrides(list, transform))
+                }
+            },
+            persisted = { current -> current?.let { rebuildOverrides(it, transform) } },
+        )
         updateOverrides()
+    }
+
+    /**
+     * a new list of the overrides passed through [transform]; a null result
+     * drops the override
+     */
+    private fun rebuildOverrides(
+        list: BlockActionOverrideList?,
+        transform: (BlockActionOverride) -> BlockActionOverride?,
+    ): BlockActionOverrideList {
+        val next = BlockActionOverrideList()
+        val n = list?.len() ?: 0
+        for (i in 0 until n) {
+            val override = list?.get(i) ?: continue
+            transform(override)?.let { next.add(it) }
+        }
+        return next
+    }
+
+    /**
+     * a copy to edit. An override read from a live device is the device's own
+     * object, so setting a field on it edits the device's state outside the
+     * device's lock, before setBlockActionOverrides ever sees the change
+     */
+    private fun copyOverride(override: BlockActionOverride): BlockActionOverride {
+        val copy = BlockActionOverride()
+        copy.overrideId = override.overrideId
+        copy.hosts = override.hosts
+        copy.appIds = override.appIds
+        copy.blockOverride = override.blockOverride
+        copy.routeOverride = override.routeOverride
+        return copy
     }
 
     override fun onCleared() {

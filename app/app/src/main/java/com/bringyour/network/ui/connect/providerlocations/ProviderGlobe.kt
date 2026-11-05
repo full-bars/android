@@ -8,6 +8,7 @@ import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -19,14 +20,27 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.focus.focusTarget
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import com.bringyour.network.ui.connect.EXTENDER_RING_GAP_DP
+import com.bringyour.network.ui.connect.EXTENDER_RING_STROKE_DP
+import com.bringyour.network.ui.connect.ExtenderRingGeometry
+import com.bringyour.network.ui.connect.drawExtenderDot
+import com.bringyour.network.ui.connect.extenderRingGeometry
+import com.bringyour.network.ui.components.focusRing
 import com.bringyour.network.ui.theme.Black
 import com.bringyour.network.ui.theme.OffWhite
 import kotlinx.coroutines.Dispatchers
@@ -78,7 +92,38 @@ private const val WHEEL_STEP_WIDTH_FRACTION = 0.18f
 // dimension (the height here) and centers, so it is never cropped
 private const val GLOBE_HEIGHT_FRACTION = 0.75f
 private const val GLOBE_ASPECT = 1f / GLOBE_HEIGHT_FRACTION
+
+/**
+ * The share of the available height the globe may take. The list below it
+ * needs the rest; on a phone the width always wins this comparison, so the
+ * phone globe is exactly the full-width globe it has always been.
+ */
+private const val GLOBE_MAX_HEIGHT_FRACTION = 0.5f
+
+/**
+ * Width of the globe box for a container [maxWidth] × [maxHeight] and an
+ * optional width cap [contentWidth] (the tablet content column). The globe is
+ * as wide as the container until either the cap or the height share binds, so
+ * on a tablet in portrait it stays inside the content column and on a tablet
+ * in landscape it leaves room for the rows, while a phone (or a tablet mini in
+ * portrait) still gets the full width.
+ */
+fun providerGlobeWidth(maxWidth: Dp, maxHeight: Dp, contentWidth: Dp? = null): Dp {
+    val byHeight = maxHeight * GLOBE_MAX_HEIGHT_FRACTION * GLOBE_ASPECT
+    val cap = contentWidth?.let { minOf(it, maxWidth) } ?: maxWidth
+    return minOf(cap, byHeight)
+}
 private const val WORLD_TOPOLOGY_ASSET = "world-110m.json"
+
+/**
+ * The wheel step an arrow key takes on the focused globe, positive east as a
+ * drag's: Right steps east, Left west, and any other key none. Pure, for tests.
+ */
+fun globeKeyStep(key: Key): Int = when (key) {
+    Key.DirectionRight -> 1
+    Key.DirectionLeft -> -1
+    else -> 0
+}
 
 /**
  * The rotation the globe is animating toward, identified by the provider it
@@ -162,7 +207,7 @@ fun ProviderGlobe(
     // Keyed on the whole target, not just the selected id: a provider whose
     // coordinates arrive after its row did must still pull the globe over.
     // Restarting this effect cancels the in-flight animateTo, which leaves the
-    // Animatable at its current value AND velocity — which is exactly what the
+    // Animatable at its current value and velocity — which is exactly what the
     // spring below then continues from.
     LaunchedEffect(centerTarget) {
         if (centerTarget != null) {
@@ -189,6 +234,29 @@ fun ProviderGlobe(
         modifier = modifier
             .fillMaxWidth()
             .aspectRatio(GLOBE_ASPECT)
+            // the keyboard steps the wheel as a drag does, Left and Right one
+            // provider at a time (adaptive app quality, Drawable_Focus): the
+            // globe takes focus while it has providers to step through
+            .then(
+                if (plottable.isNotEmpty()) {
+                    Modifier
+                        .focusRing(shape = RoundedCornerShape(16.dp))
+                        .focusTarget()
+                        .onKeyEvent { event ->
+                            val step = globeKeyStep(event.key)
+                            if (step == 0) {
+                                false
+                            } else {
+                                if (event.type == KeyEventType.KeyDown) {
+                                    currentOnStep(step)
+                                }
+                                true
+                            }
+                        }
+                } else {
+                    Modifier
+                }
+            )
             // GLOBE_SCALE already keeps every draw inside the box; this is the
             // backstop so a Canvas (which does not clip) can never paint over
             // the rows above and below
@@ -321,8 +389,12 @@ fun ProviderGlobe(
         // Provider dots. The selected one is held back and drawn last so it is
         // never covered by a dot that happens to sit on top of it — providers
         // in one city land on the same pixel.
+        //
+        // A provider reached through extenders carries their rings
+        // (EXTENDER.md K9), laid out at the dot's size in the 600-unit space
+        // and scaled with everything else; see providerGlobeDotGeometry.
+        var selectedRow: ProviderLocationRow? = null
         var selectedCenter: Offset? = null
-        var selectedColor: Color? = null
         plottable.forEach { row ->
             val point = GlobeGeometry.project(
                 row.lon!!.toFloat(),
@@ -331,21 +403,32 @@ fun ProviderGlobe(
                 phi,
                 currentScale,
             ) ?: return@forEach
-            val color = providerColor(row, getLocationColor)
             val center = canvas(point)
             if (row.clientId == selectedClientId) {
+                selectedRow = row
                 selectedCenter = center
-                selectedColor = color
             } else {
-                drawCircle(color = color, radius = DOT_RADIUS * unit, center = center)
+                drawExtenderDot(
+                    center = center,
+                    geometry = providerGlobeDotGeometry(row, unit),
+                    color = providerColor(row, getLocationColor),
+                    ringArgb = row.extenderRingArgb,
+                )
             }
         }
+        val row = selectedRow
         val center = selectedCenter
-        val color = selectedColor
-        if (center != null && color != null) {
+        if (row != null && center != null) {
+            val color = providerColor(row, getLocationColor)
             // a darker core inside its own full-strength ring: the selection
-            // reads at a glance without changing which country color it is
-            drawCircle(color = color.darkenForSelection(), radius = DOT_RADIUS * unit, center = center)
+            // reads at a glance without changing which country color it is.
+            // The extender rings keep their own colors.
+            drawExtenderDot(
+                center = center,
+                geometry = providerGlobeDotGeometry(row, unit),
+                color = color.darkenForSelection(),
+                ringArgb = row.extenderRingArgb,
+            )
             drawCircle(
                 color = color,
                 radius = SELECTED_RING_RADIUS * unit,
@@ -355,6 +438,23 @@ fun ProviderGlobe(
         }
     }
 }
+
+/**
+ * A provider's globe dot and its extender rings in canvas px: the connect
+ * grid's geometry (EXTENDER.md K2) at the dot's size in the 600-unit space,
+ * with K2's stroke and gap taken as globe units, and every length times [unit]
+ * as the rest of the globe is, so the rings shrink with the globe instead of
+ * crowding out a small dot. A dot this size holds one ring at full stroke, so
+ * a second extender dashes it rather than thinning both (K9).
+ */
+fun providerGlobeDotGeometry(row: ProviderLocationRow, unit: Float): ExtenderRingGeometry =
+    extenderRingGeometry(
+        cellSizePx = 2f * DOT_RADIUS * unit,
+        extenderCount = row.extenderRingArgb.size,
+        strokePx = EXTENDER_RING_STROKE_DP * unit,
+        gapPx = EXTENDER_RING_GAP_DP * unit,
+        dropToFit = true,
+    )
 
 /**
  * Draws one lon/lat polyline, breaking it wherever it crosses the horizon so

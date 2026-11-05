@@ -1,5 +1,7 @@
 package com.bringyour.network.ui.login
 
+import com.bringyour.network.ui.components.FoldSafeModalBottomSheet
+import com.bringyour.network.ui.components.rememberFoldSafeSheetState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -10,11 +12,9 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SheetState
 import androidx.compose.material3.Text
-import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.rememberCoroutineScope
@@ -25,6 +25,7 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
+import com.bringyour.network.LoginRequest
 import com.bringyour.network.MainApplication
 import com.bringyour.network.R
 import com.bringyour.network.ui.components.URButton
@@ -40,12 +41,10 @@ import kotlinx.coroutines.launch
 fun AuthCodeLoginSheet(
     isPresenting: Boolean,
     setIsPresenting: (Boolean) -> Unit,
-    onLogin: (String) -> Unit, // network jwt
+    onLogin: (LoginRequest, String) -> Unit, // network jwt
     viewModel: AuthCodeLoginSheetViewModel = hiltViewModel()
 ) {
-    val sheetState = rememberModalBottomSheetState(
-        skipPartiallyExpanded = true
-    )
+    val sheetState = rememberFoldSafeSheetState()
 
     LaunchedEffect(isPresenting) {
         if (!isPresenting) {
@@ -88,7 +87,7 @@ fun AuthCodeLoginSheet(
     authCodeLoginLoading: Boolean,
     authCodeLoginError: String?,
     sheetState: SheetState,
-    onLogin: (String) -> Unit, // network jwt
+    onLogin: (LoginRequest, String) -> Unit, // network jwt
 ) {
 
     val scope = rememberCoroutineScope()
@@ -97,7 +96,7 @@ fun AuthCodeLoginSheet(
 
     if (isPresenting) {
 
-        ModalBottomSheet(
+        FoldSafeModalBottomSheet(
             onDismissRequest = {
                 setIsPresenting(false)
             },
@@ -135,18 +134,20 @@ fun AuthCodeLoginSheet(
 
                 URButton(
                     onClick = {
+                        val request = application?.beginLoginRequest() ?: return@URButton
                         authCodeLogin(
-                            application?.api,
+                            request.api,
                             {},
                             { result ->
-                                onLogin(result.jwt)
-
-                                scope.launch { sheetState.hide() }.invokeOnCompletion {
-
-                                    if (!sheetState.isVisible) {
-                                        setIsPresenting(false)
+                                application.dispatchLoginResult(request) {
+                                    onLogin(request, result.jwt)
+                                    scope.launch {
+                                        if (!application.ownsLoginRequest(request)) return@launch
+                                        sheetState.hide()
+                                        if (application.ownsLoginRequest(request) && !sheetState.isVisible) {
+                                            setIsPresenting(false)
+                                        }
                                     }
-
                                 }
                             }
                         )
@@ -196,7 +197,7 @@ private fun AuthCodeLoginSheetPreview() {
                 AuthCodeLoginSheet(
                     isPresenting = true,
                     setIsPresenting = {},
-                    onLogin = {}
+                    onLogin = { _, _ -> }
                 )
             }
         }

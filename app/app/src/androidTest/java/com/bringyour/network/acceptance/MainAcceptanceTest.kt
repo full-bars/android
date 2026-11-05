@@ -8,6 +8,7 @@ import android.os.Build
 import android.util.Base64
 import android.util.Log
 import androidx.compose.ui.test.SemanticsMatcher
+import androidx.compose.ui.test.ComposeTimeoutException
 import androidx.compose.ui.test.hasAnyDescendant
 import androidx.compose.ui.test.hasClickAction
 import androidx.compose.ui.test.hasContentDescription
@@ -27,11 +28,15 @@ import androidx.test.uiautomator.UiDevice
 import com.bringyour.network.BuildConfig
 import com.bringyour.network.LoginActivity
 import com.bringyour.network.MainApplication
+import com.bringyour.network.R
 import com.bringyour.network.ui.POST_LOGIN_INTRO_CLOSE_TAG
+import com.bringyour.network.ui.POST_LOGIN_MAIN_READY_TAG
+import com.bringyour.network.ui.POST_LOGIN_OVERLAY_CLOSE_TAG
 import com.bringyour.network.ui.POST_LOGIN_WELCOME_ENTER_TAG
 import com.bringyour.network.ui.PostLoginUiAction
 import com.bringyour.network.ui.nextPostLoginUiAction
 import com.bringyour.network.ui.performTransientUiActionIfPresent
+import com.bringyour.network.ui.login.ACCEPTANCE_CREATE_NETWORK_ERROR_TAG
 import com.bringyour.network.ui.login.ACCEPTANCE_INSTANT_ERROR_TAG
 import com.bringyour.sdk.Sdk
 import java.io.File
@@ -48,7 +53,10 @@ import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
 class MainAcceptanceTest {
-    @get:Rule
+    @get:Rule(order = 0)
+    val logFlush = AcceptanceLogFlushRule(Sdk::flushGlog)
+
+    @get:Rule(order = 1)
     val compose = createEmptyComposeRule()
 
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
@@ -95,22 +103,47 @@ class MainAcceptanceTest {
             .isNotEmpty()
 
     private fun waitForTag(tag: String, timeoutMillis: Long = UI_TIMEOUT_MILLIS) {
-        waitFor("UI tag $tag", timeoutMillis) { tagExists(tag) }
+        waitFor("UI tag $tag", timeoutMillis) {
+            pollWithPasswordTagReady(tag) { tagExists(tag) }
+        }
+    }
+
+    private fun pollWithPasswordTagReady(tag: String, condition: () -> Boolean): Boolean =
+        if (tag.startsWith("acceptance.password.")) {
+            device.pollWithVerifiedAutofillSaveDismissed(condition)
+        } else {
+            condition()
+        }
+
+    private fun <T> withPasswordTagReady(tag: String, action: () -> T): T =
+        if (tag.startsWith("acceptance.password.")) {
+            device.withVerifiedAutofillSaveDismissed(action)
+        } else {
+            action()
+        }
+
+    private fun clickPasswordTag(tag: String) {
+        withPasswordTagReady(tag) {
+            compose.performEnabledSemanticsClick(tag, AUTH_TIMEOUT_MILLIS)
+        }
     }
 
     private fun waitForEitherTag(first: String, second: String, timeoutMillis: Long = AUTH_TIMEOUT_MILLIS): String {
         var result = ""
+        val passwordTag = if (first.startsWith("acceptance.password.")) first else second
         waitFor("UI tag $first or $second", timeoutMillis) {
-            when {
-                tagExists(first) -> {
-                    result = first
-                    true
+            pollWithPasswordTagReady(passwordTag) {
+                when {
+                    tagExists(first) -> {
+                        result = first
+                        true
+                    }
+                    tagExists(second) -> {
+                        result = second
+                        true
+                    }
+                    else -> false
                 }
-                tagExists(second) -> {
-                    result = second
-                    true
-                }
-                else -> false
             }
         }
         return result
@@ -145,9 +178,11 @@ class MainAcceptanceTest {
 
     private fun replaceTagText(tag: String, value: String) {
         waitForTag(tag)
-        compose.onNodeWithTag(tag, useUnmergedTree = true)
-            .assertExists()
-            .performTextReplacement(value)
+        withPasswordTagReady(tag) {
+            compose.onNodeWithTag(tag, useUnmergedTree = true)
+                .assertExists()
+                .performTextReplacement(value)
+        }
     }
 
     private fun launchLoggedOutApp() {
@@ -166,7 +201,7 @@ class MainAcceptanceTest {
         welcomeEnterPresent = tagExists(POST_LOGIN_WELCOME_ENTER_TAG),
         introClosePresent = tagExists(POST_LOGIN_INTRO_CLOSE_TAG),
         closePresent = contentDescriptionExists("close"),
-        closeOverlayPresent = contentDescriptionExists("Close Overlay"),
+        closeOverlayPresent = tagExists(POST_LOGIN_OVERLAY_CLOSE_TAG),
     )
 
     private fun dismissPostLoginUiAction(action: PostLoginUiAction) {
@@ -174,7 +209,7 @@ class MainAcceptanceTest {
             PostLoginUiAction.WelcomeEnter -> hasTestTag(POST_LOGIN_WELCOME_ENTER_TAG)
             PostLoginUiAction.IntroClose -> hasTestTag(POST_LOGIN_INTRO_CLOSE_TAG)
             PostLoginUiAction.Close -> hasContentDescription("close")
-            PostLoginUiAction.CloseOverlay -> hasContentDescription("Close Overlay")
+            PostLoginUiAction.CloseOverlay -> hasTestTag(POST_LOGIN_OVERLAY_CLOSE_TAG)
         }
         val matcher = clickableMatcher(target)
         performTransientUiActionIfPresent(
@@ -185,16 +220,36 @@ class MainAcceptanceTest {
         )
     }
 
-    private fun waitForMain() {
+    private fun waitForMain(passwordSignup: Boolean = false) {
         // Post-login surfaces are asynchronous and can appear in sequence. A
         // one-shot scan can observe the gap between them and then wait forever
         // for navigation hidden below the next surface. Keep advancing until
         // navigation is present with no dismissable surface above it.
-        val deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(AUTH_TIMEOUT_MILLIS)
-        while (true) {
-            val action = postLoginUiAction()
-            if (action == null && tagExists("acceptance.nav.connect")) break
-            if (System.nanoTime() >= deadlineNanos) {
+        waitForMainUi(object : MainUiWaitDriver {
+            override fun nowNanos(): Long = System.nanoTime()
+
+            override fun observe(): MainUiWaitEvidence {
+                val action = postLoginUiAction()
+                return MainUiWaitEvidence(
+                    action = action,
+                    mainNavigationPresent = action == null && tagExists("acceptance.nav.connect"),
+                    signupFormErrorPresent = passwordSignup && tagExists(ACCEPTANCE_CREATE_NETWORK_ERROR_TAG),
+                    mainNavigationReady = tagExists(POST_LOGIN_MAIN_READY_TAG),
+                )
+            }
+
+            override fun dismiss(action: PostLoginUiAction) = dismissPostLoginUiAction(action)
+            override fun waitForIdle() = compose.waitForIdle()
+            override fun waitUntil(timeoutMillis: Long, condition: () -> Boolean) {
+                try {
+                    compose.waitUntil(timeoutMillis, condition)
+                } catch (_: ComposeTimeoutException) {
+                    // The shared wait owns the overall deadline. Only this
+                    // bounded poll timeout is expected; driver failures escape.
+                }
+            }
+
+            override fun timeout(): Nothing {
                 val state = (context.applicationContext as MainApplication).loginStartupState.value
                 throwLoginStartupTimeout(
                     state,
@@ -205,21 +260,7 @@ class MainAcceptanceTest {
                     Sdk.writeGoroutineStacks(startupGoroutinesFile.absolutePath)
                 }
             }
-
-            if (action != null) dismissPostLoginUiAction(action)
-            compose.waitForIdle()
-
-            val remainingMillis = TimeUnit.NANOSECONDS
-                .toMillis(deadlineNanos - System.nanoTime())
-                .coerceIn(1, 1_000)
-            runCatching {
-                compose.waitUntil(remainingMillis) {
-                    val currentAction = postLoginUiAction()
-                    (currentAction == null && tagExists("acceptance.nav.connect")) ||
-                        currentAction != action
-                }
-            }
-        }
+        }, AUTH_TIMEOUT_MILLIS)
         clickTag("acceptance.nav.connect")
         waitForTag("acceptance.connect", AUTH_TIMEOUT_MILLIS)
     }
@@ -274,7 +315,7 @@ class MainAcceptanceTest {
     ) {
         waitForTag("acceptance.password.input", AUTH_TIMEOUT_MILLIS)
         replaceTagText("acceptance.password.input", password)
-        compose.performEnabledSemanticsClick("acceptance.password.submit", AUTH_TIMEOUT_MILLIS)
+        clickPasswordTag("acceptance.password.submit")
         if (verificationCode != null) {
             val destination = waitForEitherTag("acceptance.nav.connect", "acceptance.verify.code")
             if (destination == "acceptance.verify.code") {
@@ -293,7 +334,7 @@ class MainAcceptanceTest {
     ) {
         log("sign in with acceptance account through local UI")
         replaceTagText("acceptance.password.user", user)
-        compose.performEnabledSemanticsClick("acceptance.password.next", AUTH_TIMEOUT_MILLIS)
+        clickPasswordTag("acceptance.password.next")
         completePasswordPrompt(password, verificationCode, retainClient)
     }
 
@@ -328,12 +369,18 @@ class MainAcceptanceTest {
         val api = application.api ?: throw AssertionError("network delete has no active API")
         val complete = CountDownLatch(1)
         var failure: Throwable? = null
-        api.networkDelete { _, error ->
+        var refusal: String? = null
+        api.networkDelete { result, error ->
             failure = error
+            // the server refuses a deletion with an error in the result
+            if (error == null && (result == null || result.error != null)) {
+                refusal = result?.error?.message ?: "no result"
+            }
             complete.countDown()
         }
         check(complete.await(45, TimeUnit.SECONDS)) { "network delete timed out" }
         failure?.let { throw AssertionError("network delete failed", it) }
+        refusal?.let { throw AssertionError("network delete refused: $it") }
         instrumentation.runOnMainSync { application.logout() }
     }
 
@@ -343,7 +390,7 @@ class MainAcceptanceTest {
     ) {
         repeat(2) { attempt ->
             replaceTagText("acceptance.password.user", userAuth)
-            compose.performEnabledSemanticsClick("acceptance.password.next", AUTH_TIMEOUT_MILLIS)
+            clickPasswordTag("acceptance.password.next")
             when (waitForEitherTag("acceptance.create.network", "acceptance.password.input")) {
                 "acceptance.create.network" -> return
                 else -> {
@@ -374,8 +421,10 @@ class MainAcceptanceTest {
         replaceTagText("acceptance.create.network", networkName)
         replaceTagText("acceptance.create.password", inputs.password)
         clickTag("acceptance.create.terms")
-        compose.performEnabledSemanticsClick("acceptance.create.submit", AUTH_TIMEOUT_MILLIS)
-        waitForMain()
+        submitPasswordSignupAndWait(
+            submit = { compose.performEnabledSemanticsClick("acceptance.create.submit", AUTH_TIMEOUT_MILLIS) },
+            waitForMain = { waitForMain(passwordSignup = true) },
+        )
         val createdNetwork = currentNetworkId()
         capture("$iteration-$method-signup")
 
@@ -445,7 +494,7 @@ class MainAcceptanceTest {
         clickTag("acceptance.connect")
         device.clickVerifiedVpnConsentIfPresent()
         waitFor("connected status", CONNECT_TIMEOUT_MILLIS) {
-            contentDescriptionExists("Connected")
+            contentDescriptionExists(context.getString(R.string.connected))
         }
         capture("${iteration}-connected")
 
@@ -456,7 +505,7 @@ class MainAcceptanceTest {
         clickTag("acceptance.disconnect")
         waitForTag("acceptance.connect", CONNECT_TIMEOUT_MILLIS)
         waitFor("disconnected status", CONNECT_TIMEOUT_MILLIS) {
-            contentDescriptionExists("Disconnected")
+            contentDescriptionExists(context.getString(R.string.disconnected))
         }
         capture("${iteration}-disconnected")
     }
@@ -517,7 +566,7 @@ class MainAcceptanceTest {
             BuildConfig.URNETWORK_ACCEPTANCE_BUILD_ID,
         )
         assertEquals("acceptance APK must target the main environment", "main", BuildConfig.BRINGYOUR_BUNDLE_ENV_NAME)
-        assertEquals("acceptance APK must target the official network", "ur.network", BuildConfig.BRINGYOUR_BUNDLE_HOST_NAME)
+        assertEquals("acceptance APK must target the official network", "bringyour.com", BuildConfig.BRINGYOUR_BUNDLE_HOST_NAME)
 
         val repetitions = arguments.getString("repeat")?.toIntOrNull() ?: 1
         assertTrue("repeat must be positive", repetitions > 0)

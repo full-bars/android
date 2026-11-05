@@ -1,8 +1,11 @@
 package com.bringyour.network
 
+import android.util.Log
 import com.bringyour.network.ui.shared.models.ProvideControlMode
 import com.bringyour.network.ui.shared.models.ProvideNetworkMode
+import com.bringyour.sdk.BlockActionOverrideList
 import com.bringyour.sdk.DeviceLocal
+import com.bringyour.sdk.DnsResolverSettings
 import com.bringyour.sdk.LocalState
 import com.bringyour.sdk.NetworkSpace
 import com.bringyour.sdk.PerformanceProfile
@@ -34,24 +37,12 @@ internal sealed class DeviceConfigurationResult<out T> {
     data class Failed(val failure: DeviceInitFailure) : DeviceConfigurationResult<Nothing>()
 }
 
-/** Tries a stored identity once, then clears it before one default-key fallback. */
+/** Construction failure does not establish key invalidity; retain the supplied identity. */
 internal fun <T, K> createDeviceWithStoredKey(
     storedKey: K?,
-    clearStoredKey: () -> Unit,
     create: (K?) -> T?,
 ): DeviceCreationResult<T> {
-    if (storedKey == null) {
-        return runCatching { create(null) }.getOrNull()?.let { DeviceCreationResult.Created(it) }
-            ?: DeviceCreationResult.Failed(DeviceInitFailure.DEVICE_LOCAL_CREATION_FAILED)
-    }
-
-    runCatching { create(storedKey) }.getOrNull()?.let {
-        return DeviceCreationResult.Created(it)
-    }
-    if (runCatching(clearStoredKey).isFailure) {
-        return DeviceCreationResult.Failed(DeviceInitFailure.DEVICE_LOCAL_CONFIGURATION_FAILED)
-    }
-    return runCatching { create(null) }.getOrNull()?.let { DeviceCreationResult.Created(it) }
+    return runCatching { create(storedKey) }.getOrNull()?.let { DeviceCreationResult.Created(it) }
         ?: DeviceCreationResult.Failed(DeviceInitFailure.DEVICE_LOCAL_CREATION_FAILED)
 }
 
@@ -66,18 +57,51 @@ internal fun <T> configureCreatedDevice(
     DeviceConfigurationResult.Failed(DeviceInitFailure.DEVICE_LOCAL_CONFIGURATION_FAILED)
 }
 
+/**
+ * Turns on device local state auto save. A failure is reported and returned but never thrown:
+ * the device is still usable without it, only its preferences stop persisting.
+ */
+internal fun enableDeviceAutoSave(
+    setAutoSave: (Boolean) -> Unit,
+    onFailure: (Throwable) -> Unit,
+): Boolean = try {
+    setAutoSave(true)
+    true
+} catch (e: Exception) {
+    onFailure(e)
+    false
+}
+
 @Singleton
 class DeviceManager @Inject constructor(
-    private val jwtManager: JwtManager
+    private val jwtManager: JwtManager,
+    private val networkSpaceManagerProvider: NetworkSpaceManagerProvider,
 ) {
 
     companion object {
-        // per-device memory target passed where the device is created: split
-        // dns 2 : client 14 : provider 4 by ratio inside the sdk, with the
-        // provider share backing the client pair while providing is off. The
-        // process-level Sdk.setMemoryLimit (MainApplication) sizes the
-        // shared message pools and go soft limit separately.
-        const val DEVICE_MEMORY_TARGET_BYTE_COUNT = 24L * 1024 * 1024
+        private const val TAG = "DeviceManager"
+
+        // Per-device target passed at construction: DNS 2 parts, one shared
+        // 13-part transfer/topology root with overlapping client/provider/NAT
+        // children, and 5 parts for platform carriers. Process-level
+        // Sdk.setMemoryLimit (MainApplication) separately sizes the shared
+        // message pools, carrier root, and Go soft limit.
+        //
+        // Use the full selected allowance. The process soft limit is not a
+        // total-process footprint guarantee: pools/runtime/native memory are
+        // observed separately by MEMSTEADY and the physical iOS gate.
+        internal fun deviceMemoryTargetByteCount(profile: String): Long = when (profile) {
+            MainApplication.IOS_MEMORY_AUDIT_PROFILE -> 32L
+            MainApplication.LEGACY_IOS_MEMORY_AUDIT_PROFILE -> 20L
+            else -> 64L
+        } * 1024 * 1024
+        internal fun effectiveDeviceMemoryTargetByteCount(profile: String, processLimitMib: Long): Long =
+            minOf(deviceMemoryTargetByteCount(profile), processLimitMib * 1024 * 1024)
+        val DEVICE_MEMORY_TARGET_BYTE_COUNT: Long
+            get() = effectiveDeviceMemoryTargetByteCount(
+                MainApplication.MEMORY_PROFILE_NAME,
+                MainApplication.SDK_EFFECTIVE_PROCESS_MEMORY_LIMIT_MIB,
+            )
     }
 
     private val deviceLock = Any()
@@ -85,8 +109,15 @@ class DeviceManager @Inject constructor(
     // set by the application; fired when the sdk detects the stored auth is
     // no longer valid on the server (e.g. the client was removed) and has
     // cleared the local auth state. The app must log out and return to the
-    // login flow.
-    var onAuthLogout: (() -> Unit)? = null
+    // login flow. The cause is the device's (Device.getAuthLogoutCause):
+    // Sdk.AuthLogoutCauseSessionRevoked when the server confirmed another
+    // device signed this session out, else "".
+    var onAuthLogout: ((device: DeviceLocal, cause: String) -> Unit)? = null
+
+    // set by the application; fired on the sdk's thread as the sdk's logout
+    // begins, before onAuthLogout, with the device it signs out: from here no
+    // connect is admitted on it (ConnectCommands.signOutStarted)
+    var onLogoutStarted: ((device: DeviceLocal) -> Unit)? = null
 
     @Volatile var device: DeviceLocal? = null
         private set
@@ -102,7 +133,7 @@ class DeviceManager @Inject constructor(
 
     // Device lifecycle listeners: view models wire their SDK subscriptions per
     // device, and the device is (re)created asynchronously (login, network
-    // change) — an init-time `device?.let` silently wires NOTHING when the view
+    // change) — an init-time `device?.let` silently wires nothing when the view
     // model is created first. Sequencing prevents a delayed notification for a
     // retired device from arriving after its replacement.
     private val deviceChanges = SequencedValueListeners<DeviceLocal?>(null)
@@ -111,8 +142,10 @@ class DeviceManager @Inject constructor(
         return deviceChanges.add(listener)
     }
 
-    val networkSpace get() = device?.networkSpace
-    val asyncLocalState get() = device?.networkSpace?.asyncLocalState
+    val networkSpace get() = synchronized(deviceLock) {
+        device?.networkSpace ?: networkSpaceManagerProvider.getNetworkSpace()
+    }
+    val asyncLocalState get() = networkSpace?.asyncLocalState
 
     var routeLocal: Boolean
         get() = synchronized(deviceLock) { device?.routeLocal ?: true }
@@ -172,6 +205,25 @@ class DeviceManager @Inject constructor(
             device?.vpnInterfaceWhileOffline = it
         }
 
+    var blockerEnabled: Boolean
+        get() = synchronized(deviceLock) {
+            SplitRulePersistencePolicy.resolveEffectiveBlocker(
+                liveBlocker = device?.blockerEnabled,
+                storedBlocker = asyncLocalState?.localState?.blockerEnabled,
+            )
+        }
+        set(it) = synchronized(deviceLock) {
+            val plan = SplitRulePersistencePolicy.planWrite(isDeviceConnected = device != null)
+            if (plan.applyLive) {
+                device?.blockerEnabled = it
+            }
+            if (plan.persistToStorage) {
+                asyncLocalState?.localState?.let { localState ->
+                    runCatching { localState.blockerEnabled = it }
+                }
+            }
+        }
+
     var performanceProfile: PerformanceProfile?
         get() = synchronized(deviceLock) {
             device?.performanceProfile ?: asyncLocalState?.localState?.performanceProfile
@@ -196,12 +248,103 @@ class DeviceManager @Inject constructor(
             }
         }
 
+    /**
+     * The effective overrides: the live device's when there is a device (an
+     * empty list is an answer, not a reason to fall back), else the persisted
+     * list (signed out, or before the device is created)
+     */
+    val blockActionOverrides: BlockActionOverrideList?
+        get() = synchronized(deviceLock) {
+            SplitRulePersistencePolicy.resolveEffective(
+                livePresent = device != null,
+                live = device?.blockActionOverrides,
+                stored = asyncLocalState?.localState?.blockActionOverrides,
+            )
+        }
+
+    /**
+     * Applies an overrides edit to exactly one place. A live device persists
+     * its own overrides on the serial local state queue, so a second,
+     * synchronous write from here races that queue: a read-modify-write over
+     * a file the queue has not flushed yet duplicates or resurrects rules.
+     * Without a device the persisted list is edited directly. Holding
+     * [deviceLock] serializes an edit with [initDevice] handing the persisted
+     * list to a new device, so an edit made while connecting is not lost.
+     *
+     * @return false when there was nowhere to apply the edit
+     */
+    fun editBlockActionOverrides(
+        live: (DeviceLocal) -> Unit,
+        persisted: (BlockActionOverrideList?) -> BlockActionOverrideList?,
+    ): Boolean {
+        synchronized(deviceLock) {
+            val plan = SplitRulePersistencePolicy.planWrite(isDeviceConnected = device != null)
+            when {
+                plan.applyLive -> {
+                    val liveDevice = device ?: return false
+                    live(liveDevice)
+                    return true
+                }
+                else -> {
+                    val localState = asyncLocalState?.localState ?: return false
+                    val next = persisted(localState.blockActionOverrides) ?: return true
+                    return runCatching { localState.blockActionOverrides = next }.isSuccess
+                }
+            }
+        }
+    }
+
+    /**
+     * The effective dns resolver settings: the live device's, else the
+     * persisted settings. The device reports none while its dns upgrade mux is
+     * disabled, and then the persisted settings show through
+     */
+    val dnsResolverSettings: DnsResolverSettings?
+        get() = synchronized(deviceLock) {
+            SplitRulePersistencePolicy.resolveEffective(
+                livePresent = device?.dnsResolverSettings != null,
+                live = device?.dnsResolverSettings,
+                stored = asyncLocalState?.localState?.dnsResolverSettings,
+            )
+        }
+
+    /**
+     * Applies dns resolver settings to exactly one place; see
+     * [editBlockActionOverrides]. The device persists the settings only when
+     * it accepts them, and with its dns upgrade mux disabled it accepts none,
+     * so in that case they are persisted here for the next device.
+     *
+     * @return false when there was nowhere to apply the settings
+     */
+    fun applyDnsResolverSettings(settings: DnsResolverSettings): Boolean {
+        synchronized(deviceLock) {
+            val plan = SplitRulePersistencePolicy.planWrite(isDeviceConnected = device != null)
+            when {
+                plan.applyLive -> {
+                    val liveDevice = device ?: return false
+                    liveDevice.dnsResolverSettings = settings
+                    if (liveDevice.dnsResolverSettings != null) {
+                        return true
+                    }
+                    // device declined (e.g. dns upgrade mux disabled) — fall
+                    // through to persist for the next device
+                }
+                else -> {}
+            }
+            val localState = asyncLocalState?.localState ?: return false
+            return runCatching { localState.dnsResolverSettings = settings }.isSuccess
+        }
+    }
+
     fun initDevice(
         networkSpace: NetworkSpace?,
         byClientJwt: String,
         deviceDescription: String,
         deviceSpec: String
     ): DeviceInitResult {
+        // A retired device must retain its original application session owner,
+        // even if its already admitted listener runs after the next init.
+        val onAuthLogout = onAuthLogout
         if (networkSpace == null) {
             clearDevice()
             return DeviceInitResult.Failed(DeviceInitFailure.MISSING_NETWORK_SPACE)
@@ -233,10 +376,16 @@ class DeviceManager @Inject constructor(
         val performanceProfile = localState.performanceProfile
 
         val provideSecretKeys = localState.provideSecretKeys
-        val keyMaterial = localState.deviceLocalKeyMaterial
+        val keyMaterial = try {
+            // The compatibility getter hides read failures as missing keys.
+            // Only a successful checked read may authorize a fresh identity.
+            checkNotNull(localState.readDeviceLocalKeyMaterial()).keyMaterial
+        } catch (_: Throwable) {
+            clearDevice()
+            return DeviceInitResult.Failed(DeviceInitFailure.DEVICE_LOCAL_CONFIGURATION_FAILED)
+        }
         val creation = createDeviceWithStoredKey(
             storedKey = keyMaterial,
-            clearStoredKey = { localState.deviceLocalKeyMaterial = null },
             create = { retainedKeyMaterial ->
                 if (retainedKeyMaterial == null) {
                     createDeviceLocalWithDefaults(
@@ -256,8 +405,9 @@ class DeviceManager @Inject constructor(
                         instanceId,
                         false,
                         retainedKeyMaterial,
-                        // per-device memory target (split dns 2 : client 14 :
-                        // provider 4); the process pools are sized by setMemoryLimit
+                        // Per-device DNS 2 + shared transfer/topology 13 +
+                        // platform carriers 5 target; process pools and the
+                        // shared carrier root are sized by setMemoryLimit.
                         DEVICE_MEMORY_TARGET_BYTE_COUNT,
                     )
                 }
@@ -276,6 +426,33 @@ class DeviceManager @Inject constructor(
                 synchronized(deviceLock) {
                     closeDeviceSubscriptionsLocked()
                     device?.close()
+
+                    // The sdk persists a device-side preference change (split
+                    // rules, app rules, dns resolver settings, blocker, ...)
+                    // only while auto save is enabled; it defaults off and its
+                    // Load never turns it on. Without this, every edit the app
+                    // routes to the live device is applied in memory and never
+                    // reaches the network space's local state, so the setting
+                    // is gone the moment the process dies. ios enables it the
+                    // same way in PacketTunnelProvider. SetAutoSave says to
+                    // call it before exposing rpc or user input and it neither
+                    // loads nor saves a snapshot itself, so it goes in before
+                    // the device is published below. It returns an error when
+                    // the device does not own its preference store; the device
+                    // still works then, it just cannot persist. The seeds
+                    // below are device setters too, so each one now saves the
+                    // value it was seeded with.
+                    enableDeviceAutoSave(
+                        setAutoSave = newDevice::setAutoSave,
+                        onFailure = {
+                            Log.e(
+                                TAG,
+                                "could not enable local state auto save; device preferences will not persist",
+                                it,
+                            )
+                        },
+                    )
+
                     device = newDevice
 
                     persistDeviceLocalKeyMaterial(localState, newDevice)
@@ -306,6 +483,17 @@ class DeviceManager @Inject constructor(
                     newDevice.provideNetworkMode = ProvideNetworkMode.toString(provideNetworkMode)
                     newDevice.canPromptIntroFunnel = canPromptIntroFunnel
                     newDevice.performanceProfile = performanceProfile
+                    newDevice.blockerEnabled = localState.blockerEnabled
+                    // read under the lock, not with the other snapshots above:
+                    // an edit made without a device (editBlockActionOverrides,
+                    // applyDnsResolverSettings) can land while the device is
+                    // being created, and a stale snapshot applied here would
+                    // be persisted by the device over that edit. Re-applying
+                    // through the setters also dedupes by override id and
+                    // installs the resolver ignore hosts, which the sdk's
+                    // creation-time load does not
+                    localState.blockActionOverrides?.let { newDevice.blockActionOverrides = it }
+                    localState.dnsResolverSettings?.let { newDevice.dnsResolverSettings = it }
 
                     addLocalStateChangeSubscriptionsLocked(localState, newDevice)
 
@@ -330,7 +518,12 @@ class DeviceManager @Inject constructor(
                     }
 
                     authLogoutSub = newDevice.addAuthLogoutListener {
-                        onAuthLogout?.invoke()
+                        // no connect is admitted on the device from here
+                        onLogoutStarted?.invoke(newDevice)
+                        // read here, on the sdk's thread, before the app posts
+                        // its logout: the device sets the cause before it
+                        // notifies its listeners
+                        onAuthLogout?.invoke(newDevice, newDevice.authLogoutCause.orEmpty())
                     }
                     deviceChanges.prepareUpdate(newDevice)
                 }
@@ -370,8 +563,9 @@ class DeviceManager @Inject constructor(
                 instanceId,
                 false,
                 null,
-                // per-device memory target (split dns 2 : client 14 :
-                // provider 4); the process pools are sized by setMemoryLimit
+                // Per-device DNS 2 + shared transfer/topology 13 + platform
+                // carriers 5 target; process pools and the shared carrier root
+                // are sized by setMemoryLimit.
                 DEVICE_MEMORY_TARGET_BYTE_COUNT
             )
         }.getOrNull()
@@ -442,6 +636,9 @@ class DeviceManager @Inject constructor(
                 }
             }
         })
+        // block action overrides and dns resolver settings are deliberately
+        // absent: the device persists both on its own serial local state queue,
+        // and a synchronous write from a change listener races that queue
     }
 
     fun clearDevice() {

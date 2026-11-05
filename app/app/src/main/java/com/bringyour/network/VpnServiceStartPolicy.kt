@@ -15,6 +15,8 @@ internal data class VpnServiceStartFacts(
     val redelivered: Boolean,
     val systemStart: Boolean,
     val commandCompatible: Boolean = true,
+    /** The user revoked the VPN in system settings and has not connected since. */
+    val revokeFenced: Boolean = false,
 )
 
 internal enum class VpnServiceStartDecision {
@@ -77,8 +79,10 @@ internal fun vpnServiceStartRetryEligible(
     serviceActive: Boolean,
     startPending: Boolean,
     foregroundActivityAvailable: Boolean,
+    revokeFenced: Boolean = false,
 ): Boolean =
-    retryRequested &&
+    !revokeFenced &&
+        retryRequested &&
         vpnRequired &&
         !serviceActive &&
         !startPending &&
@@ -101,20 +105,44 @@ internal fun decideVpnServiceLaunch(
     else -> VpnServiceLaunchDecision.START_FOREGROUND
 }
 
-private val TUNNEL_RETRY_DELAYS_MILLIS = longArrayOf(
-    250L,
-    1_000L,
-    2_000L,
-    5_000L,
-    10_000L,
-    30_000L,
-)
+/**
+ * Timing for keeping the VPN interface up. The defaults are the shipped
+ * behavior; tests and callers pass their own instance to change any of them.
+ */
+internal data class VpnTunnelTimingSettings(
+    /**
+     * The TUN establish retry delay by consecutive failure; the last entry
+     * repeats. Configuration rebuilds and the Always-on guard share it. A 0
+     * entry retries at once; a 0 last entry would retry a persistent failure
+     * in a loop.
+     */
+    val tunnelRetryDelaysMillis: List<Long> = listOf(250L, 1_000L, 2_000L, 5_000L, 10_000L, 30_000L),
+    /**
+     * How long an Always-on start waits for its connect request to take before
+     * asking again. The guard holds while that connect is outstanding; 0 asks
+     * again at once.
+     */
+    val alwaysOnConnectRetryMillis: Long = 30_000L,
+) {
+    init {
+        require(tunnelRetryDelaysMillis.isNotEmpty()) { "tunnelRetryDelaysMillis must not be empty" }
+    }
+}
 
 /** Infinite retry with a bounded delay: a transient TUN failure must not permanently stop VPN. */
-internal fun tunnelRetryDelayMillis(failureCount: Int): Long {
-    val index = failureCount.coerceIn(0, TUNNEL_RETRY_DELAYS_MILLIS.lastIndex)
-    return TUNNEL_RETRY_DELAYS_MILLIS[index]
+internal fun tunnelRetryDelayMillis(settings: VpnTunnelTimingSettings, failureCount: Int): Long {
+    val delays = settings.tunnelRetryDelaysMillis
+    return delays[failureCount.coerceIn(0, delays.lastIndex)]
 }
+
+internal const val PACKET_FLOW_STABLE_MILLIS = 30_000L
+
+/** A briefly established loop has not recovered; keep its retry history. */
+internal fun packetFlowRetryFailureCount(
+    failureCount: Int,
+    activeMillis: Long,
+    retryPending: Boolean,
+): Int = if (!retryPending && activeMillis >= PACKET_FLOW_STABLE_MILLIS) 0 else failureCount
 
 /**
  * A new process starts with MainApplication.serviceActive=false even when
@@ -123,7 +151,7 @@ internal fun tunnelRetryDelayMillis(failureCount: Int): Long {
  * is the authority. An ordinary stale app intent still cannot resurrect a VPN.
  */
 internal fun decideVpnServiceStart(facts: VpnServiceStartFacts): VpnServiceStartDecision {
-    if (!facts.commandCompatible || facts.stopRequested || !facts.startRequested) {
+    if (facts.revokeFenced || !facts.commandCompatible || facts.stopRequested || !facts.startRequested) {
         return VpnServiceStartDecision.STOP
     }
     // Android's Settings > Always-on VPN selection is an explicit system
@@ -143,6 +171,18 @@ internal fun decideVpnServiceStart(facts: VpnServiceStartFacts): VpnServiceStart
 }
 
 internal const val VPN_SERVICE_COMMAND_VERSION = 1
+
+/** Intent extra: the revoke-fence epoch the app admitted this start under. */
+internal const val VPN_START_FENCE_EPOCH_EXTRA = "fence_epoch"
+
+/**
+ * Whether a start intent was admitted after the last revoke. An intent that
+ * carries an epoch (the app's own start) must still match it; one that carries
+ * none (the system's Always-on start, a redelivery from an older build) has
+ * nothing to compare and is judged by the fence's current value alone.
+ */
+internal fun vpnStartEpochAdmitted(carried: Long?, admits: (Long) -> Boolean): Boolean =
+    carried == null || admits(carried)
 
 /**
  * Explicit app commands are versioned because Android can redeliver an Intent
@@ -164,9 +204,75 @@ internal fun vpnServiceSystemStart(source: String?, frameworkAlwaysOn: Boolean):
     return source != "app" || frameworkAlwaysOn
 }
 
-/** Hold a fail-closed interface until an always-on service has a live provider. */
+/**
+ * Hold a fail-closed interface while an always-on service has no device, or
+ * while the tunnel the device wants would escape (offline, or before the
+ * always-on connect is requested). Once connect is requested the capture
+ * tunnel already fails closed through a provider dip; swapping in the guard
+ * then would close the packet flow, blackhole the excluded apps and, when the
+ * allow/deny lists differ, make Android replace the VPN network twice.
+ */
 internal fun vpnAlwaysOnGuardRequired(
     systemAlwaysOn: Boolean,
     deviceAvailable: Boolean,
-    providerConnected: Boolean,
-): Boolean = systemAlwaysOn && (!deviceAvailable || !providerConnected)
+    wouldEscape: Boolean,
+): Boolean = systemAlwaysOn && (!deviceAvailable || wouldEscape)
+
+/**
+ * Every path that can bring the VPN back without the user asking. A revoke
+ * (the user turned the VPN off in system settings, or another VPN replaced
+ * ours) leaves provide enabled, so reconcile would otherwise restart the
+ * service at once; the fence holds all of these until [USER_CONNECT].
+ */
+internal enum class VpnReconnectEntry {
+    RECONCILE,
+    START_SERVICE,
+    FOREGROUND_RETRY,
+    RESTORE,
+    SYSTEM_START,
+    ALWAYS_ON_GUARD,
+    ALWAYS_ON_CONNECT,
+    BALANCE_RECOVERY,
+    /** ConnectViewModel, QuickConnect and the reconnect-tunnel action. */
+    USER_CONNECT,
+}
+
+/** Whether `entry` may reconnect while the revoke fence is [raised]. */
+internal fun vpnReconnectAllowed(entry: VpnReconnectEntry, raised: Boolean): Boolean =
+    !raised || entry == VpnReconnectEntry.USER_CONNECT
+
+internal enum class VpnInternalStopDecision {
+    STOP,
+    /** Tear the flow down, keep the service and its notification, retry the TUN. */
+    KEEP_AND_RETRY,
+}
+
+/**
+ * Whether a promoted service stops itself or stays up and retries the TUN.
+ * A required VPN (provide, connect or the kill switch) must not lose its
+ * foreground service to an internal stop while the app is backgrounded: the
+ * app cannot start it again from there. Not covered, and not asked here:
+ * replacement, onDestroy, the user's disconnect, the revoke fence, and a
+ * missing device (nothing to run, and the retry needs an adopted
+ * service with a configuration).
+ */
+internal fun decideInternalStop(
+    foregroundPromoted: Boolean,
+    ownsService: Boolean,
+    deviceBound: Boolean,
+    revokeFenced: Boolean,
+    provideEnabled: Boolean,
+    connectEnabled: Boolean,
+    routeLocal: Boolean,
+): VpnInternalStopDecision =
+    if (
+        foregroundPromoted &&
+        ownsService &&
+        deviceBound &&
+        !revokeFenced &&
+        vpnServiceRequired(provideEnabled, connectEnabled, routeLocal)
+    ) {
+        VpnInternalStopDecision.KEEP_AND_RETRY
+    } else {
+        VpnInternalStopDecision.STOP
+    }

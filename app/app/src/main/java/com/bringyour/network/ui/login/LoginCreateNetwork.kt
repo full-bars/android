@@ -1,11 +1,11 @@
 package com.bringyour.network.ui.login
 
+import com.bringyour.network.ui.connection_region.CantReachPrompt
 import com.bringyour.network.ui.components.tabletForm
 import android.util.Patterns
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.EnterTransition
 import androidx.compose.animation.fadeOut
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -20,7 +20,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -36,20 +35,17 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.TextRange
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.TextFieldValue
@@ -66,24 +62,23 @@ import com.bringyour.network.LoginClientCompletion
 import com.bringyour.network.MainApplication
 import com.bringyour.network.R
 import com.bringyour.network.ui.components.TermsCheckbox
+import com.bringyour.network.ui.components.ProductUpdatesOptOutRow
 import com.bringyour.network.ui.components.URButton
 import com.bringyour.network.ui.components.URInlineErrorText
 import com.bringyour.network.ui.components.URTextInput
 import com.bringyour.network.ui.components.referral.ReferralAppliedChip
-import com.bringyour.network.ui.components.referral.ReferralBonusSheet
+import com.bringyour.network.ui.components.referral.ReferralCodeInput
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.res.dimensionResource
 import androidx.compose.ui.unit.TextUnit
 import com.bringyour.network.ui.theme.Black
 import com.bringyour.network.ui.theme.URNetworkTheme
+import com.bringyour.network.ui.wallet.bittensorSignatureMismatchText
+import com.bringyour.network.ui.wallet.bittensorSignatureMismatchWallet
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import com.bringyour.network.ui.components.overlays.WelcomeAnimatedOverlayLogin
-import android.net.Uri
-import com.bringyour.network.ui.theme.TextMuted
-import com.bringyour.network.ui.theme.ppNeueBitBold
-import com.bringyour.sdk.Api
 
 // Base class with common parameters
 open class CommonLoginParams(
@@ -120,7 +115,10 @@ sealed class LoginCreateNetworkParams(
         val publicKey: String,
         val signedMessage: String,
         val signature: String,
-        referralCode: String?
+        referralCode: String?,
+        // the Bittensor wallet the signature was pasted from (null: a wallet signed
+        // it), named when the server refuses a signature from another account
+        val manualWalletId: String? = null,
     ) : LoginCreateNetworkParams(
         referralCode
     )
@@ -133,16 +131,14 @@ fun LoginCreateNetwork(
     loginCreateNetworkViewModel: LoginCreateNetworkViewModel = hiltViewModel()
 ) {
 
-    val context = LocalContext.current
-    val application = context.applicationContext as? MainApplication
-    val presentReferralSheet by loginCreateNetworkViewModel.presentBonusSheet.collectAsState()
+    val referralInput = loginCreateNetworkViewModel.referralInput
 
     LaunchedEffect(params.referralCode) {
 
         params.referralCode?.let { code ->
             if (code.isNotEmpty()) {
-                loginCreateNetworkViewModel.setReferralCode(TextFieldValue(code))
-                loginCreateNetworkViewModel.validateReferralCode(application?.api, {})
+                referralInput.setCode(TextFieldValue(code))
+                referralInput.check {}
             }
         }
     }
@@ -157,24 +153,24 @@ fun LoginCreateNetwork(
         networkName = loginCreateNetworkViewModel.networkName,
         setNetworkName = loginCreateNetworkViewModel.setNetworkName,
         networkNameErrorExists = loginCreateNetworkViewModel.networkNameErrorExists,
+        networkNameCheckFailed = loginCreateNetworkViewModel.networkNameCheckFailed,
         password = loginCreateNetworkViewModel.password,
         setPassword = loginCreateNetworkViewModel.setPassword,
         termsAgreed = loginCreateNetworkViewModel.termsAgreed,
         setTermsAgreed = loginCreateNetworkViewModel.setTermsAgreed,
+        productUpdates = loginCreateNetworkViewModel.productUpdates,
+        setProductUpdates = loginCreateNetworkViewModel.setProductUpdates,
         createNetworkArgs = loginCreateNetworkViewModel.createNetworkArgs,
         networkNameIsValid = loginCreateNetworkViewModel.networkNameIsValid,
         networkNameSupportingText = loginCreateNetworkViewModel.networkNameSupportingText,
         setNetworkNameSupportingText = loginCreateNetworkViewModel.setNetworkNameSupportingText,
-        presentBonusSheet = presentReferralSheet,
-        setPresentBonusSheet = loginCreateNetworkViewModel.setPresentBonusSheet,
-        referralCode = loginCreateNetworkViewModel.referralCode,
-        setReferralCode = loginCreateNetworkViewModel.setReferralCode,
-        validateReferralCode = loginCreateNetworkViewModel.validateReferralCode,
-        isValidReferralCode = loginCreateNetworkViewModel.isValidReferralCode,
-        isValidatingReferralCode = loginCreateNetworkViewModel.isValidatingReferralCode,
-        referralValidationComplete = loginCreateNetworkViewModel.referralValidationComplete,
-        referralCodeInputSupportingTextRes = loginCreateNetworkViewModel.referralCodeInputSupportingTextRes.collectAsState().value,
-        isReferralCodeCapped = loginCreateNetworkViewModel.referralCodeIsCapped.collectAsState().value
+        referralCode = referralInput.code,
+        setReferralCode = referralInput.setCode,
+        checkReferralCode = { referralInput.check {} },
+        isValidReferralCode = referralInput.isValid,
+        isValidatingReferralCode = referralInput.isValidating,
+        isReferralCodeRejected = referralInput.isRejected,
+        referralCodeInputSupportingTextRes = referralInput.supportingTextRes,
    )
 }
 
@@ -192,21 +188,21 @@ fun LoginCreateNetwork(
     password: TextFieldValue,
     setPassword: (TextFieldValue) -> Unit,
     networkNameErrorExists: Boolean,
+    networkNameCheckFailed: Boolean = false,
     termsAgreed: Boolean,
     setTermsAgreed: (Boolean) -> Unit,
+    productUpdates: Boolean = true,
+    setProductUpdates: (Boolean) -> Unit = {},
     networkNameIsValid: Boolean,
     createNetworkArgs: (LoginCreateNetworkParams) -> NetworkCreateArgs,
     setNetworkNameSupportingText: (String) -> Unit,
     networkNameSupportingText: String,
-    presentBonusSheet: Boolean,
-    setPresentBonusSheet: (Boolean) -> Unit,
     referralCode: TextFieldValue,
     setReferralCode: (TextFieldValue) -> Unit,
-    validateReferralCode: (Api?, (Boolean) -> Unit) -> Unit,
+    checkReferralCode: () -> Unit,
     isValidReferralCode: Boolean,
     isValidatingReferralCode: Boolean,
-    isReferralCodeCapped: Boolean,
-    referralValidationComplete: Boolean,
+    isReferralCodeRejected: Boolean,
     referralCodeInputSupportingTextRes: Int?
 ) {
     val context = LocalContext.current
@@ -227,8 +223,8 @@ fun LoginCreateNetwork(
     var welcomeOverlayVisible by remember { mutableStateOf(false) }
     var isContentVisible by remember { mutableStateOf(true) }
 
-    // NOTE: this is intentionally a plain `val`, recomputed on every recomposition,
-    // and NOT wrapped in `remember { derivedStateOf { ... } }`.
+    // This is intentionally a plain `val`, recomputed on every recomposition,
+    // and not wrapped in `remember { derivedStateOf { ... } }`.
     //
     // `remember` with no keys only evaluates its calculation once, on this
     // composable's first composition, and caches the result forever after.
@@ -298,38 +294,55 @@ fun LoginCreateNetwork(
         createNetworkError = null
         inProgress = true
 
-        application?.api?.networkCreate(args) { result, err ->
-            application.dispatchLoginResult {
+        val request = application?.beginLoginRequest() ?: run {
+            inProgress = false
+            return@createNetwork
+        }
+        request.api.networkCreate(args) { result, err ->
+            application.dispatchLoginResult(request) {
                 if (err != null) {
+                    CantReachPrompt.shared.report(err)
                     scope.launch {
+                        if (!application.ownsLoginRequest(request)) return@launch
                         createNetworkError = err.message ?: createNetworkErrorMsg
                         inProgress = false
                     }
                 } else if (result == null) {
                     scope.launch {
+                        if (!application.ownsLoginRequest(request)) return@launch
                         createNetworkError = createNetworkErrorMsg
                         inProgress = false
                     }
                 } else if (result.error != null) {
+                    // a pasted signature from another account than the entered
+                    // address names the wallet; any other refusal reads as sent
+                    val mismatchWallet = bittensorSignatureMismatchWallet(
+                        result.error.code,
+                        (params as? LoginCreateNetworkParams.LoginCreateWalletParams)?.manualWalletId,
+                    )
                     scope.launch {
-                        createNetworkError = result.error.message
+                        if (!application.ownsLoginRequest(request)) return@launch
+                        createNetworkError = mismatchWallet?.let { bittensorSignatureMismatchText(context, it) }
+                            ?: result.error.message
                         inProgress = false
                     }
                 } else if (result.network != null && result.network.byJwt.isNotEmpty()) {
                     application.authenticateNetworkSession(
+                        request,
                         result.network.byJwt,
                         newNetwork = true,
                     ) { completion ->
                         if (completion is LoginClientCompletion.Ready) {
-                            loginActivity?.finishAuthenticatedLoginAfterWelcome()
+                            loginActivity?.finishAuthenticatedLoginAfterWelcome(request)
                         }
                         scope.launch {
+                            if (!application.ownsLoginRequest(request)) return@launch
                             val error = (completion as? LoginClientCompletion.Failed)?.message
                             if (completion is LoginClientCompletion.Ready) {
                                 createNetworkError = null
                                 isContentVisible = false
                                 delay(500)
-                                welcomeOverlayVisible = true
+                                if (application.isCurrentLoginRequest(request)) welcomeOverlayVisible = true
                                 return@launch
                             }
                             inProgress = false
@@ -342,6 +355,7 @@ fun LoginCreateNetwork(
                     }
                 } else if (result.verificationRequired != null) {
                     scope.launch {
+                        if (!application.ownsLoginRequest(request)) return@launch
                         val verificationUserAuth = when (params) {
                             is LoginCreateNetworkParams.LoginCreateUserAuthParams -> params.userAuth
                             is LoginCreateNetworkParams.LoginCreateAuthJwtParams ->
@@ -350,7 +364,12 @@ fun LoginCreateNetwork(
                         }
 
                         verificationUserAuth?.let {
-                            navController.navigate("verify/${Uri.encode(it)}")
+                            navController.navigate(
+                                verifyRoute(
+                                    it,
+                                    result.verificationRequired.sendError?.toVerifySendError(),
+                                )
+                            )
                         } ?: run {
                             createNetworkError = createNetworkErrorMsg
                         }
@@ -359,6 +378,7 @@ fun LoginCreateNetwork(
                     }
                 } else {
                     scope.launch {
+                        if (!application.ownsLoginRequest(request)) return@launch
                         createNetworkError = createNetworkErrorMsg
                         inProgress = false
                     }
@@ -372,18 +392,21 @@ fun LoginCreateNetwork(
     }
 
     val networkNameUnavailable = stringResource(id = R.string.network_name_unavailable)
+    val networkNameCheckFailedText = stringResource(id = R.string.network_name_check_failed)
     val invalidNetworkNameLength = stringResource(id = R.string.network_name_length_error)
     val networkNameAvailable = stringResource(id = R.string.available)
 
     val titleSize: TextUnit = dimensionResource(id = R.dimen.login_title_size).value.sp
 
-    LaunchedEffect(networkNameErrorExists, networkNameIsValid, networkName.text) {
+    LaunchedEffect(networkNameErrorExists, networkNameCheckFailed, networkNameIsValid, networkName.text) {
         if (networkName.text.isEmpty()) {
             setNetworkNameSupportingText("")
         } else if (networkName.text.length < 6) {
             setNetworkNameSupportingText(invalidNetworkNameLength)
         } else if (networkNameErrorExists) {
             setNetworkNameSupportingText(networkNameUnavailable)
+        } else if (networkNameCheckFailed) {
+            setNetworkNameSupportingText(networkNameCheckFailedText)
         } else if (networkNameIsValid) {
             setNetworkNameSupportingText(networkNameAvailable)
         } else {
@@ -405,7 +428,7 @@ fun LoginCreateNetwork(
                         IconButton(onClick = { navController.popBackStack() }) {
                             Icon(
                                 Icons.AutoMirrored.Filled.KeyboardArrowLeft,
-                                contentDescription = "Back"
+                                contentDescription = stringResource(id = R.string.back)
                             )
                         }
                     },
@@ -451,15 +474,20 @@ fun LoginCreateNetwork(
                     setPassword = setPassword,
                     termsAgreed = termsAgreed,
                     setTermsAgreed = setTermsAgreed,
+                    productUpdates = productUpdates,
+                    setProductUpdates = setProductUpdates,
                     isBtnEnabled = isBtnEnabled,
                     onCreateNetwork = {
                         createNetwork()
                     },
                     networkNameSupportingText = networkNameSupportingText,
-                    setPresentBonusSheet = setPresentBonusSheet,
-                    isValidReferralCode = isValidReferralCode,
-                    isReferralCodeCapped = isReferralCodeCapped,
                     referralCode = referralCode,
+                    setReferralCode = setReferralCode,
+                    checkReferralCode = checkReferralCode,
+                    isValidReferralCode = isValidReferralCode,
+                    isValidatingReferralCode = isValidatingReferralCode,
+                    isReferralCodeRejected = isReferralCodeRejected,
+                    referralCodeInputSupportingTextRes = referralCodeInputSupportingTextRes,
                     isInProgress = inProgress,
                     createNetworkError = createNetworkError,
                     clearCreateNetworkError = {
@@ -467,25 +495,6 @@ fun LoginCreateNetwork(
                     }
                 )
             }
-
-            /**
-             * Referral sheet: accepting a code flips the sheet into the gold
-             * royal-welcome moment before it dismisses itself
-             */
-            ReferralBonusSheet(
-                presented = presentBonusSheet,
-                onDismiss = { setPresentBonusSheet(false) },
-                referralCode = referralCode,
-                setReferralCode = setReferralCode,
-                isValidating = isValidatingReferralCode,
-                isValid = isValidReferralCode,
-                isCapped = isReferralCodeCapped,
-                validationComplete = referralValidationComplete,
-                supportingTextRes = referralCodeInputSupportingTextRes,
-                validate = { onComplete ->
-                    validateReferralCode(application?.api, onComplete)
-                },
-            )
         }
     }
 
@@ -510,13 +519,18 @@ private fun NetworkCreateForm(
     setPassword: (TextFieldValue) -> Unit,
     termsAgreed: Boolean,
     setTermsAgreed: (Boolean) -> Unit,
+    productUpdates: Boolean = true,
+    setProductUpdates: (Boolean) -> Unit = {},
     isBtnEnabled: Boolean,
     isInProgress: Boolean,
     onCreateNetwork: () -> Unit,
-    setPresentBonusSheet: (Boolean) -> Unit,
-    isValidReferralCode: Boolean,
-    isReferralCodeCapped: Boolean,
     referralCode: TextFieldValue,
+    setReferralCode: (TextFieldValue) -> Unit,
+    checkReferralCode: () -> Unit,
+    isValidReferralCode: Boolean,
+    isValidatingReferralCode: Boolean,
+    isReferralCodeRejected: Boolean,
+    referralCodeInputSupportingTextRes: Int?,
     createNetworkError: String?,
     clearCreateNetworkError: () -> Unit,
 ) {
@@ -621,7 +635,30 @@ private fun NetworkCreateForm(
 
             }
 
-            Spacer(modifier = Modifier.height(32.dp))
+            Spacer(modifier = Modifier.height(12.dp))
+
+            ProductUpdatesOptOutRow(
+                checked = productUpdates,
+                onCheckedChanged = setProductUpdates,
+                enabled = !isInProgress,
+            )
+
+            // the switch's 48 dp touch target fills the rest
+            Spacer(modifier = Modifier.height(10.dp))
+
+            ReferralCodeInput(
+                referralCode = referralCode,
+                setReferralCode = { newValue ->
+                    setReferralCode(newValue)
+                    clearCreateNetworkError()
+                },
+                isValidating = isValidatingReferralCode,
+                isRejected = isReferralCodeRejected,
+                supportingTextRes = referralCodeInputSupportingTextRes,
+                onDone = checkReferralCode,
+                enabled = !isInProgress,
+                modifier = Modifier.testTag("acceptance.create.referral")
+            )
 
             Row(
                 verticalAlignment = Alignment.CenterVertically,
@@ -629,7 +666,7 @@ private fun NetworkCreateForm(
                 horizontalArrangement = Arrangement.Start
             ) {
 
-                if (isValidReferralCode && !isReferralCodeCapped) {
+                if (isValidReferralCode) {
                     ReferralAppliedChip()
                 } else {
                     Text("")
@@ -651,39 +688,21 @@ private fun NetworkCreateForm(
                 Spacer(modifier = Modifier.width(4.dp))
                 Icon(
                     imageVector = Icons.AutoMirrored.Filled.ArrowForward,
-                    contentDescription = "Right Arrow",
+                    contentDescription = null,
                     modifier = Modifier.size(16.dp),
                     tint = if (isBtnEnabled) Color.White else Color.Gray
                 )
             }
 
             Spacer(modifier = Modifier.height(8.dp))
-            URInlineErrorText(createNetworkError)
-
-            Spacer(modifier = Modifier.height(32.dp))
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.Center
-            ) {
-                Text(
-                    text = if (referralCode.text.isEmpty()) stringResource(id = R.string.add_referral_code)
-                        else stringResource(id = R.string.edit_referral_code),
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(50))
-                        .clickable {
-                            if (!isInProgress) {
-                                setPresentBonusSheet(true)
-                            }
-                        }
-                        .padding(horizontal = 16.dp, vertical = 8.dp),
-                    style = TextStyle(
-                        color = TextMuted,
-                        fontFamily = ppNeueBitBold,
-                        fontSize = 24.sp
-                    )
-                )
-            }
+            URInlineErrorText(
+                createNetworkError,
+                if (signupFormErrorIsTerminal(!createNetworkError.isNullOrEmpty(), isInProgress)) {
+                    Modifier.testTag(ACCEPTANCE_CREATE_NETWORK_ERROR_TAG)
+                } else {
+                    Modifier
+                },
+            )
         }
     }
 }
@@ -702,8 +721,6 @@ private fun LoginNetworkCreatePreview() {
     val mockCreateNetworkArgs: (LoginCreateNetworkParams) -> NetworkCreateArgs = {
         NetworkCreateArgs()
     }
-
-    val mockValidateReferralCode: (Api?, (Boolean) -> Unit) -> Unit = { _, _ -> }
 
     URNetworkTheme {
         Scaffold(
@@ -732,16 +749,13 @@ private fun LoginNetworkCreatePreview() {
                     networkNameIsValid = true,
                     networkNameSupportingText = "",
                     setNetworkNameSupportingText = {},
-                    presentBonusSheet = false,
-                    setPresentBonusSheet = {},
                     referralCode = TextFieldValue(""),
                     setReferralCode = {},
-                    validateReferralCode = mockValidateReferralCode,
+                    checkReferralCode = {},
                     isValidReferralCode = true,
                     isValidatingReferralCode = false,
-                    referralValidationComplete = false,
-                    referralCodeInputSupportingTextRes = null,
-                    isReferralCodeCapped = false
+                    isReferralCodeRejected = false,
+                    referralCodeInputSupportingTextRes = null
                 )
             }
         }

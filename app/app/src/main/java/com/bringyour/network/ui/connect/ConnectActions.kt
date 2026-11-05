@@ -1,5 +1,6 @@
 package com.bringyour.network.ui.connect
 
+import android.content.Intent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -26,29 +27,41 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.PointerIcon
+import androidx.compose.ui.input.pointer.pointerHoverIcon
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInParent
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavController
 import com.bringyour.network.R
 import com.bringyour.network.ui.Route
 import com.bringyour.network.ui.components.ButtonStyle
+import com.bringyour.network.ui.components.outOfBalanceKindText
 import com.bringyour.network.ui.components.URButton
 import com.bringyour.network.ui.components.URSwitch
 import com.bringyour.network.ui.components.UsageBar
+import com.bringyour.network.ui.components.dataInfoShowsFreeRefresh
+import com.bringyour.network.ui.components.focusRing
+import com.bringyour.network.ui.components.rememberFreeRefreshCountdown
+import com.bringyour.network.ui.navigateToUpgradeForBalanceBlock
 import com.bringyour.network.ui.shared.models.ConnectStatus
 import com.bringyour.network.ui.shared.viewmodels.Plan
 import com.bringyour.network.ui.stats.BlockActionsViewModel
 import com.bringyour.network.ui.stats.BlockerViewModel
 import com.bringyour.network.ui.stats.ConnectStatsSections
+import com.bringyour.network.ui.stats.IpFamilyPoint
 import com.bringyour.network.ui.stats.DnsSettingsViewModel
 import com.bringyour.network.ui.stats.ThroughputViewModel
 import com.bringyour.network.ui.theme.Green
@@ -58,17 +71,20 @@ import com.bringyour.network.ui.theme.Amber
 import com.bringyour.network.ui.theme.Red400
 import com.bringyour.network.ui.theme.TextFaint
 import com.bringyour.network.ui.theme.TextMuted
+import com.bringyour.network.ui.upgrade.PLAN_CHECKOUT_RIDES_TUNNEL
 import com.bringyour.sdk.ConnectLocation
 import kotlin.math.roundToInt
 
 @Composable
-fun ConnectActions(
+internal fun ConnectActions(
     navController: NavController,
     selectedLocation: ConnectLocation?,
     peerCount: Int,
     providerDiscoverable: Boolean,
     deviceName: String,
     selectedPeerName: String?,
+    // the selected location's current provider count (selectedProviderCount)
+    selectedProviderCount: Int,
     presentSelectProvider: (Boolean) -> Unit,
     getLocationColor: (String) -> Color,
     minHeight: Dp,
@@ -79,7 +95,25 @@ fun ConnectActions(
     connectStatus: ConnectStatus,
     isPollingSubscriptionBalance: Boolean,
     displayReconnectTunnel: Boolean,
+    // the strict Private DNS provider host to warn about, or null for no notice
+    // (see privateDnsStrictNoticeHost). Shown only while connected in strict mode.
+    privateDnsStrictHost: String?,
     insufficientBalance: Boolean,
+    // whether a tunnel is running, for what the alert says about the traffic, and
+    // a paying account refused at a data limit (DataLimitGate)
+    tunnelStarted: Boolean,
+    dataLimitReached: Boolean,
+    // reserved (Pending) or used up, from the last account balance, and the
+    // reserved amount it names
+    outOfBalanceKind: OutOfBalanceKind,
+    reservedBytes: Long,
+    // a connect insufficient balance blocked, waiting to be retried by itself;
+    // cancelBalanceRecovery is the refused start's Cancel
+    balanceRecovery: BalanceRecoveryState,
+    cancelBalanceRecovery: () -> Unit,
+    // opens the "About your data" sheet, from Why? under the out-of-balance
+    // notice; the connect screen keeps the sheet, so a fold keeps it open
+    showDataInfo: () -> Unit,
     usedBytes: Long,
     availableBytes: Long,
     pendingBytes: Long,
@@ -98,8 +132,19 @@ fun ConnectActions(
     blockActionsViewModel: BlockActionsViewModel,
     dnsSettingsViewModel: DnsSettingsViewModel,
     blockerViewModel: BlockerViewModel,
+    // the window's providers with their state and IP version, for the
+    // family status row under the transport bar
+    ipFamilyPoints: List<IpFamilyPoint>,
     // opens the referral flow from the usage bar referral row
     onReferralClick: () -> Unit,
+    // false in the statistics pane beside the connect pane (the pane
+    // arrangements, AdaptiveLayout.kt): the connect pane shows the connect
+    // buttons and their notices, and the drawer is always open, so there is
+    // no fold to mark
+    showActions: Boolean = true,
+    // follows the location row, where the location dialog of the pane
+    // arrangements opens
+    locationRowModifier: Modifier = Modifier,
     // Reports the local integer Y offset of the fold marker placed right after
     // the connect button, measured from the top of ConnectActions — the top of
     // the sheet content. The sheet scaffold sizes the collapsed peek to this
@@ -111,7 +156,7 @@ fun ConnectActions(
     belowFoldGap: Dp = 24.dp,
 ) {
 
-    // The card's uniform content padding. The fold marker below measures its
+    // The card's content padding. The fold marker below measures its
     // position in the card's content area, which excludes this padding, so the
     // card's top padding is added back to anchor the reported fold offset at
     // the top of the sheet content. The card is the first child of
@@ -133,7 +178,13 @@ fun ConnectActions(
                     MainTintedBackgroundBase,
                     shape = RoundedCornerShape(12.dp)
                 )
-                .padding(cardPadding)
+                .padding(
+                    start = cardPadding,
+                    top = cardPadding,
+                    end = cardPadding,
+                    // the last option switch's 48 dp touch target fills the rest
+                    bottom = 2.dp,
+                )
         ) {
 
             // The above-the-fold block — the location row and the connect/
@@ -143,6 +194,14 @@ fun ConnectActions(
             // the marker (the peers line, the connection-type selector, the
             // toggles) stays inside the same card but falls below the fold when
             // collapsed.
+            val actionButtons = connectActionButtons(
+                insufficientBalance = insufficientBalance,
+                currentPlan = currentPlan,
+                isPollingSubscriptionBalance = isPollingSubscriptionBalance,
+                connectStatus = connectStatus,
+                displayReconnectTunnel = displayReconnectTunnel,
+            )
+
             Column(
                 modifier = Modifier.fillMaxWidth()
             ) {
@@ -150,110 +209,59 @@ fun ConnectActions(
                 OpenProviderListButton(
                     selectedLocation = selectedLocation,
                     selectedPeerName = selectedPeerName,
+                    providerCount = selectedProviderCount,
                     getLocationColor = getLocationColor,
-                    onClick = { presentSelectProvider(true) }
+                    onClick = { presentSelectProvider(true) },
+                    modifier = locationRowModifier,
                 )
 
-                Spacer(modifier = Modifier.height(8.dp))
+                if (showActions) {
+                    Spacer(modifier = Modifier.height(8.dp))
 
-                /**
-                 * Connect / Disconnect buttons
-                 */
-                Box(
-                    modifier = Modifier
-                        .height(48.dp)
-                ) {
-
-                if (insufficientBalance && currentPlan != Plan.Supporter && !isPollingSubscriptionBalance) {
-                    URButton(
-                        onClick = {
-                            navController.navigate(Route.Upgrade)
-                        },
-                        style = ButtonStyle.OUTLINE
-                    ) { buttonTextStyle ->
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.Center
-                        ) {
-                            Text(
-                                stringResource(id = R.string.insufficient_balance),
-                                style = buttonTextStyle,
-                                modifier = Modifier.padding(horizontal = 16.dp)
-                            )
-                        }
-                    }
-                } else {
-
-                    if (connectStatus == ConnectStatus.DISCONNECTED) {
-                        URButton(
-                            onClick = connect,
-                            modifier = Modifier.testTag("acceptance.connect")
-                        ) { buttonTextStyle ->
-                            Text(
-                                stringResource(id = R.string.connect),
-                                style = buttonTextStyle,
-                                modifier = Modifier.padding(horizontal = 16.dp)
-                            )
-                        }
-                    }
-
-                    if (connectStatus != ConnectStatus.DISCONNECTED && !displayReconnectTunnel) {
-                        URButton(
-                            onClick = disconnect,
-                            style = ButtonStyle.OUTLINE,
-                            modifier = Modifier.testTag("acceptance.disconnect")
-                        ) { buttonTextStyle ->
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.Center
-                            ) {
-
-                                Text(
-                                    stringResource(id = R.string.disconnect),
-                                    style = buttonTextStyle,
-                                    modifier = Modifier.padding(horizontal = 16.dp)
-                                )
-
-                            }
-                        }
-                    }
-
-                    if (displayReconnectTunnel) {
-                        URButton(
-                            onClick = {
-//                                application?.startVpnService()
-                                reconnectTunnel()
-                            },
-                            style = ButtonStyle.OUTLINE
-                        ) { buttonTextStyle ->
-                            Text(
-                                stringResource(id = R.string.reconnect),
-                                style = buttonTextStyle,
-                                modifier = Modifier.padding(horizontal = 16.dp)
-                            )
-                        }
-                    }
-                }
+                    ConnectActionButtonRow(
+                        actionButtons = actionButtons,
+                        navController = navController,
+                        connect = connect,
+                        disconnect = disconnect,
+                        reconnectTunnel = reconnectTunnel,
+                    )
                 }
             }
 
-            // the fold marker: a zero-height anchor at the bottom of the
-            // location + connect block. positionInParent is relative to the
-            // card's content area (inside its padding), so the card's top
-            // padding is added to yield the fold's offset from the top of the
-            // sheet content. Still local geometry only: translating the sheet
-            // cannot retrigger layout.
-            Spacer(
-                modifier = Modifier.onGloballyPositioned {
-                    onFoldMarkerPositioned(cardPaddingPx + it.positionInParent().y.roundToInt())
-                }
-            )
+            if (showActions) {
+                // in-app alert, above the fold so it shows in the collapsed peek
+                ConnectActionNotices(
+                    actionButtons = actionButtons,
+                    tunnelStarted = tunnelStarted,
+                    dataLimitReached = dataLimitReached,
+                    outOfBalanceKind = outOfBalanceKind,
+                    reservedBytes = reservedBytes,
+                    balanceRecovery = balanceRecovery,
+                    cancelBalanceRecovery = cancelBalanceRecovery,
+                    privateDnsStrictHost = privateDnsStrictHost,
+                    showDataInfo = showDataInfo,
+                )
 
-            // Everything from here down falls below the collapsed fold: the
-            // scaffold-supplied gap clears the peek's overhang past the fold
-            // marker, so the peers line lands off-screen when collapsed and
-            // only appears once the drawer is opened (iOS parity).
-            Spacer(modifier = Modifier.height(belowFoldGap))
+                // the fold marker: a zero-height anchor at the bottom of the
+                // location + connect block. positionInParent is relative to the
+                // card's content area (inside its padding), so the card's top
+                // padding is added to yield the fold's offset from the top of the
+                // sheet content. Still local geometry only: translating the sheet
+                // cannot retrigger layout.
+                Spacer(
+                    modifier = Modifier.onGloballyPositioned {
+                        onFoldMarkerPositioned(cardPaddingPx + it.positionInParent().y.roundToInt())
+                    }
+                )
+
+                // Everything from here down falls below the collapsed fold: the
+                // scaffold-supplied gap clears the peek's overhang past the fold
+                // marker, so the peers line lands off-screen when collapsed and
+                // only appears once the drawer is opened (iOS parity).
+                Spacer(modifier = Modifier.height(belowFoldGap))
+            } else {
+                Spacer(modifier = Modifier.height(16.dp))
+            }
 
             /**
              * Network peers status line: a small dot (brand green when peers are online,
@@ -267,132 +275,23 @@ fun ConnectActions(
 
             Spacer(modifier = Modifier.height(6.dp))
 
-            /**
-             * Second line under the peers count: whether this device is itself
-             * discoverable/connectable as a peer (providing to same-network peers).
-             */
-            Text(
-                when {
-                    providerDiscoverable && deviceName.isNotEmpty() ->
-                        stringResource(id = R.string.device_discoverable_as, deviceName)
-                    providerDiscoverable ->
-                        stringResource(id = R.string.device_discoverable)
-                    else ->
-                        stringResource(id = R.string.device_not_discoverable)
-                },
-                style = MaterialTheme.typography.bodyMedium,
-                color = TextMuted,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(start = 16.dp)
+            DeviceDiscoverableLine(
+                providerDiscoverable = providerDiscoverable,
+                deviceName = deviceName,
             )
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            /**
-             * Window Type Segmented Button
-             */
-            SingleChoiceSegmentedButtonRow(
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                WindowType.entries.forEachIndexed { index, windowType ->
-                    SegmentedButton(
-                        shape = SegmentedButtonDefaults.itemShape(
-                            index = index,
-                            count = WindowType.entries.size
-                        ),
-                        onClick = {
-                            setSelectedWindowType(windowType)
-                        },
-                        selected = selectedWindowType == windowType,
-                        label = {
-                            WindowTypeButtonText(windowType)
-                        }
-                    )
-                }
-            }
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    stringResource(id = R.string.fixed_ip),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = Color.White
-                )
-
-                /**
-                 * Fixed IP Switch
-                 */
-
-                URSwitch(
-                    checked = fixedIpSize,
-                    toggle = {
-                        toggleFixedIpSize()
-                    },
-                    enabled = selectedWindowType != WindowType.AUTO
-                )
-            }
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    stringResource(id = R.string.strong_anonymization),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = Color.White
-                )
-
-                /**
-                 * Allow direct
-                 * When "Strong Anonymization" is true, "allowDirect" is false and vice versa
-                 */
-
-                URSwitch(
-                    checked = !allowDirect,
-                    toggle = {
-                        toggleAllowDirect()
-                    },
-                )
-            }
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    stringResource(id = R.string.post_quantum_encryption),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = Color.White
-                )
-
-                /**
-                 * Post quantum encryption
-                 * Opportunistic e2e: providers without support fall back to
-                 * plaintext at this layer
-                 */
-
-                URSwitch(
-                    checked = postQuantumEncryption,
-                    toggle = {
-                        togglePostQuantumEncryption()
-                    },
-                )
-            }
+            ConnectOptions(
+                fixedIpSize = fixedIpSize,
+                toggleFixedIpSize = toggleFixedIpSize,
+                selectedWindowType = selectedWindowType,
+                setSelectedWindowType = setSelectedWindowType,
+                allowDirect = allowDirect,
+                toggleAllowDirect = toggleAllowDirect,
+                postQuantumEncryption = postQuantumEncryption,
+                togglePostQuantumEncryption = togglePostQuantumEncryption,
+            )
 
         }
 
@@ -407,116 +306,656 @@ fun ConnectActions(
             blockActionsViewModel = blockActionsViewModel,
             dnsSettingsViewModel = dnsSettingsViewModel,
             blockerViewModel = blockerViewModel,
+            ipFamilyPoints = ipFamilyPoints,
         )
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(
-                    MainTintedBackgroundBase,
-                    shape = RoundedCornerShape(12.dp)
-                )
-                .padding(16.dp)
-        ) {
+        ConnectPlanCard(
+            navController = navController,
+            currentPlan = currentPlan,
+            isPollingSubscriptionBalance = isPollingSubscriptionBalance,
+            usedBytes = usedBytes,
+            availableBytes = availableBytes,
+            pendingBytes = pendingBytes,
+            meanReliabilityWeight = meanReliabilityWeight,
+            totalReferrals = totalReferrals,
+            dailyByteCount = dailyByteCount,
+            onReferralClick = onReferralClick,
+        )
+    }
+}
 
+/**
+ * Connect, Disconnect, or what replaces them: Upgrade when out of balance,
+ * Retry beside Disconnect after a failed connect, and Reconnect for a lost
+ * tunnel. The drawer shows it under the location row; the pane arrangements
+ * show it at the foot of the connect pane.
+ */
+@Composable
+internal fun ConnectActionButtonRow(
+    actionButtons: ConnectActionButtons,
+    navController: NavController,
+    connect: () -> Unit,
+    disconnect: () -> Unit,
+    reconnectTunnel: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Box(
+        modifier = modifier
+            .height(48.dp)
+    ) {
 
-            // member area
-            Column {
-                Text(
-                    stringResource(id = R.string.plan),
-                    style = TextStyle(
-                        color = TextMuted
-                    )
-                )
-
+        val disconnectButton: @Composable (Modifier) -> Unit = { buttonModifier ->
+            URButton(
+                onClick = disconnect,
+                style = ButtonStyle.OUTLINE,
+                modifier = buttonModifier.testTag("acceptance.disconnect")
+            ) { buttonTextStyle ->
                 Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(40.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.Bottom
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.Center
                 ) {
 
-                    if (isPollingSubscriptionBalance) {
+                    Text(
+                        stringResource(id = R.string.disconnect),
+                        style = buttonTextStyle,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(horizontal = 16.dp)
+                    )
 
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
+                }
+            }
+        }
 
-                            CircularProgressIndicator(
-                                modifier = Modifier
-                                    .width(24.dp)
-                                    .height(24.dp),
-                                color = TextMuted,
-                                trackColor = TextFaint,
-                                strokeWidth = 2.dp
-                            )
-
-                            Spacer(modifier = Modifier.width(8.dp))
-
-                            Text(stringResource(id = R.string.checking_payment),
-                                style = MaterialTheme.typography.bodyLarge,
-                                color = TextMuted
-                            )
-
-                        }
-
-                    } else {
-
-                        if (currentPlan == Plan.Supporter) {
-                            Text(stringResource(id = R.string.supporter),
-                                style = MaterialTheme.typography.headlineMedium
-                            )
-                        } else {
-                            Text(stringResource(id = R.string.free),
-                                style = MaterialTheme.typography.headlineMedium
-                            )
-                        }
+        if (actionButtons.upgrade) {
+            // out of balance: upgrade replaces connect, but a requested
+            // connection always keeps its way out
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                URButton(
+                    onClick = {
+                        navController.navigateToUpgradeForBalanceBlock()
+                    },
+                    style = ButtonStyle.OUTLINE,
+                    modifier = Modifier
+                        .weight(1f)
+                        .testTag("acceptance.insufficient_balance_upgrade")
+                ) { buttonTextStyle ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.Center
+                    ) {
+                        Text(
+                            stringResource(id = R.string.insufficient_balance),
+                            style = buttonTextStyle,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(horizontal = 4.dp)
+                        )
                     }
+                }
 
-                    if (currentPlan != Plan.Supporter) {
+                if (actionButtons.disconnect) {
+                    disconnectButton(Modifier.weight(1f))
+                }
+            }
+        } else {
 
-                        TextButton(onClick = {
-                            // the same upgrade flow Account's "Change" opens; this used to
-                            // launch the onboarding funnel instead of the plan picker
-                            navController.navigate(Route.Upgrade)
-                        }) {
-                            Text(
-                                stringResource(id = R.string.get_pro),
-                                style = TextStyle(
-                                    color = Pink
-                                )
-                            )
-                        }
-
-                    }
+            if (actionButtons.connect) {
+                URButton(
+                    onClick = connect,
+                    modifier = Modifier.testTag("acceptance.connect")
+                ) { buttonTextStyle ->
+                    Text(
+                        stringResource(id = R.string.connect),
+                        style = buttonTextStyle,
+                        modifier = Modifier.padding(horizontal = 16.dp)
+                    )
                 }
             }
 
-            Spacer(modifier = Modifier.height(12.dp))
+            if (actionButtons.retry) {
+                // the connect failed: retry connects to the selected
+                // location again, and disconnect stays the way out
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    URButton(
+                        onClick = connect,
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("acceptance.connect_retry")
+                    ) { buttonTextStyle ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.Center
+                        ) {
+                            Text(
+                                stringResource(id = R.string.retry),
+                                style = buttonTextStyle,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.padding(horizontal = 4.dp)
+                            )
+                        }
+                    }
 
-            UsageBar(
-                usedBytes = usedBytes,
-                pendingBytes = pendingBytes,
-                availableBytes = availableBytes,
-                meanReliabilityWeight = meanReliabilityWeight,
-                totalReferrals = totalReferrals,
-                dailyByteCount = dailyByteCount,
-                onReferralClick = onReferralClick
-            )
+                    disconnectButton(Modifier.weight(1f))
+                }
+            } else if (actionButtons.disconnect) {
+                disconnectButton(Modifier)
+            }
 
+            if (actionButtons.reconnect) {
+                URButton(
+                    onClick = {
+    //                    application?.startVpnService()
+                        reconnectTunnel()
+                    },
+                    style = ButtonStyle.OUTLINE
+                ) { buttonTextStyle ->
+                    Text(
+                        stringResource(id = R.string.reconnect),
+                        style = buttonTextStyle,
+                        modifier = Modifier.padding(horizontal = 16.dp)
+                    )
+                }
+            }
         }
     }
+}
+
+/**
+ * The notices that go with the connect buttons: when the free data
+ * refreshes (with Why?), why the balance ran out, a held or retried connect,
+ * and the strict Private DNS warning.
+ */
+@Composable
+internal fun ConnectActionNotices(
+    actionButtons: ConnectActionButtons,
+    tunnelStarted: Boolean,
+    dataLimitReached: Boolean,
+    outOfBalanceKind: OutOfBalanceKind,
+    reservedBytes: Long,
+    balanceRecovery: BalanceRecoveryState,
+    cancelBalanceRecovery: () -> Unit,
+    privateDnsStrictHost: String?,
+    showDataInfo: () -> Unit,
+) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+
+        val outOfBalanceNotice = outOfBalanceNotice(
+            actionButtons,
+            outOfBalanceKind,
+            balanceRecovery,
+            tunnelStarted = tunnelStarted,
+            checkoutRidesTunnel = PLAN_CHECKOUT_RIDES_TUNNEL,
+        )
+
+        if (outOfBalanceNotice.refresh) {
+            Spacer(modifier = Modifier.height(8.dp))
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    stringResource(id = R.string.insufficient_balance_refreshes_in, rememberFreeRefreshCountdown()),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = TextMuted,
+                    modifier = Modifier.weight(1f, fill = false)
+                )
+                Text(
+                    stringResource(id = R.string.data_info_why),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Pink,
+                    modifier = Modifier
+                        .clickable(role = Role.Button) { showDataInfo() }
+                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                        .testTag("acceptance.insufficient_balance_why")
+                )
+            }
+        }
+
+        // reserved data comes back as connections close (no time promised);
+        // used up waits for the refresh or an upgrade
+        val outOfBalanceKindText = outOfBalanceKindText(outOfBalanceNotice.kind, reservedBytes)
+        if (outOfBalanceKindText != null) {
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                outOfBalanceKindText,
+                style = MaterialTheme.typography.bodyMedium,
+                color = TextMuted,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 4.dp)
+                    .testTag("acceptance.insufficient_balance_kind")
+            )
+        }
+
+        refusedTrafficTextId(dataLimit = false, traffic = outOfBalanceNotice.traffic)?.let { line ->
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                stringResource(id = line),
+                style = MaterialTheme.typography.bodyMedium,
+                color = TextMuted,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 4.dp)
+                    .testTag("acceptance.insufficient_balance_notice")
+            )
+        }
+
+        // this flavor's checkout goes through the tunnel, so paying has to wait for
+        // the Disconnect above, which nothing presses for the user. A kill switch
+        // that is on keeps the VPN service up after it (vpnServiceRequired), so the
+        // line names that too
+        if (outOfBalanceNotice.disconnectFirst) {
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                stringResource(id = R.string.insufficient_balance_disconnect_first_kill_switch),
+                style = MaterialTheme.typography.bodyMedium,
+                color = TextMuted,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 4.dp)
+                    .testTag("acceptance.insufficient_balance_disconnect_first")
+            )
+        }
+
+        // a paying account refused at a data limit: nothing to buy, and the
+        // Disconnect beside this stays the way out
+        if (dataLimitReached) {
+            refusedTrafficTextId(
+                dataLimit = true,
+                traffic = refusedTraffic(
+                    connectRequested = actionButtons.disconnect || actionButtons.reconnect,
+                    tunnelStarted = tunnelStarted,
+                ),
+            )?.let { line ->
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    stringResource(id = line),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = TextMuted,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 4.dp)
+                        .testTag("acceptance.data_limit_notice")
+                )
+            }
+        }
+
+        if (outOfBalanceNotice.willReconnect) {
+            Spacer(modifier = Modifier.height(8.dp))
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    stringResource(id = R.string.insufficient_balance_will_reconnect),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = TextMuted,
+                    modifier = Modifier
+                        .weight(1f, fill = false)
+                        .testTag("acceptance.insufficient_balance_will_reconnect")
+                )
+                if (outOfBalanceNotice.cancel) {
+                    Text(
+                        stringResource(id = R.string.cancel),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Pink,
+                        modifier = Modifier
+                            .clickable(role = Role.Button) { cancelBalanceRecovery() }
+                            .padding(horizontal = 8.dp, vertical = 4.dp)
+                            .testTag("acceptance.insufficient_balance_cancel_reconnect")
+                    )
+                }
+            }
+        }
+
+        // Strict Private DNS breaks name resolution while connected: Android
+        // sends DoT straight to the user's provider instead of through the
+        // tunnel. Android has no public Private DNS settings intent, so the
+        // button opens the wireless settings screen.
+        if (privateDnsStrictHost != null) {
+            val context = LocalContext.current
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                stringResource(id = R.string.private_dns_strict_notice, privateDnsStrictHost),
+                style = MaterialTheme.typography.bodyMedium,
+                color = TextMuted,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 4.dp)
+                    .testTag("acceptance.private_dns_strict_notice")
+            )
+            TextButton(
+                onClick = {
+                    runCatching {
+                        context.startActivity(
+                            Intent(android.provider.Settings.ACTION_WIRELESS_SETTINGS)
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        )
+                    }
+                }
+            ) {
+                Text(
+                    stringResource(id = R.string.private_dns_open_settings),
+                    color = Pink
+                )
+            }
+        }
+    }
+}
+
+/**
+ * Second line under the peers count: whether this device is itself
+ * discoverable/connectable as a peer (providing to same-network peers).
+ */
+@Composable
+internal fun DeviceDiscoverableLine(
+    providerDiscoverable: Boolean,
+    deviceName: String,
+) {
+    Text(
+        when {
+            providerDiscoverable && deviceName.isNotEmpty() ->
+                stringResource(id = R.string.device_discoverable_as, deviceName)
+            providerDiscoverable ->
+                stringResource(id = R.string.device_discoverable)
+            else ->
+                stringResource(id = R.string.device_not_discoverable)
+        },
+        style = MaterialTheme.typography.bodyMedium,
+        color = TextMuted,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = 16.dp)
+    )
+}
+
+/**
+ * The connection options: the window type, Fixed IP, strong anonymization
+ * and post quantum encryption.
+ */
+@Composable
+internal fun ConnectOptions(
+    fixedIpSize: Boolean,
+    toggleFixedIpSize: () -> Unit,
+    selectedWindowType: WindowType,
+    setSelectedWindowType: (WindowType) -> Unit,
+    allowDirect: Boolean,
+    toggleAllowDirect: () -> Unit,
+    postQuantumEncryption: Boolean,
+    togglePostQuantumEncryption: () -> Unit,
+) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+
+        /**
+         * Window Type Segmented Button
+         */
+        SingleChoiceSegmentedButtonRow(
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            WindowType.entries.forEachIndexed { index, windowType ->
+                SegmentedButton(
+                    shape = SegmentedButtonDefaults.itemShape(
+                        index = index,
+                        count = WindowType.entries.size
+                    ),
+                    onClick = {
+                        setSelectedWindowType(windowType)
+                    },
+                    selected = selectedWindowType == windowType,
+                    label = {
+                        WindowTypeButtonText(windowType)
+                    }
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    // the switch's touch target adds 6 dp of its own
+                    .padding(end = 6.dp)
+            ) {
+                Text(
+                    stringResource(id = R.string.fixed_ip),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Color.White
+                )
+                // a Fixed IP window keeps its one exit for the session
+                // (connect stickyExit): no hourly rotation, no spare
+                Text(
+                    stringResource(id = R.string.fixed_ip_subtitle),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextMuted
+                )
+            }
+
+            /**
+             * Fixed IP Switch
+             */
+
+            URSwitch(
+                checked = fixedIpSize,
+                toggle = {
+                    toggleFixedIpSize()
+                },
+                enabled = selectedWindowType != WindowType.AUTO
+            )
+        }
+
+        // the next switch's 48 dp touch target fills the rest
+        Spacer(modifier = Modifier.height(2.dp))
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                stringResource(id = R.string.strong_anonymization),
+                style = MaterialTheme.typography.bodyMedium,
+                color = Color.White
+            )
+
+            /**
+             * Allow direct
+             * When "Strong Anonymization" is true, "allowDirect" is false and vice versa
+             */
+
+            URSwitch(
+                checked = !allowDirect,
+                toggle = {
+                    toggleAllowDirect()
+                },
+            )
+        }
+
+        // no spacer: the two switches' 48 dp touch targets space these rows
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                stringResource(id = R.string.post_quantum_encryption),
+                style = MaterialTheme.typography.bodyMedium,
+                color = Color.White
+            )
+
+            /**
+             * Post quantum encryption
+             * Opportunistic e2e: providers without support fall back to
+             * plaintext at this layer
+             */
+
+            URSwitch(
+                checked = postQuantumEncryption,
+                toggle = {
+                    togglePostQuantumEncryption()
+                },
+            )
+        }
+    }
+}
+
+/** The plan card at the end of the drawer: the plan, Get Pro, and the usage bar. */
+@Composable
+internal fun ConnectPlanCard(
+    navController: NavController,
+    currentPlan: Plan,
+    isPollingSubscriptionBalance: Boolean,
+    usedBytes: Long,
+    availableBytes: Long,
+    pendingBytes: Long,
+    meanReliabilityWeight: Double,
+    totalReferrals: Long,
+    dailyByteCount: Long,
+    onReferralClick: () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(
+                MainTintedBackgroundBase,
+                shape = RoundedCornerShape(12.dp)
+            )
+            .padding(16.dp)
+    ) {
+
+
+        // member area
+        Column {
+            Text(
+                stringResource(id = R.string.plan),
+                style = TextStyle(
+                    color = TextMuted
+                )
+            )
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(40.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.Bottom
+            ) {
+
+                if (isPollingSubscriptionBalance) {
+
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+
+                        CircularProgressIndicator(
+                            modifier = Modifier
+                                .width(24.dp)
+                                .height(24.dp),
+                            color = TextMuted,
+                            trackColor = TextFaint,
+                            strokeWidth = 2.dp
+                        )
+
+                        Spacer(modifier = Modifier.width(8.dp))
+
+                        Text(stringResource(id = R.string.checking_payment),
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = TextMuted
+                        )
+
+                    }
+
+                } else {
+
+                    if (currentPlan == Plan.Supporter) {
+                        Text(stringResource(id = R.string.supporter),
+                            style = MaterialTheme.typography.headlineMedium
+                        )
+                    } else {
+                        Text(stringResource(id = R.string.free),
+                            style = MaterialTheme.typography.headlineMedium
+                        )
+                    }
+                }
+
+                if (currentPlan != Plan.Supporter) {
+
+                    TextButton(onClick = {
+                        // the same upgrade flow Account's "Change" opens; this used to
+                        // launch the onboarding funnel instead of the plan picker
+                        navController.navigate(Route.Upgrade)
+                    }) {
+                        Text(
+                            stringResource(id = R.string.get_pro),
+                            style = TextStyle(
+                                color = Pink
+                            )
+                        )
+                    }
+
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        UsageBar(
+            usedBytes = usedBytes,
+            pendingBytes = pendingBytes,
+            availableBytes = availableBytes,
+            meanReliabilityWeight = meanReliabilityWeight,
+            totalReferrals = totalReferrals,
+            dailyByteCount = dailyByteCount,
+            onReferralClick = onReferralClick,
+            showFreeRefresh = dataInfoShowsFreeRefresh(currentPlan),
+        )
+
+    }
+}
+
+/**
+ * Shortens [label] to "abcd…1234" when it is the client id [clientId]
+ * (the first four and last four characters). Other labels are returned as is.
+ */
+internal fun shortClientIdLabel(label: String, clientId: String?): String {
+    if (clientId.isNullOrEmpty() || !label.trim().equals(clientId, ignoreCase = true)) {
+        return label
+    }
+    val id = label.trim()
+    return if (id.length <= 12) id else "${id.take(4)}…${id.takeLast(4)}"
 }
 
 @Composable
 fun OpenProviderListButton(
     selectedLocation: ConnectLocation?,
     selectedPeerName: String?,
+    providerCount: Int,
     getLocationColor: (String) -> Color,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
 ) {
 
     val text = when {
@@ -525,6 +964,10 @@ fun OpenProviderListButton(
         selectedLocation == null || selectedLocation.connectLocationId.bestAvailable ->
             stringResource(id = R.string.best_available_provider)
         else -> selectedLocation.name
+    }.let { label ->
+        // a client id label (a direct client connection, or a peer without a device name)
+        // is shortened to "abcd…1234" so it does not crowd the Change button
+        shortClientIdLabel(label, selectedLocation?.connectLocationId?.clientId?.idStr)
     }
 
     val iconTint = if (selectedLocation == null || selectedLocation.connectLocationId.bestAvailable) {
@@ -539,9 +982,11 @@ fun OpenProviderListButton(
     }
 
     Row(
-        modifier = Modifier
+        modifier = modifier
             .padding(vertical = 4.dp)
             .fillMaxWidth()
+            .focusRing(shape = RoundedCornerShape(8.dp))
+            .pointerHoverIcon(PointerIcon.Hand)
             .clickable {
                 onClick()
             },
@@ -550,6 +995,8 @@ fun OpenProviderListButton(
     ) {
 
         Row(
+            // take only the remaining width so the Change button is never squeezed
+            modifier = Modifier.weight(1f, fill = false),
             verticalAlignment = Alignment.CenterVertically
         ) {
 
@@ -567,17 +1014,19 @@ fun OpenProviderListButton(
                 Text(
                     text,
                     color = Color.White,
-                    style = MaterialTheme.typography.bodyLarge
+                    style = MaterialTheme.typography.bodyLarge,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
 
                 if (selectedLocation != null) {
 
-                    if (selectedLocation.providerCount > 0) {
+                    if (providerCount > 0) {
                         Text(
                             pluralStringResource(
                                 id = R.plurals.provider_count,
-                                count = selectedLocation.providerCount,
-                                selectedLocation.providerCount,
+                                count = providerCount,
+                                providerCount,
                             ),
                             style = MaterialTheme.typography.bodyMedium,
                             color = TextMuted
@@ -593,7 +1042,12 @@ fun OpenProviderListButton(
 
         }
 
-        TextButton(onClick = onClick) {
+        // the row's own click does the same, so the keyboard stops on the
+        // row once rather than twice
+        TextButton(
+            onClick = onClick,
+            modifier = Modifier.focusProperties { canFocus = false },
+        ) {
             Text(
                 stringResource(id = R.string.change),
                 color = Pink
@@ -605,12 +1059,16 @@ fun OpenProviderListButton(
 @Composable
 fun NetworkPeersStatusLine(
     peerCount: Int,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    // centered under the connect status in the stacked arrangement
+    horizontalArrangement: Arrangement.Horizontal = Arrangement.Start,
 ) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            .pointerHoverIcon(PointerIcon.Hand)
             .clickable(onClick = onClick),
+        horizontalArrangement = horizontalArrangement,
         verticalAlignment = Alignment.CenterVertically,
     ) {
 

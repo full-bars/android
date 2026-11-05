@@ -36,6 +36,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -50,6 +51,7 @@ import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import androidx.navigation.NavController
 import com.bringyour.network.R
 import com.bringyour.network.ui.components.URButton
+import com.bringyour.network.ui.connection_region.ConnectionRegionSettingsRow
 import com.bringyour.network.ui.components.URSwitch
 import com.bringyour.network.ui.components.URTextInput
 import com.bringyour.network.ui.theme.Black
@@ -76,10 +78,13 @@ fun DnsSettingsScreen(
     var draft by remember { mutableStateOf<DnsSettingsUi?>(null) }
     var original by remember { mutableStateOf<DnsSettingsUi?>(null) }
 
+    // the editor opens only on the settings in force, never on a blank form
+    // while they are unknown, and follows them until the user edits
     LaunchedEffect(dnsSettingsViewModel.settings) {
-        if (draft == null) {
-            draft = dnsSettingsViewModel.settings ?: DnsSettingsUi()
-            original = dnsSettingsViewModel.settings ?: DnsSettingsUi()
+        val current = dnsSettingsViewModel.settings
+        if (current != null && (draft == null || draft == original)) {
+            draft = current
+            original = current
         }
     }
 
@@ -96,7 +101,7 @@ fun DnsSettingsScreen(
                 },
                 navigationIcon = {
                     IconButton(onClick = { navController.popBackStack() }) {
-                        Icon(Icons.AutoMirrored.Filled.KeyboardArrowLeft, contentDescription = "Back")
+                        Icon(Icons.AutoMirrored.Filled.KeyboardArrowLeft, contentDescription = stringResource(id = R.string.back))
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
@@ -115,9 +120,9 @@ fun DnsSettingsScreen(
                 .fillMaxSize()
         ) {
 
-            if (currentDraft == null) {
-                return@Column
-            }
+            // the connection region comes from the network space and shows
+            // at once; the traffic dns editor waits for the device's report
+            val sections = dnsSettingsSections(currentDraft)
 
             Column(
                 modifier = Modifier
@@ -126,6 +131,29 @@ fun DnsSettingsScreen(
                     .verticalScroll(rememberScrollState())
                     .padding(horizontal = 16.dp)
             ) {
+
+                /**
+                 * Connection region (ingress dns): how the app reaches
+                 * URnetwork. Separate from the traffic dns below; changing
+                 * one never changes the other.
+                 */
+                if (sections.connectionRegion) {
+                    ConnectionRegionSettingsRow()
+
+                    Spacer(modifier = Modifier.height(24.dp))
+                }
+
+                if (!sections.trafficDns || currentDraft == null) {
+                    return@Column
+                }
+
+                Text(
+                    stringResource(id = R.string.traffic_dns),
+                    style = MaterialTheme.typography.titleMedium,
+                    color = Color.White
+                )
+
+                Spacer(modifier = Modifier.height(12.dp))
 
                 /**
                  * Recommendation panel when the connected country has one,
@@ -230,43 +258,42 @@ fun DnsSettingsScreen(
                  * Resolver toggles
                  */
                 SettingsGroup(title = stringResource(id = R.string.resolvers)) {
+                    // no spacers: the switches' 48 dp touch targets space the
+                    // rows and the description
                     DnsToggleRow(
                         label = stringResource(id = R.string.dns_over_https),
                         detail = stringResource(id = R.string.remote_lowercase),
                         checked = currentDraft.enableRemoteDoh,
                         toggle = { draft = currentDraft.copy(enableRemoteDoh = !currentDraft.enableRemoteDoh) }
                     )
-                    Spacer(modifier = Modifier.height(12.dp))
                     DnsToggleRow(
                         label = stringResource(id = R.string.dns_over_https),
                         detail = stringResource(id = R.string.local_lowercase),
                         checked = currentDraft.enableLocalDoh,
                         toggle = { draft = currentDraft.copy(enableLocalDoh = !currentDraft.enableLocalDoh) }
                     )
-                    Spacer(modifier = Modifier.height(12.dp))
                     DnsToggleRow(
                         label = stringResource(id = R.string.unencrypted_dns),
                         detail = stringResource(id = R.string.remote_lowercase),
                         checked = currentDraft.enableRemoteDns,
                         toggle = { draft = currentDraft.copy(enableRemoteDns = !currentDraft.enableRemoteDns) }
                     )
-                    Spacer(modifier = Modifier.height(12.dp))
                     DnsToggleRow(
                         label = stringResource(id = R.string.unencrypted_dns),
                         detail = stringResource(id = R.string.local_lowercase),
                         checked = currentDraft.enableLocalDns,
                         toggle = { draft = currentDraft.copy(enableLocalDns = !currentDraft.enableLocalDns) }
                     )
-                    Spacer(modifier = Modifier.height(12.dp))
+                    // opt-in, off by default: answers dns over the host network while
+                    // the tunnel's dns starts
                     DnsToggleRow(
-                        label = stringResource(id = R.string.local_dns_fallback),
+                        label = stringResource(id = FastDnsOnConnectToggle.labelRes),
                         detail = null,
-                        checked = currentDraft.enableFallback,
-                        toggle = { draft = currentDraft.copy(enableFallback = !currentDraft.enableFallback) }
+                        checked = FastDnsOnConnectToggle.isOn(currentDraft),
+                        toggle = { draft = FastDnsOnConnectToggle.toggled(currentDraft) }
                     )
-                    Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        stringResource(id = R.string.local_dns_fallback_description),
+                        stringResource(id = FastDnsOnConnectToggle.descriptionRes),
                         style = MaterialTheme.typography.bodySmall,
                         color = TextFaint
                     )
@@ -290,10 +317,8 @@ fun DnsSettingsScreen(
 
                     SettingsGroup(title = stringResource(id = R.string.suggested_remote_dns_servers)) {
 
-                        sortedServers.forEachIndexed { index, server ->
-                            if (0 < index) {
-                                Spacer(modifier = Modifier.height(12.dp))
-                            }
+                        // no spacers: the switches' 48 dp touch targets space the rows
+                        sortedServers.forEach { server ->
                             RegionalServerRow(
                                 server = server,
                                 isConnectedCountry = server.countryCode == connectedCountryCode,
@@ -314,7 +339,8 @@ fun DnsSettingsScreen(
                             )
                         }
 
-                        Spacer(modifier = Modifier.height(8.dp))
+                        // the switch's 48 dp touch target fills the rest
+                        Spacer(modifier = Modifier.height(2.dp))
 
                         Text(
                             stringResource(id = R.string.suggested_remote_dns_servers_description),
@@ -383,14 +409,26 @@ fun DnsSettingsScreen(
 
             }
 
-            Column(
-                modifier = Modifier.padding(16.dp)
+            // pinned below the scrolling content; on a tablet it is exactly as
+            // wide as the content column above it, never the whole screen
+            if (sections.trafficDns) Column(
+                modifier = Modifier
+                    .tabletReadableColumn()
+                    .padding(16.dp)
             ) {
                 URButton(
                     onClick = {
-                        draft?.let {
-                            dnsSettingsViewModel.apply(it)
-                            original = it
+                        val edited = draft
+                        val editedFrom = original
+                        if (edited != null && editedFrom != null) {
+                            if (dnsSettingsViewModel.apply(edited, editedFrom)) {
+                                original = edited
+                            } else {
+                                // the settings changed under the editor: start
+                                // again from the ones in force
+                                draft = dnsSettingsViewModel.settings
+                                original = dnsSettingsViewModel.settings
+                            }
                         }
                     },
                     enabled = isDirty
@@ -634,7 +672,7 @@ private fun EditableValueList(
     onChange: (List<String>) -> Unit,
 ) {
 
-    var newValue by remember { mutableStateOf(TextFieldValue("")) }
+    var newValue by rememberSaveable(stateSaver = TextFieldValue.Saver) { mutableStateOf(TextFieldValue("")) }
 
     val trimmed = newValue.text.trim()
     val canAdd = validate(trimmed) && !values.contains(trimmed)

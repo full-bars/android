@@ -1,5 +1,6 @@
 package com.bringyour.network.ui.settings
 
+import com.bringyour.network.ui.components.FoldSafeBasicAlertDialog
 import com.bringyour.network.ui.components.tabletReadableColumn
 import com.bringyour.network.BuildConfig
 import android.app.Activity
@@ -34,7 +35,6 @@ import androidx.compose.material.icons.automirrored.outlined.Outbound
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.AlertDialogDefaults
-import androidx.compose.material3.BasicAlertDialog
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -56,6 +56,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -65,6 +66,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.AnnotatedString
@@ -84,8 +86,12 @@ import com.bringyour.network.LoginActivity
 import com.bringyour.network.MainApplication
 import com.bringyour.network.ui.account.AccountViewModel
 import com.bringyour.network.ui.components.InfoIconWithOverlay
-import com.bringyour.network.ui.components.URLinkText
+import com.bringyour.network.ui.components.SupportContact
+import com.bringyour.network.ui.components.openSupportUri
 import com.bringyour.network.ui.components.URSwitch
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.TextFieldValue
 import com.bringyour.network.ui.components.URTextInputLabel
 import com.bringyour.network.ui.components.URTextInput
@@ -103,13 +109,19 @@ import com.bringyour.network.ui.Route
 import com.bringyour.network.ui.components.ButtonStyle
 import com.bringyour.network.ui.components.URButton
 import com.bringyour.network.ui.shared.models.ProvideControlMode
+import com.bringyour.network.ui.shared.models.ProvidePowerMode
 import com.bringyour.network.ui.shared.viewmodels.OverlayViewModel
 import com.bringyour.network.ui.shared.viewmodels.Plan
 import com.bringyour.network.ui.shared.viewmodels.PlanViewModel
 import com.bringyour.network.ui.shared.viewmodels.SubscriptionBalanceViewModel
 import com.bringyour.network.ui.theme.BlueMedium
 import com.bringyour.network.ui.theme.Green
+import com.bringyour.network.ui.upgrade.SubscriptionManageLine
+import com.bringyour.network.ui.wallet.BittensorKeyScreenRequests
+import com.bringyour.network.ui.wallet.BittensorKeySignOut
 import com.bringyour.network.ui.wallet.EarningsViewModel
+import com.bringyour.network.ui.wallet.SeekerSignOutcome
+import com.bringyour.network.ui.wallet.SeekerVerifyNotice
 import com.solana.mobilewalletadapter.clientlib.ActivityResultSender
 import com.solana.mobilewalletadapter.clientlib.ConnectionIdentity
 import com.solana.mobilewalletadapter.clientlib.MobileWalletAdapter
@@ -126,6 +138,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.bringyour.network.TAG
 import com.bringyour.network.ui.components.ProvideCellPicker
 import com.bringyour.network.ui.components.ProvideControlModePicker
+import com.bringyour.network.ui.components.ProvidePowerModePicker
 import com.bringyour.network.location.MockLocationStatus
 import com.bringyour.network.location.MockLocationTarget
 import com.bringyour.network.ui.connect.providerlocations.MockLocationViewModel
@@ -145,6 +158,8 @@ import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
  * @param activityResultSender Sender for Mobile Wallet Adapter (MWA) activity results.
  * @param earningsViewModel ViewModel managing earnings, rewards, and Seeker token holder status.
  * @param isPro True if the current account holds an active supporter subscription tier.
+ * @param currentStore The store of the current subscription, null when there is none.
+ * @param planNotices The lines under the plan row (the past-due notice, PaymentPastDueNotice).
  * @param mockLocationViewModel ViewModel managing mock location simulation preferences and status.
  */
 @OptIn(ExperimentalMaterial3Api::class)
@@ -158,6 +173,8 @@ fun SettingsScreen(
     activityResultSender: ActivityResultSender?,
     earningsViewModel: EarningsViewModel,
     isPro: Boolean,
+    currentStore: String? = null,
+    planNotices: @Composable () -> Unit = {},
     mockLocationViewModel: MockLocationViewModel = hiltViewModel(),
 ) {
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -187,7 +204,7 @@ fun SettingsScreen(
     val isAddingAuth = settingsViewModel.isAddingAuth.collectAsState().value
     val isRemovingAuth = settingsViewModel.isRemovingAuth.collectAsState().value
 
-    var presentAddAuthSheet by remember { mutableStateOf(false) }
+    var presentAddAuthSheet by rememberSaveable { mutableStateOf(false) }
     var pendingRemoveMethod by remember { mutableStateOf<String?>(null) }
     var removeAuthError by remember { mutableStateOf<String?>(null) }
 
@@ -215,12 +232,13 @@ fun SettingsScreen(
     val iconUri = Uri.parse("favicon.ico")
     val identityName = "URnetwork"
     val snackbarHostState = remember { SnackbarHostState() }
+    val context = LocalContext.current
 
     val clipboardManager = LocalClipboardManager.current
 
 
-    var isPresentingRenameDevice by remember { mutableStateOf(false) }
-    var editingDeviceName by remember { mutableStateOf(TextFieldValue("")) }
+    var isPresentingRenameDevice by rememberSaveable { mutableStateOf(false) }
+    var editingDeviceName by rememberSaveable(stateSaver = TextFieldValue.Saver) { mutableStateOf(TextFieldValue("")) }
 
     LaunchedEffect(Unit) {
         settingsViewModel.fetchDeviceInfo()
@@ -248,35 +266,51 @@ fun SettingsScreen(
                     signMessagesDetached(arrayOf(message.toByteArray()), arrayOf((authResult.accounts.first().publicKey)))
                 }
 
-                when (result) {
-                    is TransactionResult.Success -> {
-                        val signedMessageBytes = result.successPayload?.messages?.first()?.signatures?.first()
-                        val signatureBase64 = Base64.encodeToString(signedMessageBytes, Base64.NO_WRAP)
-                        // val message = result.successPayload?.messages?.first()?.message?.decodeToString()
-                        val pk = SolanaPublicKey(result.authResult.accounts.first().publicKey)
-
-                        earningsViewModel.verifySeekerHolder(
-                            pk,
-                            message,
-                            signatureBase64
-                        ) { errMsg ->
-                            scope.launch {
-                                snackbarHostState.showSnackbar(
-                                    message = errMsg,
-                                    withDismissAction = true,
-                                    duration = SnackbarDuration.Indefinite
-                                )
-                            }
-                        }
-
-
+                val showNotice: (SeekerVerifyNotice) -> Unit = { notice ->
+                    val noticeMessage = when (notice) {
+                        SeekerVerifyNotice.NoWalletApp ->
+                            context.getString(R.string.seeker_verify_no_wallet_app)
+                        SeekerVerifyNotice.Failed ->
+                            context.getString(R.string.seeker_verify_failed)
+                        is SeekerVerifyNotice.NotHolder ->
+                            context.getString(R.string.seeker_token_not_found, notice.walletSuffix)
+                        is SeekerVerifyNotice.ServerMessage -> notice.message
                     }
-                    is TransactionResult.NoWalletFound -> {
-                        println("No MWA compatible wallet app found on device.")
+                    scope.launch {
+                        snackbarHostState.showSnackbar(
+                            message = noticeMessage,
+                            withDismissAction = true,
+                            duration = SnackbarDuration.Indefinite
+                        )
                     }
+                }
+
+                // a wallet app that cannot sign is shown, not only logged
+                val signedMessageBytes = (result as? TransactionResult.Success)
+                    ?.successPayload?.messages?.firstOrNull()?.signatures?.firstOrNull()
+                val signOutcome = when (result) {
+                    is TransactionResult.Success ->
+                        if (signedMessageBytes == null) SeekerSignOutcome.NoSignature else SeekerSignOutcome.Signed
+                    is TransactionResult.NoWalletFound -> SeekerSignOutcome.NoWalletApp
                     is TransactionResult.Failure -> {
-                        println("Error during transaction signing: ${result.e}")
+                        Log.i(TAG, "Error during transaction signing: ${result.e}")
+                        SeekerSignOutcome.Failed
                     }
+                }
+
+                val signNotice = SeekerVerifyNotice.fromSign(signOutcome)
+                if (signNotice != null) {
+                    showNotice(signNotice)
+                } else if (result is TransactionResult.Success && signedMessageBytes != null) {
+                    val signatureBase64 = Base64.encodeToString(signedMessageBytes, Base64.NO_WRAP)
+                    val pk = SolanaPublicKey(result.authResult.accounts.first().publicKey)
+
+                    earningsViewModel.verifySeekerHolder(
+                        pk,
+                        message,
+                        signatureBase64,
+                        showNotice
+                    )
                 }
             }
 
@@ -300,6 +334,7 @@ fun SettingsScreen(
             editingDeviceName = TextFieldValue(settingsViewModel.deviceName)
             isPresentingRenameDevice = true
         },
+        networkName = networkUser?.networkName,
         showDeleteAccountDialog = showDeleteAccountDialog,
         setShowDeleteAccountDialog = settingsViewModel.setShowDeleteAccountDialog,
         deleteAccount = settingsViewModel.deleteAccount,
@@ -312,6 +347,8 @@ fun SettingsScreen(
         version = settingsViewModel.version,
         allowProvideCell = settingsViewModel.allowProvideOnCell.collectAsState().value,
         toggleProvideCell = settingsViewModel.toggleAllowProvideOnCell,
+        providePowerMode = settingsViewModel.providePowerMode.collectAsState().value,
+        setProvidePowerMode = settingsViewModel.setProvidePowerMode,
         authCodeCreate = settingsViewModel.authCodeCreate,
         authCode = authCode,
         isCreatingAuthCode = settingsViewModel.isCreatingAuthCode.collectAsState().value,
@@ -319,6 +356,8 @@ fun SettingsScreen(
         provideIndicatorColor = settingsViewModel.provideIndicatorColor,
         provideIndicatorRingColor = settingsViewModel.provideIndicatorRingColor,
         stripePortalUrl = settingsViewModel.stripePortalUrl.collectAsState().value,
+        currentStore = currentStore,
+        planNotices = planNotices,
         authMethods = authMethods,
         onRemoveAuthMethod = { method -> pendingRemoveMethod = method },
         onAddAuthMethodClick = { presentAddAuthSheet = true },
@@ -340,9 +379,22 @@ fun SettingsScreen(
         onOpenMockLocationGuide = {
             navController.navigate(Route.MockLocationGuide)
         },
+        showCloudProxyEntry = CloudProxy.entryVisible(accountViewModel.loginMode),
+        onCloudProxyClick = {
+            // Open the existing ur.io cloud proxies page (P150). Opened without a
+            // one-time auth code for now; see CloudProxy for the signed-in follow-up.
+            val linkHostName = (context.applicationContext as? MainApplication)
+                ?.deviceManager?.networkSpace?.linkHostName
+            val proxiesUrl = CloudProxy.proxiesUrl(linkHostName)
+            runCatching {
+                context.startActivity(Intent(Intent.ACTION_VIEW, proxiesUrl.toUri()))
+            }
+        },
     )
 
     if (isPresentingRenameDevice) {
+        val deviceNameUpdated = stringResource(id = R.string.device_name_updated)
+        val deviceNameUpdateFailed = stringResource(id = R.string.error_updating_device_name)
         URDialog(
             visible = true,
             onDismiss = { isPresentingRenameDevice = false }
@@ -367,8 +419,7 @@ fun SettingsScreen(
                             isPresentingRenameDevice = false
                             scope.launch {
                                 snackbarHostState.showSnackbar(
-                                    message = if (success) "Device name updated"
-                                        else "There was an error updating the device name.",
+                                    message = if (success) deviceNameUpdated else deviceNameUpdateFailed,
                                     withDismissAction = true,
                                     duration = SnackbarDuration.Short
                                 )
@@ -399,7 +450,7 @@ fun SettingsScreen(
     AddAuthMethodSheet(
         visible = presentAddAuthSheet,
         onDismiss = { presentAddAuthSheet = false },
-        showGoogleOption = BuildConfig.BRINGYOUR_BUNDLE_SSO_GOOGLE,
+        showSsoOptions = BuildConfig.BRINGYOUR_BUNDLE_SSO_GOOGLE,
         activityResultSender = activityResultSender,
         isAddingAuth = isAddingAuth,
         addAuth = settingsViewModel.addAuth,
@@ -418,13 +469,16 @@ fun SettingsScreen(
     ) {
         Column(modifier = Modifier.fillMaxWidth()) {
             Text(
-                "Remove ${pendingRemoveMethod?.let { methodDisplayName(it) } ?: ""}?",
+                stringResource(id = R.string.remove_this_sign_in_method),
                 style = MaterialTheme.typography.headlineSmall,
                 color = Color.White
             )
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                "You won't be able to sign in with this method anymore.",
+                stringResource(
+                    id = R.string.are_you_sure_you_want_to_remove,
+                    pendingRemoveMethod?.let { methodDisplayName(it) } ?: "",
+                ),
                 style = MaterialTheme.typography.bodyMedium,
                 color = Color.White
             )
@@ -449,7 +503,7 @@ fun SettingsScreen(
                 enabled = !isRemovingAuth,
                 isProcessing = isRemovingAuth
             ) { buttonTextStyle ->
-                Text("Remove", style = buttonTextStyle)
+                Text(stringResource(id = R.string.remove), style = buttonTextStyle)
             }
         }
     }
@@ -464,17 +518,21 @@ fun SettingsScreen(
         Column(modifier = Modifier.fillMaxWidth()) {
             val isRegenerate = pendingSeedphraseAction == SeedphraseAction.REGENERATE
             Text(
-                if (isRegenerate) "Regenerate your seedphrase?" else "Generate a seedphrase?",
+                stringResource(
+                    id = if (isRegenerate) R.string.regenerate_seedphrase_title else R.string.generate_a_recovery_seedphrase
+                ),
                 style = MaterialTheme.typography.headlineSmall,
                 color = Color.White
             )
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                if (isRegenerate) {
-                    "Your current seedphrase will stop working. You'll be shown a new one to save."
-                } else {
-                    "A seedphrase lets you recover your account if you lose access. You'll be shown it once."
-                },
+                stringResource(
+                    id = if (isRegenerate) {
+                        R.string.regenerate_seedphrase_body
+                    } else {
+                        R.string.a_seedphrase_lets_you_recover_your_account_2
+                    }
+                ),
                 style = MaterialTheme.typography.bodyMedium,
                 color = Color.White
             )
@@ -496,7 +554,7 @@ fun SettingsScreen(
                 enabled = !isGeneratingSeedphrase && !isRegeneratingSeedphrase,
                 isProcessing = isGeneratingSeedphrase || isRegeneratingSeedphrase
             ) { buttonTextStyle ->
-                Text(if (isRegenerate) "Regenerate" else "Generate", style = buttonTextStyle)
+                Text(stringResource(id = if (isRegenerate) R.string.regenerate else R.string.generate), style = buttonTextStyle)
             }
         }
     }
@@ -536,9 +594,10 @@ private fun SettingsScreen(
     deviceName: String = "",
     deviceSpec: String = "",
     onEditDeviceName: () -> Unit = {},
+    networkName: String? = null,
     setShowDeleteAccountDialog: (Boolean) -> Unit = {},
     showDeleteAccountDialog: Boolean,
-    deleteAccount: (onSuccess: () -> Unit, onFailure: (Exception?) -> Unit) -> Unit,
+    deleteAccount: (onSuccess: (signedOutDevice: com.bringyour.sdk.DeviceLocal) -> Unit, onFailure: (DeleteAccountOutcome.Failed) -> Unit) -> Unit,
     isDeletingAccount: Boolean,
     routeLocal: Boolean,
     toggleRouteLocal: () -> Unit,
@@ -548,6 +607,8 @@ private fun SettingsScreen(
     version: String,
     allowProvideCell: Boolean,
     toggleProvideCell: () -> Unit,
+    providePowerMode: ProvidePowerMode = ProvidePowerMode.DEFAULT,
+    setProvidePowerMode: (ProvidePowerMode) -> Unit = {},
     authCodeCreate: () -> Unit,
     authCode: String?,
     isCreatingAuthCode: Boolean,
@@ -555,6 +616,9 @@ private fun SettingsScreen(
     provideIndicatorColor: Color,
     provideIndicatorRingColor: Color? = null,
     stripePortalUrl: String?,
+    currentStore: String? = null,
+    // the lines under the plan row (PaymentPastDueNotice)
+    planNotices: @Composable () -> Unit = {},
     authMethods: List<String>,
     onRemoveAuthMethod: (String) -> Unit,
     onAddAuthMethodClick: () -> Unit,
@@ -568,14 +632,16 @@ private fun SettingsScreen(
     mockLocationTarget: MockLocationTarget? = null,
     onToggleMockLocation: () -> Unit = {},
     onOpenMockLocationGuide: () -> Unit = {},
+    showCloudProxyEntry: Boolean = false,
+    onCloudProxyClick: () -> Unit = {},
 ) {
 
     val context = LocalContext.current
     val clipboardManager = LocalClipboardManager.current
     val application = context.applicationContext as? MainApplication
+    // outlives the delete dialog, which closes before the failure snackbar shows
+    val deleteAccountScope = rememberCoroutineScope()
 
-    // todo - load this maybe as an config var?
-    val discordInviteLink = "https://discord.com/invite/RUNZXMwPRK"
 
     val depinHubStr = "DePIN Hub"
     val depinHubLink = "https://depinhub.io/projects/urnetwork"
@@ -595,7 +661,7 @@ private fun SettingsScreen(
                 },
                 navigationIcon = {
                     IconButton(onClick = { navController.popBackStack() }) {
-                        Icon(Icons.AutoMirrored.Filled.KeyboardArrowLeft, contentDescription = "Back")
+                        Icon(Icons.AutoMirrored.Filled.KeyboardArrowLeft, contentDescription = stringResource(id = R.string.back))
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
@@ -625,7 +691,7 @@ private fun SettingsScreen(
              * Client ID
              */
             URTextInputLabel(
-                text = "Client ID"
+                text = stringResource(id = R.string.client_id)
             )
             Row(
                 modifier = Modifier
@@ -650,7 +716,7 @@ private fun SettingsScreen(
 
                 Icon(
                     painter = painterResource(id = R.drawable.content_copy),
-                    contentDescription = "Copy",
+                    contentDescription = stringResource(id = R.string.copy),
                     tint = TextMuted,
                     modifier = Modifier.width(16.dp)
                 )
@@ -713,7 +779,7 @@ private fun SettingsScreen(
 
                 Icon(
                     imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
-                    contentDescription = "Keyboard Arrow Right",
+                    contentDescription = null,
                     tint = TextMuted
                 )
             }
@@ -724,7 +790,7 @@ private fun SettingsScreen(
             /**
              * Seedphrase
              */
-            URTextInputLabel(text = "Seedphrase")
+            URTextInputLabel(text = stringResource(id = R.string.seedphrase))
 
             Row(
                 modifier = Modifier
@@ -734,7 +800,7 @@ private fun SettingsScreen(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    if (hasSeedphrase) "Regenerate Seedphrase" else "Generate Seedphrase",
+                    stringResource(id = if (hasSeedphrase) R.string.regenerate_seedphrase else R.string.generate_seedphrase),
                     style = MaterialTheme.typography.bodyMedium,
                     color = Color.White
                 )
@@ -749,7 +815,7 @@ private fun SettingsScreen(
                             )
                         }) {
                             Text(
-                                if (hasSeedphrase) "Regenerate" else "Generate",
+                                stringResource(id = if (hasSeedphrase) R.string.regenerate else R.string.generate),
                                 color = BlueMedium
                             )
                         }
@@ -757,7 +823,7 @@ private fun SettingsScreen(
                 }
             }
             Text(
-                "A seedphrase lets you recover your account if you lose access.",
+                stringResource(id = R.string.a_seedphrase_lets_you_recover_your_account),
                 style = MaterialTheme.typography.bodySmall,
                 color = TextMuted
             )
@@ -767,7 +833,7 @@ private fun SettingsScreen(
             /**
              * Sign-In Methods
              */
-            URTextInputLabel(text = "Sign-In Methods")
+            URTextInputLabel(text = stringResource(id = R.string.sign_in_methods))
 
             authMethods.forEach { method ->
                 Row(
@@ -788,7 +854,7 @@ private fun SettingsScreen(
                     if (authMethods.size > 1) {
                         TextButton(onClick = { onRemoveAuthMethod(method) }) {
                             Text(
-                                "Remove",
+                                stringResource(id = R.string.remove),
                                 color = TextDanger
                             )
                         }
@@ -798,7 +864,7 @@ private fun SettingsScreen(
 
             TextButton(onClick = onAddAuthMethodClick) {
                 Text(
-                    "Add sign-in method",
+                    stringResource(id = R.string.add_sign_in_method),
                     color = BlueMedium
                 )
             }
@@ -810,36 +876,41 @@ private fun SettingsScreen(
              */
             URTextInputLabel(stringResource(id = R.string.general))
 
-            if (supportsBatteryOptimizationExemption()) {
-                /**
-                 * Battery optimization
-                 */
+            /**
+             * Battery optimization
+             */
 
-                Spacer(modifier = Modifier.height(18.dp))
+            // the switch's 48 dp touch target fills the rest
+            Spacer(modifier = Modifier.height(4.dp))
 
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        stringResource(id = R.string.ignore_battery_optimizations),
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = Color.White
-                    )
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    stringResource(id = R.string.ignore_battery_optimizations),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Color.White
+                )
 
-                    BatteryOptimizationToggle()
+                BatteryOptimizationToggle()
 
-                }
+            }
 
-                Row {
-                    Text(
-                        stringResource(id = R.string.disable_ignore_battery_hint),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = TextMuted
-                    )
-                }
+            Row {
+                Text(
+                    stringResource(
+                        id = if (supportsBatteryOptimizationExemption()) {
+                            R.string.disable_ignore_battery_settings_hint
+                        } else {
+                            R.string.battery_optimization_settings_hint
+                        }
+                    ),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextMuted
+                )
             }
 
             Spacer(modifier = Modifier.height(32.dp))
@@ -915,7 +986,8 @@ private fun SettingsScreen(
                 provideIndicatorRingColor
             )
 
-            Spacer(modifier = Modifier.height(18.dp))
+            // the switch's 48 dp touch target fills the rest
+            Spacer(modifier = Modifier.height(4.dp))
 
             /**
              * Allow providing on cell networks
@@ -925,7 +997,20 @@ private fun SettingsScreen(
                 toggleProvideCell = toggleProvideCell
             )
 
-            Spacer(modifier = Modifier.height(18.dp))
+            // the switch's 48 dp touch target fills the rest
+            Spacer(modifier = Modifier.height(4.dp))
+
+            /**
+             * Providing on battery: keep providing, pause in Battery Saver
+             * (the default), or pause until charging
+             */
+            ProvidePowerModePicker(
+                providePowerMode = providePowerMode,
+                setProvidePowerMode = setProvidePowerMode
+            )
+
+            // the switch's 48 dp touch target fills the rest
+            Spacer(modifier = Modifier.height(4.dp))
 
             /**
              * Kill switch
@@ -943,8 +1028,6 @@ private fun SettingsScreen(
                         color = Color.White
                     )
 
-                    Spacer(modifier = Modifier.width(6.dp))
-
                     InfoIconWithOverlay(
                         contentDescription = stringResource(
                             id = R.string.show_kill_switch_exception
@@ -958,8 +1041,16 @@ private fun SettingsScreen(
                                 color = Color.White
                             )
                             Spacer(modifier = Modifier.height(8.dp))
+                            // the tunnel captures ::/0 like 0.0.0.0/0 (VpnRoutes.kt),
+                            // so the only public-route exception is SMTP on port 25
                             Text(
-                                stringResource(id = R.string.kill_switch_exception_detail),
+                                stringResource(id = R.string.kill_switch_exception_smtp_detail),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = BlueLight
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                stringResource(id = R.string.kill_switch_exception_unrecognized_encrypted),
                                 style = MaterialTheme.typography.bodySmall,
                                 color = BlueLight
                             )
@@ -975,7 +1066,7 @@ private fun SettingsScreen(
                 )
             }
 
-            Spacer(modifier = Modifier.height(18.dp))
+            // no spacer: the two switches' 48 dp touch targets space these rows
 
             /**
              * Device location sync (the mock location provider setup guide)
@@ -1005,14 +1096,14 @@ private fun SettingsScreen(
 
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
-                            contentDescription = "Keyboard Arrow Right",
+                            contentDescription = null,
                             tint = TextMuted
                         )
                     }
 
                     // ORPHANED is not a togglable state: the test providers are
                     // stuck until URnetwork is re-selected in developer options
-                    // and cleanup retries itself, so a switch that still reads ON
+                    // and cleanup retries itself, so a switch that still reads "on"
                     // would be lying. Every other state stays tappable — an
                     // incomplete setup reaches the guide through this switch.
                     URSwitch(
@@ -1042,7 +1133,6 @@ private fun SettingsScreen(
                     // the chain is progress, not a problem
                     val statusIsError = mockLocationStatus == MockLocationStatus.ORPHANED ||
                             mockLocationStatus == MockLocationStatus.ERROR_TRANSIENT
-                    Spacer(modifier = Modifier.height(2.dp))
                     Text(
                         statusSubtitle,
                         style = MaterialTheme.typography.bodySmall,
@@ -1054,7 +1144,8 @@ private fun SettingsScreen(
                 }
             }
 
-            Spacer(modifier = Modifier.height(18.dp))
+            // the switch's 48 dp touch target fills the rest
+            Spacer(modifier = Modifier.height(12.dp))
 
             Row(
                 modifier = Modifier
@@ -1073,9 +1164,75 @@ private fun SettingsScreen(
 
                 Icon(
                     imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
-                    contentDescription = "Keyboard Arrow Right",
+                    contentDescription = null,
                     tint = TextMuted
                 )
+            }
+
+            Spacer(modifier = Modifier.height(18.dp))
+
+            /**
+             * VLESS: a VLESS server this network space also dials through
+             */
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        navController.navigate(Route.Vless)
+                    }
+                    .padding(vertical = 6.dp),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    stringResource(id = R.string.vless),
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+
+                Icon(
+                    imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                    contentDescription = null,
+                    tint = TextMuted
+                )
+            }
+
+            // Run URnetwork as a cloud proxy instead of the VPN (P150): opens
+            // ur.io/app/proxies, where the HTTPS proxy is always on and SOCKS and
+            // WireGuard are available on Pro. Hidden for guests (no account). The
+            // title and note are the other apps' proxies row strings, so the entry
+            // reads the same on every platform.
+            if (showCloudProxyEntry) {
+                Spacer(modifier = Modifier.height(18.dp))
+
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onCloudProxyClick() }
+                            .padding(vertical = 6.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            stringResource(id = R.string.use_wireguard_socks_https_proxy),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = Color.White,
+                            modifier = Modifier.testTag("acceptance.cloud_proxy_entry")
+                        )
+
+                        // decorative: the note below says the row opens the browser
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Outlined.Outbound,
+                            contentDescription = null,
+                            tint = TextMuted
+                        )
+                    }
+
+                    Text(
+                        stringResource(id = R.string.use_wireguard_socks_https_proxy_note),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TextMuted
+                    )
+                }
             }
 
             Spacer(modifier = Modifier.height(32.dp))
@@ -1135,42 +1292,60 @@ private fun SettingsScreen(
                 )
             }
 
-            Spacer(modifier = Modifier.height(18.dp))
+            // the switch's 48 dp touch target fills the rest; 14 dp stays clear
+            // for the touch area of the 20 dp link button below
+            Spacer(modifier = Modifier.height(14.dp))
 
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.Bottom
-            ) {
+            // one row per support contact; the email comes first since Discord is unreachable in some regions
+            SupportContact.settingsLinks.forEachIndexed { index, link ->
+
+                if (0 < index) {
+                    Spacer(modifier = Modifier.height(18.dp))
+                }
 
                 Row(
-                    verticalAlignment = Alignment.CenterVertically
+                    modifier = Modifier
+                        .fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.Bottom
                 ) {
-                    Text(
-                        stringResource(id = R.string.join_community_discord),
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = Color.White
-                    )
-                    Spacer(modifier = Modifier.width(3.dp))
-                    URLinkText(
-                        text = "Discord",
-                        url = discordInviteLink,
-                        fontSize = 14.sp
-                    )
-                }
-                IconButton(
-                    onClick = {
-                        val intent = Intent(Intent.ACTION_VIEW, discordInviteLink.toUri())
-                        context.startActivity(intent)
-                    },
-                    modifier = Modifier.size(20.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.AutoMirrored.Outlined.Outbound,
-                        contentDescription = "Right Arrow",
-                        tint = TextMuted,
-                    )
+
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            stringResource(
+                                id = if (link == SupportContact.emailLink) {
+                                    R.string.email_support_at
+                                } else {
+                                    R.string.join_community_discord
+                                }
+                            ),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = Color.White
+                        )
+                        Spacer(modifier = Modifier.width(3.dp))
+                        Text(
+                            link.text,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = BlueMedium,
+                            modifier = Modifier.clickable {
+                                openSupportUri(context, link.uri)
+                            }
+                        )
+                    }
+                    IconButton(
+                        onClick = {
+                            openSupportUri(context, link.uri)
+                        },
+                        modifier = Modifier.size(20.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Outlined.Outbound,
+                            contentDescription = link.text,
+                            tint = TextMuted,
+                        )
+                    }
                 }
             }
 
@@ -1189,7 +1364,7 @@ private fun SettingsScreen(
 
                     Image(
                         painter = painterResource(id = R.drawable.depin_hub),
-                        contentDescription = "Image description",
+                        contentDescription = null,
                         modifier = Modifier.size(24.dp),
                         contentScale = ContentScale.Fit
                     )
@@ -1222,7 +1397,7 @@ private fun SettingsScreen(
                 ) {
                     Icon(
                         imageVector = Icons.AutoMirrored.Outlined.Outbound,
-                        contentDescription = "Right Arrow",
+                        contentDescription = depinHubStr,
                         tint = TextMuted,
                     )
                 }
@@ -1246,15 +1421,13 @@ private fun SettingsScreen(
                 ) {
 
                     Text(
-                        if (currentPlan == Plan.Basic) "Basic" else "Pro",
+                        stringResource(id = if (currentPlan == Plan.Basic) R.string.free else R.string.supporter),
                         style = MaterialTheme.typography.bodyMedium,
                         color = Color.White
                     )
 
 
                     if (currentPlan == Plan.Basic) {
-                        Spacer(modifier = Modifier.width(2.dp))
-
                         InfoIconWithOverlay() {
                             Column() {
 
@@ -1284,7 +1457,7 @@ private fun SettingsScreen(
                                         )
                                     )
                                     Icon(imageVector = Icons.AutoMirrored.Filled.ArrowForward,
-                                        contentDescription = "Right Arrow",
+                                        contentDescription = null,
                                         tint = BlueLight,
                                         modifier = Modifier.size(20.dp)
                                     )
@@ -1308,12 +1481,19 @@ private fun SettingsScreen(
 
                 if (currentPlan == Plan.Supporter) {
 
-                    ManageSubscriptionButton(stripePortalUrl)
+                    // a one-time crypto payment does not renew and has nothing to manage
+                    // (src/cryptoPay); otherwise the flavor's manage button
+                    SubscriptionManageLine(currentStore = currentStore, stripePortalUrl = stripePortalUrl)
 
                 }
             }
 
-            Spacer(modifier = Modifier.height(32.dp))
+            // a renewal whose payment did not go through, under the manage line
+            planNotices()
+
+            // the free plan's info icon makes its row 48 dp tall, 14 dp of it
+            // below the text
+            Spacer(modifier = Modifier.height(if (currentPlan == Plan.Basic) 18.dp else 32.dp))
 
             /**
             * Version
@@ -1335,7 +1515,7 @@ private fun SettingsScreen(
                 )
                 Icon(
                     Icons.AutoMirrored.Filled.KeyboardArrowRight,
-                    contentDescription = stringResource(id = R.string.dev_open_tools),
+                    contentDescription = null,
                 )
             }
 
@@ -1371,6 +1551,30 @@ private fun SettingsScreen(
                 }
             )
 
+            Spacer(modifier = Modifier.height(16.dp))
+
+            /**
+             * Licenses
+             */
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        navController.navigate(Route.Licenses)
+                    }
+                    .padding(vertical = 6.dp),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    stringResource(id = R.string.licenses),
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Icon(
+                    Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                    contentDescription = null,
+                )
+            }
+
             // The Seeker/Saga data multiplier is promoted only on the Solana Mobile flavor.
             if (BuildConfig.BRINGYOUR_BUNDLE_STORE == "solana_dapp") {
 
@@ -1396,7 +1600,7 @@ private fun SettingsScreen(
                 if (isSeekerHolder) {
                     Icon(
                         Icons.Filled.Check,
-                        contentDescription = "Multiplier claimed",
+                        contentDescription = stringResource(id = R.string.claim_confirmed),
                         tint = Green
                     )
                 } else {
@@ -1415,6 +1619,13 @@ private fun SettingsScreen(
 
             Text(
                 stringResource(id = R.string.connect_seeker_wallet),
+                style = MaterialTheme.typography.bodySmall,
+                color = TextMuted
+            )
+
+            // the multiplier doubles points, free daily data and referral data; it does not grant Pro
+            Text(
+                stringResource(id = R.string.seeker_multiplier_benefit),
                 style = MaterialTheme.typography.bodySmall,
                 color = TextMuted
             )
@@ -1442,7 +1653,7 @@ private fun SettingsScreen(
                 ) {
                     Icon(
                         imageVector = Icons.AutoMirrored.Outlined.Outbound,
-                        contentDescription = "Right Arrow",
+                        contentDescription = stringResource(id = R.string.learn_more),
                         tint = TextMuted,
                     )
                 }
@@ -1468,7 +1679,19 @@ private fun SettingsScreen(
         }
 
         if (showDeleteAccountDialog) {
-            BasicAlertDialog(
+            // scoped to the dialog: closing it discards the entry, so the
+            // next open starts empty rather than pre-confirmed
+            var deleteConfirmText by rememberSaveable(stateSaver = TextFieldValue.Saver) { mutableStateOf(TextFieldValue("")) }
+            val requiresTypedName = DeleteAccountConfirmation.requiresTypedName(networkName)
+            val deleteConfirmed = DeleteAccountConfirmation.confirms(networkName, deleteConfirmText.text)
+            val deleteAccountFailedText = stringResource(id = R.string.error_deleting_account)
+            // the network the dialog deletes, and whether its payout key on this
+            // device is unsaved: the phrase can't be recovered once the key goes
+            // with the account
+            val deletedNetworkId = remember { BittensorKeySignOut.networkId(context) }
+            val keyNeedsBackup = remember { BittensorKeySignOut.needsBackup(context, deletedNetworkId) }
+
+            FoldSafeBasicAlertDialog(
                 onDismissRequest = {
                     setShowDeleteAccountDialog(false)
                 },
@@ -1510,34 +1733,129 @@ private fun SettingsScreen(
                             )
                         }
 
+                        if (keyNeedsBackup) {
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            Row {
+                                Text(
+                                    stringResource(id = R.string.bittensor_key_delete_account_message_2),
+                                    style = MaterialTheme.typography.bodyLarge
+                                )
+                            }
+                        }
+
+                        if (requiresTypedName) {
+                            Spacer(modifier = Modifier.height(12.dp))
+
+                            Row {
+                                Text(
+                                    stringResource(
+                                        id = R.string.delete_account_type_network_name,
+                                        networkName ?: ""
+                                    ),
+                                    style = MaterialTheme.typography.bodyLarge
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            URTextInput(
+                                value = deleteConfirmText,
+                                onValueChange = { deleteConfirmText = it },
+                                label = null,
+                                placeholder = networkName ?: "",
+                                // network names are lowercase identifiers;
+                                // an auto-capitalised or auto-corrected
+                                // entry would never match
+                                keyboardOptions = KeyboardOptions(
+                                    capitalization = KeyboardCapitalization.None,
+                                    autoCorrectEnabled = false,
+                                    imeAction = ImeAction.Done
+                                ),
+                                enabled = !isDeletingAccount,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+
                         Spacer(modifier = Modifier.height(16.dp))
 
-                        Row {
+                        if (keyNeedsBackup) {
+                            URButton(
+                                onClick = {
+                                    setShowDeleteAccountDialog(false)
+                                    BittensorKeyScreenRequests.request()
+                                },
+                                enabled = !isDeletingAccount,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("acceptance.account.delete.backUpFirst")
+                            ) { buttonTextStyle ->
+                                Text(
+                                    stringResource(id = R.string.bittensor_key_back_up_first),
+                                    style = buttonTextStyle
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.height(8.dp))
+                        }
+
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            URButton(
+                                onClick = {
+                                    setShowDeleteAccountDialog(false)
+                                },
+                                style = ButtonStyle.OUTLINE,
+                                modifier = Modifier.weight(1f)
+                            ) { buttonTextStyle ->
+                                Text(
+                                    stringResource(id = R.string.cancel),
+                                    style = buttonTextStyle
+                                )
+                            }
+
                             URButton(
                                 onClick = {
 
                                     deleteAccount(
-                                        {
+                                        { signedOutDevice ->
                                             setShowDeleteAccountDialog(false)
 
-                                            application?.logout()
+                                            // the network is gone, and so is its payout key
+                                            // on this device, with its reminder
+                                            BittensorKeySignOut.forgetNetwork(context, deletedNetworkId)
 
-                                            val intent = Intent(context, LoginActivity::class.java)
-                                            context.startActivity(intent)
+                                            // only the deleted account signs out: by the
+                                            // server's answer it may be signed out already,
+                                            // and the next account signed in
+                                            if (application?.logout(signedOutDevice) == true) {
+                                                val intent = Intent(context, LoginActivity::class.java)
+                                                context.startActivity(intent)
 
-                                            (context as? Activity)?.finish()
+                                                (context as? Activity)?.finish()
+                                            }
 
                                         },
-                                        { exception ->
-                                            Log.i(TAG, "Error deleting account: ${exception?.message}")
+                                        { failed ->
+                                            // the account still exists: stay signed in, say why
                                             setShowDeleteAccountDialog(false)
-                                            // todo: snackbar show error
+                                            val message = DeleteAccountOutcome.failureMessage(deleteAccountFailedText, failed)
+                                            deleteAccountScope.launch {
+                                                snackbarHostState.showSnackbar(
+                                                    message = message,
+                                                    withDismissAction = true,
+                                                    duration = SnackbarDuration.Indefinite
+                                                )
+                                            }
                                         }
                                     )
                                 },
                                 style = ButtonStyle.WARNING,
-                                enabled = !isDeletingAccount,
-                                isProcessing = isDeletingAccount
+                                enabled = deleteConfirmed && !isDeletingAccount,
+                                isProcessing = isDeletingAccount,
+                                modifier = Modifier.weight(1f)
                             ) { buttonTextStyle ->
                                 Text(
                                     stringResource(id = R.string.delete_account),
@@ -1622,14 +1940,14 @@ fun BatteryOptimizationToggle() {
         }
     }
 
+    // the switch reflects the system state; the app cannot change it itself,
+    // so a tap asks for the exemption or opens the system setting
+    // (batteryOptimizationAction), and the state is re-read on resume
     URSwitch(
         checked = isIgnored,
         toggle = {
-            if (!isIgnored) {
-                requestBatteryOptimizationExemption(context)
-            }
-        },
-        enabled = !isIgnored
+            performBatteryOptimizationAction(context, isIgnored)
+        }
     )
 }
 
@@ -1784,6 +2102,7 @@ private fun SettingsScreenDeleteAccountDialogPreview() {
             toggleAllowProductUpdates = {},
             provideControlMode = ProvideControlMode.AUTO,
             setProvideControlMode = {},
+            networkName = "ur_network",
             showDeleteAccountDialog = true,
             setShowDeleteAccountDialog = {},
             deleteAccount = { onSuccess, onFailure -> },

@@ -30,6 +30,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -43,6 +44,9 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.navigation.NavController
 import com.bringyour.network.R
 import com.bringyour.network.BuildConfig
+import com.bringyour.network.VpnLifecycleLog
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import com.bringyour.network.ui.wallet.EarningsDebugFlags
 import androidx.compose.runtime.collectAsState
 import com.bringyour.network.ui.components.URSwitch
@@ -102,7 +106,7 @@ fun DeveloperScreen(
                     IconButton(onClick = { navController.popBackStack() }) {
                         Icon(
                             Icons.AutoMirrored.Filled.KeyboardArrowLeft,
-                            contentDescription = "Back",
+                            contentDescription = stringResource(id = R.string.back),
                         )
                     }
                 },
@@ -138,13 +142,13 @@ private fun DeveloperContent(developerViewModel: DeveloperViewModel) {
     // A diagnostics export is most needed exactly when the connection is
     // broken or the user is signed out -- i.e. exactly when `connected`
     // (reliability != null, which requires a live device) is false. This
-    // section therefore renders ABOVE the !connected guard below rather than
+    // section therefore renders above the !connected guard below rather than
     // being gated on the healthy connection it exists to help diagnose the
     // absence of. The export tolerates a null device on its own
     // (deviceManager.device?.let { ... }), which is what makes that safe.
     URTextInputLabel(text = stringResource(id = R.string.dev_section_diagnostics))
 
-    // ABOVE the export rows on purpose: the order of operations is set the
+    // Above the export rows on purpose: the order of operations is set the
     // level, reproduce the fault, then export. A verbosity control placed
     // under the export actions is found only after the capture it was supposed
     // to widen, and the bundle it produced is the useless one -- close to half
@@ -156,7 +160,7 @@ private fun DeveloperContent(developerViewModel: DeveloperViewModel) {
         onSelect = developerViewModel.setLogVerbosity,
     )
 
-    // Beside the verbosity row and, like it, ABOVE the !connected guard below.
+    // Beside the verbosity row and, like it, above the !connected guard below.
     // An address family that fails after connecting is what makes the api
     // unreachable, so this row is reached while signed out or with the tunnel
     // down -- exactly where a row gated on `connected` would not be drawn.
@@ -199,6 +203,25 @@ private fun DeveloperContent(developerViewModel: DeveloperViewModel) {
     }
 
     val context = LocalContext.current
+    var lifecycleLog by remember { mutableStateOf("") }
+    LaunchedEffect(context) {
+        while (true) {
+            lifecycleLog = withContext(Dispatchers.IO) {
+                runCatching { VpnLifecycleLog.read(context.createDeviceProtectedStorageContext().filesDir).joinToString("\n") }
+                    .getOrElse { context.getString(R.string.vpn_lifecycle_log_read_failed) }
+            }
+            delay(DeveloperViewModel.REFRESH_POLL_MILLIS)
+        }
+    }
+    URTextInputLabel(text = stringResource(R.string.vpn_lifecycle_log_title))
+    Text(lifecycleLog.ifEmpty { stringResource(R.string.vpn_lifecycle_log_empty) }, style = MaterialTheme.typography.bodySmall, color = TextMuted)
+    DeveloperAction(label = stringResource(R.string.vpn_lifecycle_log_share), enabled = lifecycleLog.isNotEmpty()) {
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_TEXT, lifecycleLog)
+        }
+        context.startActivity(Intent.createChooser(intent, context.getString(R.string.vpn_lifecycle_log_share)))
+    }
     val shareBundle: (File) -> Unit = { file ->
         val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
         val intent = Intent(Intent.ACTION_SEND).apply {
@@ -233,7 +256,7 @@ private fun DeveloperContent(developerViewModel: DeveloperViewModel) {
     }
 
     // The total size before exporting, and any unavailable source with its
-    // reason, are both shown BEFORE the user commits to a bundle of up to
+    // reason, are both shown before the user commits to a bundle of up to
     // 4x16MB per process -- not afterwards in the summary. The read is
     // directory i/o plus a stat per file across the gomobile bridge, so it
     // happens once on entry, off the main thread.
@@ -281,7 +304,17 @@ private fun DeveloperContent(developerViewModel: DeveloperViewModel) {
         )
     }
 
-    var showPicker by remember { mutableStateOf(false) }
+    val clearingLogs = developerViewModel.clearingLogs
+
+    DeveloperAction(
+        label = stringResource(id = if (clearingLogs) R.string.dev_clearing_logs else R.string.dev_clear_logs),
+        enabled = !exporting && !clearingLogs,
+    ) {
+        developerViewModel.clearLogs(context.filesDir)
+    }
+
+
+    var showPicker by rememberSaveable { mutableStateOf(false) }
 
     DeveloperAction(
         label = stringResource(id = R.string.dev_choose_logs),
@@ -636,11 +669,12 @@ private fun DeveloperContent(developerViewModel: DeveloperViewModel) {
         checked = reliability?.affinityStickyPastCap == true,
         toggle = developerViewModel.setAffinityStickyPastCap,
     )
-    DeveloperToggle(
-        label = stringResource(id = R.string.dev_fresh_flow_affinity),
-        detail = stringResource(id = R.string.dev_fresh_flow_affinity_detail),
-        checked = reliability?.freshFlowAffinity == true,
-        toggle = developerViewModel.setFreshFlowAffinity,
+    DeveloperDurationSetting(
+        label = stringResource(id = R.string.dev_affinity_max_time),
+        detail = stringResource(id = R.string.dev_affinity_max_time_detail),
+        millis = reliability?.affinityMaxTimeMillis ?: 0L,
+        presets = DeveloperViewModel.AFFINITY_MAX_TIME_PRESETS,
+        onSelect = developerViewModel.setAffinityMaxTimeMillis,
     )
     DeveloperToggle(
         label = stringResource(id = R.string.dev_affinity_performance),
@@ -650,13 +684,13 @@ private fun DeveloperContent(developerViewModel: DeveloperViewModel) {
     )
     DeveloperToggle(
         label = stringResource(id = R.string.dev_group_follow),
-        detail = stringResource(id = R.string.dev_group_follow_detail),
+        detail = stringResource(id = R.string.dev_group_follow_compat_detail),
         checked = reliability?.quarantineGroupFollow == true,
         toggle = developerViewModel.setQuarantineGroupFollow,
     )
     DeveloperDurationSetting(
         label = stringResource(id = R.string.dev_group_follow_window),
-        detail = stringResource(id = R.string.dev_group_follow_window_detail),
+        detail = stringResource(id = R.string.dev_group_follow_compat_detail),
         millis = reliability?.groupFollowWindowMillis ?: 0L,
         presets = DeveloperViewModel.GROUP_FOLLOW_WINDOW_PRESETS,
         onSelect = developerViewModel.setGroupFollowWindowMillis,
@@ -667,7 +701,7 @@ private fun DeveloperContent(developerViewModel: DeveloperViewModel) {
         count = reliability?.removalBudgetCount ?: 0,
         presets = DeveloperViewModel.REMOVAL_BUDGET_COUNT_PRESETS,
         onSelect = developerViewModel.setRemovalBudgetCount,
-        zeroLabel = "Off",
+        zeroLabel = stringResource(id = R.string.off),
     )
     DeveloperDurationSetting(
         label = stringResource(id = R.string.dev_removal_budget_window),
@@ -688,7 +722,7 @@ private fun DeveloperContent(developerViewModel: DeveloperViewModel) {
         count = reliability?.blackholeLoadCorroboration ?: 0,
         presets = DeveloperViewModel.LOAD_CORROBORATION_PRESETS,
         onSelect = developerViewModel.setBlackholeLoadCorroboration,
-        zeroLabel = "Off",
+        zeroLabel = stringResource(id = R.string.off),
     )
     DeveloperCountSetting(
         label = stringResource(id = R.string.dev_min_blackhole_destinations),
@@ -696,7 +730,7 @@ private fun DeveloperContent(developerViewModel: DeveloperViewModel) {
         count = reliability?.minBlackholeDestinations ?: 0,
         presets = DeveloperViewModel.MIN_BLACKHOLE_DESTINATIONS_PRESETS,
         onSelect = developerViewModel.setMinBlackholeDestinations,
-        zeroLabel = "Off",
+        zeroLabel = stringResource(id = R.string.off),
     )
     DeveloperToggle(
         label = stringResource(id = R.string.dev_cluster_affinity),
@@ -797,7 +831,7 @@ private fun DeveloperContent(developerViewModel: DeveloperViewModel) {
         count = reliability?.probeSampleHostCount ?: 0,
         presets = DeveloperViewModel.PROBE_SAMPLE_PRESETS,
         onSelect = developerViewModel.setProbeSampleHostCount,
-        zeroLabel = "All",
+        zeroLabel = stringResource(id = R.string.dev_all),
     )
     DeveloperCountSetting(
         label = stringResource(id = R.string.dev_evaluation_pool),
@@ -886,7 +920,7 @@ private fun DeveloperContent(developerViewModel: DeveloperViewModel) {
     //
     // The provider-qualification prober (the "Probe providers" toggle and the
     // "Probes" counter above) does not share that trap: it resolves hostnames
-    // by querying a public resolver THROUGH the provider channel being probed
+    // by querying a public resolver through the provider channel being probed
     // -- no OS resolver, no tun resolver settings, no [::1]:53 fallback -- so
     // its results are about the provider, not the harness.
 
@@ -901,7 +935,7 @@ private fun DeveloperContent(developerViewModel: DeveloperViewModel) {
  * The glog verbosity of the process that writes the logs, cycling
  * Default -> Verbose -> Trace on tap.
  *
- * The value shown is the one the DEVICE reports, never the one last asked for.
+ * The value shown is the one the device reports, never the one last asked for.
  * A set can be clamped by the sdk or refused outright by a hosted device, and
  * neither throws -- so a level that failed to apply has to be visible here
  * rather than assumed, or the user reproduces a fault believing they are
@@ -923,7 +957,7 @@ private fun DeveloperVerbositySetting(
         LogVerbosityLevel.TRACE -> R.string.dev_log_verbosity_trace
         null -> R.string.dev_log_verbosity_unavailable
     }
-    // the detail line names what THIS level buys, so the cost of the next step
+    // the detail line names what this level buys, so the cost of the next step
     // is read before it is taken rather than discovered in the bundle
     val detail = when (named) {
         LogVerbosityLevel.DEFAULT -> R.string.dev_log_verbosity_default_detail
@@ -982,7 +1016,7 @@ private fun DeveloperVerbositySetting(
  * Which address family the control plane dials over, cycling Automatic ->
  * Force IPv4 -> Force IPv6 on tap.
  *
- * Unlike [DeveloperVerbositySetting] this row is ALWAYS live. That row is
+ * Unlike [DeveloperVerbositySetting] this row is always live. That row is
  * inert without a device because there is no process to set a log level on;
  * this policy is process-global sdk state that is always answerable, and the
  * row has to work signed out and with the tunnel down -- those are the states
@@ -1087,7 +1121,7 @@ private fun DeveloperCountSetting(
     count: Int,
     presets: List<Int>,
     onSelect: (Int) -> Unit,
-    zeroLabel: String = "Unlimited",
+    zeroLabel: String = stringResource(id = R.string.dev_unlimited),
 ) {
     Row(
         modifier = Modifier
@@ -1197,7 +1231,7 @@ private fun DeveloperAction(
     Text(
         label,
         style = MaterialTheme.typography.bodyMedium,
-        // a disabled action has to LOOK disabled: an active-looking control
+        // a disabled action has to look disabled: an active-looking control
         // that silently does nothing reads as a broken app, and here the
         // "nothing" is deliberate (an empty selection, or an export already
         // running)
@@ -1243,42 +1277,26 @@ private fun DeveloperExitRow(
             )
         }
 
-        val state = buildString {
-            append(exit.windowType.ifEmpty { "auto" })
-            // the platform's rank for this provider. only the best rank present
-            // is raced until it is at the flow cap, so a tier above the minimum
-            // with 0 flows is a spare, not a failure. effectiveTier is the rank
-            // selection actually uses (tier plus live demerits); when it
-            // differs the exit is demoted and "tier N→M" makes that visible
-            append(" · tier ")
-            append(exit.tier)
-            if (exit.effectiveTier > exit.tier) {
-                append("→")
-                append(exit.effectiveTier)
+        // window type, tier, warning state and lifecycle parts, each word a
+        // string resource except the sdk's own tokens (see exitStateTexts)
+        val state = exitStateTexts(
+            ExitStateFields(
+                windowType = exit.windowType,
+                tier = exit.tier,
+                effectiveTier = exit.effectiveTier,
+                quarantined = exit.quarantined,
+                warning = exit.warning,
+                warningCause = exit.warningCause,
+                done = exit.done,
+                p2pOnly = exit.p2pOnly,
+                proven = exit.proven,
+            )
+        ).map { text ->
+            when (text) {
+                is ExitStateText.Resource -> stringResource(text.id, *text.formatArgs.toTypedArray())
+                is ExitStateText.SdkToken -> text.token
             }
-            // the warning state, by name. "benched" is a quarantine (a soft
-            // verdict held against a loaded exit -- it stops taking new
-            // placements while its flows keep running, and receive progress
-            // acquits it); otherwise the resize pass's cause: draining
-            // (healthy, retiring), starved (upstream failing dials), or
-            // unhealthy (a verdict demoted or deferred). Before the cause
-            // existed every one of these displayed as "draining", which made
-            // benches read as retirements.
-            when {
-                exit.quarantined -> append(" · benched")
-                exit.warning -> {
-                    append(" · ")
-                    append(exit.warningCause.ifEmpty { "warned" })
-                }
-            }
-            if (exit.done) append(" · done")
-            if (exit.p2pOnly) append(" · p2p")
-            // a probe pass (or the exit's own traffic) proved this provider
-            // dials real destinations within the qualification window. Absence
-            // of the chip is "not yet proven", never "bad" -- the probe design
-            // records no negative state to show
-            if (exit.proven) append(" · proven")
-        }
+        }.joinToString(" · ")
         Text(state, style = MaterialTheme.typography.bodySmall, color = TextMuted)
 
         // shown only when the exit has reported upstream dials it could not
@@ -1290,6 +1308,24 @@ private fun DeveloperExitRow(
                 style = MaterialTheme.typography.bodySmall,
                 color = TextMuted,
             )
+        }
+
+        // the provider's security rules generation, once its first diagnostics
+        // arrive. An exit with a lower number than the others runs older rules
+        val policyGenerationText = when (
+            val policyGenerationLine = exitPolicyGenerationLine(
+                providerDiagnosticsAvailable = exit.providerDiagnosticsAvailable,
+                providerSecurityPolicyGeneration = exit.providerSecurityPolicyGeneration,
+            )
+        ) {
+            is ExitPolicyGenerationLine.Known ->
+                stringResource(id = R.string.dev_exit_policy_generation, policyGenerationLine.generation)
+            ExitPolicyGenerationLine.Unknown ->
+                stringResource(id = R.string.dev_exit_policy_generation_unknown)
+            null -> null
+        }
+        if (policyGenerationText != null) {
+            Text(policyGenerationText, style = MaterialTheme.typography.bodySmall, color = TextMuted)
         }
 
         Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
@@ -1346,6 +1382,34 @@ private fun EarningsSampleDataSettings() {
             checked = EarningsDebugFlags.sampleStartDisconnected,
             enabled = EarningsDebugFlags.useSampleData,
             toggle = { EarningsDebugFlags.setSampleStartDisconnected(!EarningsDebugFlags.sampleStartDisconnected) },
+        )
+    }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 8.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text("Sample starts with a Solana payout wallet", style = MaterialTheme.typography.bodyMedium)
+        URSwitch(
+            checked = EarningsDebugFlags.sampleSolanaWallet,
+            enabled = EarningsDebugFlags.useSampleData,
+            toggle = { EarningsDebugFlags.setSampleSolanaWallet(!EarningsDebugFlags.sampleSolanaWallet) },
+        )
+    }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 8.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text("Sample has 3.87 USDC waiting", style = MaterialTheme.typography.bodyMedium)
+        URSwitch(
+            checked = EarningsDebugFlags.sampleUsdcWaiting,
+            enabled = EarningsDebugFlags.useSampleData,
+            toggle = { EarningsDebugFlags.setSampleUsdcWaiting(!EarningsDebugFlags.sampleUsdcWaiting) },
         )
     }
 }

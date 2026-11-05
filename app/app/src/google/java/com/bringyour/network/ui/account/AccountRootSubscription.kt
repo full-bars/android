@@ -18,6 +18,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavHostController
@@ -41,8 +42,11 @@ fun AccountRootSubscription(
     isCheckingSolanaTransaction: Boolean, // checking for potential Solana transaction
     isPollingSubscriptionBalance: Boolean,
 //    scope: CoroutineScope,
-    logout: () -> Unit,
+    // a legacy guest adds a sign-in method to this network (GuestConversionSheet)
+    createAccount: () -> Unit,
     navController: NavHostController,
+    // a Pro network's plan label replays the Pro celebration
+    onPlanLabelTap: () -> Unit = {},
 ) {
     // member area
     Box {
@@ -82,7 +86,13 @@ fun AccountRootSubscription(
 
                     } else {
                         Text(if (currentPlan == Plan.Supporter) stringResource(id = R.string.supporter) else stringResource(id = R.string.free),
-                            style = MaterialTheme.typography.headlineMedium
+                            style = MaterialTheme.typography.headlineMedium,
+                            // Pro: the label itself is a button that replays the celebration
+                            modifier = if (currentPlan == Plan.Supporter) {
+                                Modifier.clickable(role = Role.Button) { onPlanLabelTap() }
+                            } else {
+                                Modifier
+                            }
                         )
                     }
                 }
@@ -96,7 +106,7 @@ fun AccountRootSubscription(
                         modifier = Modifier
                             .offset(y = (-8).dp)
                             .clickable {
-                                logout()
+                                createAccount()
                             }
                     )
                 } else {

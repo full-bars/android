@@ -24,6 +24,76 @@ android_acceptance_session_running() {
   [ -z "${1:-}" ] || kill -0 "$1" 2>/dev/null
 }
 
+# This is the shell's exact wait result, not an inferred app/ADB exit or the
+# time the child actually exited. Keep it even when terminal text is missing.
+android_acceptance_record_session_exit() {
+  local out="$1" role="$2" child_pid="$3" child_status="$4" joined_by="$5" joined_at
+  case "$role:$joined_by" in client:finish|provider:finish|client:trap|provider:trap) ;; *) return 2 ;; esac
+  case "$child_pid" in ''|0*|*[!0-9]*) return 2 ;; esac
+  [[ "$child_status" =~ ^(0|[1-9][0-9]{0,2})$ ]] && [ "$child_status" -le 255 ] || return 2
+  joined_at="$(node -p 'new Date().toISOString()')" || return 1
+  (umask 077; set -C
+    printf '{"schemaVersion":1,"childPid":%s,"waitExitCode":%s,"joinedAt":"%s","joinedBy":"%s"}\n' \
+      "$child_pid" "$child_status" "$joined_at" "$joined_by" >"$out/$role-instrumentation-exit.json")
+}
+
+# `adb am instrument` can exit without a nonzero host status after losing its
+# transport. Absence of a failure line is not proof that the one retained P2P
+# test completed. Require one ordered start, test success, and terminal runner
+# success, with no failure or second terminal result anywhere in the stream.
+android_acceptance_verify_p2p_instrumentation() {
+  local transcript="$1"
+  [ -f "$transcript" ] && [ ! -L "$transcript" ] && [ -s "$transcript" ] || return 1
+  LC_ALL=C awk '
+    { sub(/\r$/, "") }
+    /FAILURES!!!|INSTRUMENTATION_FAILED|FATAL EXCEPTION|Process crashed|shortMsg=|AssertionError/ { invalid = 1 }
+    /^INSTRUMENTATION_STATUS: class=/ {
+      if ($0 != "INSTRUMENTATION_STATUS: class=com.bringyour.network.acceptance.PhysicalLowbarSessionTest") invalid = 1
+      classes++
+    }
+    /^INSTRUMENTATION_STATUS: test=/ {
+      if ($0 != "INSTRUMENTATION_STATUS: test=physicalLowbarSession") invalid = 1
+      tests++
+    }
+    /^INSTRUMENTATION_STATUS: (current|numtests)=/ {
+      if ($0 !~ /=1$/) invalid = 1
+    }
+    /^INSTRUMENTATION_STATUS_CODE:/ {
+      if ($0 == "INSTRUMENTATION_STATUS_CODE: 1" && !started && !completed) started = NR
+      else if ($0 == "INSTRUMENTATION_STATUS_CODE: 0" && started && !completed) completed = NR
+      else invalid = 1
+    }
+    /^OK \(/ {
+      if ($0 != "OK (1 test)" || !completed || ok) invalid = 1
+      ok = NR
+    }
+    /^INSTRUMENTATION_CODE:/ {
+      if ($0 != "INSTRUMENTATION_CODE: -1" || !ok || terminal) invalid = 1
+      terminal = NR
+    }
+    /[^[:space:]]/ { last = NR }
+    END { exit invalid || classes != 2 || tests != 2 || !started || !completed || !ok || !terminal || terminal != last }
+  ' "$transcript"
+}
+
+# Poll only the retained host child; never reconnect/restart ADB or touch a
+# device here. The caller decides how to stop an authorized app after this
+# bounded natural-exit grace. An optional retained terminal transcript also
+# requires guest finalization: a disconnected host alone cannot prove it.
+android_acceptance_wait_for_session_exit() {
+  local session_pid="$1" polls="$2" poll
+  case "$session_pid" in ''|0*|*[!0-9]*) return 2 ;; esac
+  case "$polls" in ''|0*|*[!0-9]*) return 2 ;; esac
+  [ "$#" -eq 2 ] || { [ "$#" -eq 3 ] && [ -n "$3" ]; } || return 2
+  for ((poll=0; poll<polls; poll++)); do
+    if ! android_acceptance_session_running "$session_pid" && \
+       { [ "$#" -eq 2 ] || android_acceptance_verify_p2p_instrumentation "$3"; }; then return 0; fi
+    sleep 0.2
+  done
+  ! android_acceptance_session_running "$session_pid" && \
+    { [ "$#" -eq 2 ] || android_acceptance_verify_p2p_instrumentation "$3"; }
+}
+
 # A successful full UI cell must leave one screenshot at every workflow
 # boundary. Instrumentation's exit status alone is not enough evidence: Android
 # can report a completed runner even when screenshot capture or the host-side
@@ -112,9 +182,13 @@ android_acceptance_verify_sdk_build_owner() {
 # Android's emulator rejects a read-only peer when the first instance holds the
 # AVD writable, which otherwise prevents the peer-to-peer phase from starting.
 run_android_acceptance_shared_avd_emulator() {
-  local emulator="$1" log_file="$2" argument
-  local read_only=0 gpu_host=0 expects_gpu_value=0
-  shift 2
+  local emulator="$1" log_file="$2" owner_token="$3" argument
+  local read_only=0 gpu_host=0 port_set=0
+  local expects_gpu_value=0 expects_port_value=0
+  shift 3
+
+  case "$owner_token" in ''|*[!A-Za-z0-9._:-]*) return 2 ;; esac
+  [ "${#owner_token}" -le 92 ] || return 2
 
   for argument in "$@"; do
     if [ "$expects_gpu_value" -eq 1 ]; then
@@ -126,9 +200,36 @@ run_android_acceptance_shared_avd_emulator() {
       expects_gpu_value=0
       continue
     fi
+    if [ "$expects_port_value" -eq 1 ]; then
+      case "$argument" in ''|*[!0-9]*)
+        echo "refusing to start a shared acceptance AVD without an explicit console port" >&2
+        return 2
+        ;;
+      esac
+      port_set=1
+      expects_port_value=0
+      continue
+    fi
     [ "$argument" = -read-only ] && read_only=1
     case "$argument" in
       -gpu) expects_gpu_value=1 ;;
+      -port) expects_port_value=1 ;;
+      -port=*)
+        case "${argument#*=}" in ''|*[!0-9]*)
+          echo "refusing to start a shared acceptance AVD without an explicit console port" >&2
+          return 2
+          ;;
+        esac
+        port_set=1
+        ;;
+      -id|-id=*)
+        echo "refusing a caller-supplied shared acceptance AVD instance ID" >&2
+        return 2
+        ;;
+      -prop|-prop=*)
+        echo "refusing an unsupported shared acceptance AVD boot property" >&2
+        return 2
+        ;;
       -gpu=host) gpu_host=1 ;;
       -gpu=*|-cores|-cores=*)
         echo "refusing unsupported shared acceptance AVD resource override: $argument" >&2
@@ -144,7 +245,404 @@ run_android_acceptance_shared_avd_emulator() {
     echo "refusing to start a shared acceptance AVD without -gpu host" >&2
     return 2
   fi
-  exec "$emulator" "$@" >"$log_file" 2>&1
+  if [ "$expects_port_value" -eq 1 ] || [ "$port_set" -ne 1 ]; then
+    echo "refusing to start a shared acceptance AVD without an explicit console port" >&2
+    return 2
+  fi
+  exec "$emulator" "$@" -id "$owner_token" >"$log_file" 2>&1
+}
+
+# Returns success only when no already-running emulator can be the configured
+# acceptance AVD. An offline or otherwise unclassifiable emulator is unsafe:
+# the caller cannot distinguish it from the AVD whose writable lock it must
+# not inherit or replace.
+android_acceptance_no_running_avd() {
+  local adb="$1" expected_avd="$2" devices header candidate state actual_avd
+
+  case "$expected_avd" in ''|*$'\r'*|*$'\n'*) return 2 ;; esac
+  devices="$(timeout 15 "$adb" devices </dev/null 2>/dev/null)" || return 2
+  header="${devices%%$'\n'*}"
+  header="${header%$'\r'}"
+  [ "$header" = 'List of devices attached' ] || return 2
+  while read -r candidate state _; do
+    case "$candidate" in emulator-*) ;; *) continue ;; esac
+    [ "$state" = device ] || return 2
+    actual_avd="$(timeout 15 "$adb" -s "$candidate" emu avd name \
+      </dev/null 2>/dev/null)" || return 2
+    actual_avd="${actual_avd%%$'\n'*}"
+    actual_avd="${actual_avd%$'\r'}"
+    [ -n "$actual_avd" ] || return 2
+    [ "$actual_avd" != "$expected_avd" ] || return 1
+  done <<<"$devices"
+  return 0
+}
+
+# ADB command exit status is not a reliable acknowledgement of an emulator
+# shutdown: the transport can disappear while `adb emu kill` is still waiting
+# for its reply. Confirm the terminal state from a fresh, bounded inventory
+# instead. Any listing for the exact serial, including offline, remains pending;
+# a failed or malformed inventory is never treated as absence.
+android_acceptance_emulator_disconnect_poll_sleep() {
+  sleep 0.5
+}
+
+android_acceptance_wait_for_emulator_disconnect() {
+  local adb="$1" serial="$2" attempts="${3:-120}"
+  local attempt devices header candidate state present
+
+  case "$serial" in
+    emulator-*)
+      case "${serial#emulator-}" in ''|*[!0-9]*) return 2 ;; esac
+      ;;
+    *) return 2 ;;
+  esac
+  case "$attempts" in ''|*[!0-9]*|0) return 2 ;; esac
+
+  for attempt in $(seq 1 "$attempts"); do
+    devices="$(timeout 15 "$adb" devices </dev/null 2>/dev/null)" || return 1
+    header="${devices%%$'\n'*}"
+    header="${header%$'\r'}"
+    [ "$header" = 'List of devices attached' ] || return 1
+    present=0
+    while read -r candidate state _; do
+      [ "$candidate" != "$serial" ] || present=1
+    done <<<"$devices"
+    [ "$present" -eq 1 ] || return 0
+    [ "$attempt" -lt "$attempts" ] || break
+    android_acceptance_emulator_disconnect_poll_sleep
+  done
+  return 1
+}
+
+# The default acceptance AVD name is a harness-reserved resource. Before
+# per-launch instance IDs existed, setup could leave that AVD running writable
+# with the emulator's default ID equal to its AVD name. That exact legacy state
+# may therefore be retired once; custom names and per-launch-ID guests are
+# never stopped. Output is the finite state "none" or "retired".
+android_acceptance_retire_legacy_reserved_avd() {
+  local adb="$1" expected_avd="$2" devices header candidate state actual_avd owner
+  local disconnect_attempts="${3:-120}" retired=0
+
+  [ "$expected_avd" = urnetwork-acceptance ] || return 2
+  case "$disconnect_attempts" in ''|*[!0-9]*|0) return 2 ;; esac
+  devices="$(timeout 15 "$adb" devices </dev/null 2>/dev/null)" || return 1
+  header="${devices%%$'\n'*}"
+  header="${header%$'\r'}"
+  [ "$header" = 'List of devices attached' ] || return 1
+  while read -r candidate state _; do
+    case "$candidate" in emulator-*) ;; *) continue ;; esac
+    case "${candidate#emulator-}" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$state" = device ] || return 1
+    actual_avd="$(timeout 15 "$adb" -s "$candidate" emu avd name \
+      </dev/null 2>/dev/null)" || return 1
+    actual_avd="${actual_avd%%$'\n'*}"
+    actual_avd="${actual_avd%$'\r'}"
+    [ -n "$actual_avd" ] || return 1
+    [ "$actual_avd" = "$expected_avd" ] || continue
+    owner="$(timeout 15 "$adb" -s "$candidate" emu avd id \
+      </dev/null 2>/dev/null)" || return 1
+    owner="${owner%%$'\n'*}"
+    owner="${owner%$'\r'}"
+    [ "$owner" = "$expected_avd" ] || return 1
+    # The emulator may terminate before adb receives the console reply, so the
+    # command status is only a delivery attempt. Exact inventory absence below
+    # is the authoritative completion condition.
+    timeout 15 "$adb" -s "$candidate" emu kill \
+      </dev/null >/dev/null 2>&1 || true
+    android_acceptance_wait_for_emulator_disconnect \
+      "$adb" "$candidate" "$disconnect_attempts" || return 1
+    retired=1
+  done <<<"$devices"
+  android_acceptance_no_running_avd "$adb" "$expected_avd" || return 1
+  if [ "$retired" -eq 1 ]; then
+    printf 'retired\n'
+  else
+    printf 'none\n'
+  fi
+}
+
+# The launch helper gives the emulator a per-launch instance ID and the caller
+# binds that console-reported ID to its exact child PID. A matching live PID or
+# AVD name alone is insufficient because an older guest can occupy the same adb
+# serial while a new emulator child is starting.
+android_acceptance_emulator_owner_token_matches() {
+  local adb="$1" serial="$2" expected_owner="$3" owner_pid="$4" actual_owner
+
+  case "$serial" in
+    emulator-*)
+      case "${serial#emulator-}" in ''|*[!0-9]*) return 2 ;; esac
+      ;;
+    *) return 2 ;;
+  esac
+  case "$expected_owner" in ''|*[!A-Za-z0-9._:-]*) return 2 ;; esac
+  [ "${#expected_owner}" -le 92 ] || return 2
+  case "$owner_pid" in ''|*[!0-9]*|0) return 2 ;; esac
+  kill -0 "$owner_pid" 2>/dev/null || return 1
+  actual_owner="$(timeout 15 "$adb" -s "$serial" emu avd id \
+    </dev/null 2>/dev/null)" || return 1
+  actual_owner="${actual_owner%%$'\n'*}"
+  actual_owner="${actual_owner%$'\r'}"
+  [ "$actual_owner" = "$expected_owner" ]
+}
+
+# Combines the live guest instance ID with the configured AVD identity.
+# Callers use this before every reuse, mutation, or adb-directed cleanup of a
+# runner-started emulator. Status 1 is unavailable/pending, 2 is invalid input,
+# and 3 is a conclusive nonempty instance-ID or AVD mismatch.
+android_acceptance_runner_owns_emulator() {
+  local adb="$1" serial="$2" expected_avd="$3" owner_pid="$4"
+  local owner_token="$5" actual_owner actual_avd
+
+  # Diagnostic metadata only. Reset on every call and retain the exact failed
+  # existing check; never expose values or change its authority/return status.
+  android_acceptance_emulator_ownership_stage=serial-validation
+  case "$serial" in
+    emulator-*)
+      case "${serial#emulator-}" in ''|*[!0-9]*) return 2 ;; esac
+      ;;
+    *) return 2 ;;
+  esac
+  android_acceptance_emulator_ownership_stage=avd-validation
+  case "$expected_avd" in ''|*$'\r'*|*$'\n'*) return 2 ;; esac
+  android_acceptance_emulator_ownership_stage=pid-validation
+  case "$owner_pid" in ''|*[!0-9]*|0) return 2 ;; esac
+  android_acceptance_emulator_ownership_stage=token-validation
+  case "$owner_token" in ''|*[!A-Za-z0-9._:-]*) return 2 ;; esac
+  android_acceptance_emulator_ownership_stage=token-length
+  [ "${#owner_token}" -le 92 ] || return 2
+  android_acceptance_emulator_ownership_stage=process-before
+  kill -0 "$owner_pid" 2>/dev/null || return 1
+  android_acceptance_emulator_ownership_stage=device-ready
+  android_acceptance_adb_device_ready "$adb" "$serial" || return 1
+  android_acceptance_emulator_ownership_stage=instance-id-read
+  actual_owner="$(timeout 15 "$adb" -s "$serial" emu avd id \
+    </dev/null 2>/dev/null)" || return 1
+  actual_owner="${actual_owner%%$'\n'*}"
+  actual_owner="${actual_owner%$'\r'}"
+  android_acceptance_emulator_ownership_stage=instance-id-empty
+  [ -n "$actual_owner" ] || return 1
+  android_acceptance_emulator_ownership_stage=instance-id-match
+  [ "$actual_owner" = "$owner_token" ] || return 3
+  android_acceptance_emulator_ownership_stage=avd-name-read
+  actual_avd="$(timeout 15 "$adb" -s "$serial" emu avd name \
+    </dev/null 2>/dev/null)" || return 1
+  actual_avd="${actual_avd%%$'\n'*}"
+  actual_avd="${actual_avd%$'\r'}"
+  android_acceptance_emulator_ownership_stage=avd-name-empty
+  [ -n "$actual_avd" ] || return 1
+  android_acceptance_emulator_ownership_stage=avd-name-match
+  [ "$actual_avd" = "$expected_avd" ] || return 3
+  android_acceptance_emulator_ownership_stage=process-after
+  kill -0 "$owner_pid" 2>/dev/null || return "$?"
+  android_acceptance_emulator_ownership_stage=verified
+}
+
+# ADB exposes a newly launched emulator transport before every console query is
+# guaranteed to answer. Poll the combined instance-ID and AVD proof rather than
+# treating wait-for-device as ownership readiness. A definitive mismatch and a
+# dead exact child fail immediately; only unavailable/empty evidence is retried
+# to the finite bound.
+android_acceptance_emulator_ownership_poll_sleep() {
+  sleep 0.5
+}
+
+android_acceptance_wait_for_runner_owned_emulator() {
+  local adb="$1" serial="$2" expected_avd="$3" owner_pid="$4"
+  local owner_token="$5" attempts="${6:-120}" attempt ownership_status
+
+  case "$attempts" in ''|*[!0-9]*|0) return 2 ;; esac
+  for attempt in $(seq 1 "$attempts"); do
+    ownership_status=0
+    android_acceptance_runner_owns_emulator \
+      "$adb" "$serial" "$expected_avd" "$owner_pid" "$owner_token" || \
+      ownership_status=$?
+    case "$ownership_status" in
+      0) return 0 ;;
+      1) ;;
+      2) return 2 ;;
+      3) return 1 ;;
+      *) return 1 ;;
+    esac
+    kill -0 "$owner_pid" 2>/dev/null || return 1
+    [ "$attempt" -lt "$attempts" ] || break
+    android_acceptance_emulator_ownership_poll_sleep
+  done
+  return 1
+}
+
+# One bounded child-shutdown poll step, overridden by deterministic tests.
+android_acceptance_emulator_cleanup_poll_sleep() {
+  sleep 0.2
+}
+
+# Join only the exact emulator child captured by the caller. The first bound
+# lets a proven guest honor adb emu kill; callers that lost guest ownership use
+# zero and proceed directly to host PID termination. Requiring KILL is reported
+# as cleanup failure even though the process is still reaped.
+android_acceptance_stop_emulator_child() {
+  local owner_pid="$1" graceful_attempts="${2:-150}" term_attempts="${3:-50}"
+  local forced=0 attempt
+
+  case "$owner_pid" in ''|*[!0-9]*|0) return 2 ;; esac
+  case "$graceful_attempts:$term_attempts" in *[!0-9:]*) return 2 ;; esac
+  for attempt in $(seq 1 "$graceful_attempts"); do
+    kill -0 "$owner_pid" 2>/dev/null || break
+    android_acceptance_emulator_cleanup_poll_sleep
+  done
+  if kill -0 "$owner_pid" 2>/dev/null; then
+    kill -TERM "$owner_pid" 2>/dev/null || true
+  fi
+  for attempt in $(seq 1 "$term_attempts"); do
+    kill -0 "$owner_pid" 2>/dev/null || break
+    android_acceptance_emulator_cleanup_poll_sleep
+  done
+  if kill -0 "$owner_pid" 2>/dev/null; then
+    kill -KILL "$owner_pid" 2>/dev/null || true
+    forced=1
+  fi
+  wait "$owner_pid" 2>/dev/null || true
+  [ "$forced" -eq 0 ]
+}
+
+# Hash a file or stdin using the platform's standard SHA-256 utility. macOS
+# ships shasum while Linux runners normally have sha256sum, so accept either
+# rather than making the fast cache host-specific.
+android_acceptance_sha256_file() {
+  local input="$1"
+
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$input" | awk '{ print $1 }'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$input" | awk '{ print $1 }'
+  else
+    echo "no SHA-256 utility is available (need shasum or sha256sum)" >&2
+    return 1
+  fi
+}
+
+android_acceptance_sha256_stdin() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{ print $1 }'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{ print $1 }'
+  else
+    echo "no SHA-256 utility is available (need shasum or sha256sum)" >&2
+    return 1
+  fi
+}
+
+# Returns the inputs that can change an APK pair without hashing the whole
+# checkout on every local iteration. A clean git HEAD represents all tracked
+# source inputs; a binary diff represents tracked edits; and untracked files
+# are hashed individually. local.properties is intentionally included even
+# though it is ignored because it can change BuildConfig at configuration time.
+#
+# The F-Droid transform is deterministic, so the target name is part of this
+# key instead of fingerprinting the temporary transformed tree. The SDK AAR
+# and sources jar are independent build inputs outside this checkout and must
+# be included explicitly.
+android_acceptance_input_fingerprint() {
+  local source_tree="$1" sdk_aar="$2" sdk_sources="$3" target="$4" flavor="$5"
+  local local_properties="$source_tree/app/local.properties" relative path
+
+  [ -d "$source_tree" ] && [ -f "$sdk_aar" ] && [ -f "$sdk_sources" ] || return 1
+  case "$target:$flavor" in
+    *[!A-Za-z0-9._:-]*) return 2 ;;
+  esac
+
+  (
+    set -e
+    printf 'android-acceptance-input-v1\n'
+    printf 'target=%s\nflavor=%s\n' "$target" "$flavor"
+    case "$target" in
+      fdroid) printf 'fdroid-transform=google-to-ungoogled-v1\n' ;;
+    esac
+
+    if git -C "$source_tree" rev-parse --verify HEAD >/dev/null 2>&1; then
+      printf 'git-head='
+      git -C "$source_tree" rev-parse HEAD
+      printf 'git-diff-begin\n'
+      git -C "$source_tree" diff --no-ext-diff --binary HEAD -- .
+      printf 'git-diff-end\n'
+      printf 'untracked-begin\n'
+      while IFS= read -r -d '' relative; do
+        # Generated acceptance artifacts and Gradle outputs are deliberately
+        # not APK inputs. They must not turn every prior test run into a cache
+        # miss.
+        case "$relative" in
+          app/**/build/*|app/.gradle/*|tests/__acceptance__/*) continue ;;
+        esac
+        path="$source_tree/$relative"
+        [ -f "$path" ] || continue
+        printf 'untracked-path=%s\n' "$relative"
+        android_acceptance_sha256_file "$path"
+      done < <(git -C "$source_tree" ls-files --others --exclude-standard -z)
+      printf 'untracked-end\n'
+    else
+      # Git is expected for normal development, but retain a conservative
+      # fallback for source archives. It is slower because every source file
+      # must be read, which is preferable to reusing an unverified APK.
+      printf 'tree-fallback-begin\n'
+      while IFS= read -r path; do
+        relative="${path#"$source_tree"/}"
+        case "$relative" in
+          app/**/build/*|app/.gradle/*|tests/__acceptance__/*) continue ;;
+        esac
+        printf 'tree-path=%s\n' "$relative"
+        android_acceptance_sha256_file "$path"
+      done < <(find "$source_tree" -type f -print | LC_ALL=C sort)
+      printf 'tree-fallback-end\n'
+    fi
+
+    if [ -f "$local_properties" ]; then
+      printf 'local-properties='
+      android_acceptance_sha256_file "$local_properties"
+    else
+      printf 'local-properties=absent\n'
+    fi
+    printf 'sdk-aar='
+    android_acceptance_sha256_file "$sdk_aar"
+    printf 'sdk-sources='
+    android_acceptance_sha256_file "$sdk_sources"
+  ) | android_acceptance_sha256_stdin
+}
+
+# Returns true only for a complete, input-matching APK cache. The input stamp
+# is written last, so an interrupted cache refresh cannot be mistaken for a
+# usable old build.
+android_acceptance_cache_is_current() {
+  local cache_dir="$1" expected_fingerprint="$2" actual_fingerprint line_count
+
+  [[ "$expected_fingerprint" =~ ^[0-9a-f]{64}$ ]] || return 1
+  [ -s "$cache_dir/app.apk" ] && [ -s "$cache_dir/test.apk" ] && \
+    [ -s "$cache_dir/build-id" ] && [ -s "$cache_dir/input.sha256" ] || return 1
+  line_count="$(awk 'END { print NR }' "$cache_dir/input.sha256")"
+  [ "$line_count" = 1 ] || return 1
+  IFS= read -r actual_fingerprint <"$cache_dir/input.sha256" || return 1
+  [ "$actual_fingerprint" = "$expected_fingerprint" ]
+}
+
+# Writes the two small cache metadata files atomically. Call this only after
+# android_acceptance_cache_apks has copied both APKs successfully.
+android_acceptance_write_cache_metadata() {
+  local cache_dir="$1" build_id="$2" input_fingerprint="$3"
+  local build_temporary fingerprint_temporary
+
+  [[ "$build_id" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  [[ "$input_fingerprint" =~ ^[0-9a-f]{64}$ ]] || return 1
+  mkdir -p "$cache_dir" || return 1
+  build_temporary="$(mktemp "$cache_dir/.build-id.XXXXXX")" || return 1
+  fingerprint_temporary="$(mktemp "$cache_dir/.input.sha256.XXXXXX")" || {
+    rm -f "$build_temporary"
+    return 1
+  }
+  if ! printf '%s\n' "$build_id" >"$build_temporary" ||
+     ! printf '%s\n' "$input_fingerprint" >"$fingerprint_temporary" ||
+     ! mv "$build_temporary" "$cache_dir/build-id" ||
+     ! mv "$fingerprint_temporary" "$cache_dir/input.sha256"; then
+    rm -f "$build_temporary" "$fingerprint_temporary"
+    return 1
+  fi
 }
 
 # CPU, renderer, and focused-window evidence are classified into finite states
@@ -258,24 +756,34 @@ android_acceptance_normalize_focused_window_lines() {
   local lines="$1" line
 
   while IFS= read -r line; do
+    [ -n "$(printf '%s\n' "$line" | tr -d '[:space:]')" ] || continue
     android_acceptance_normalize_focused_window_value "$line" || return 1
   done <<<"$lines"
 }
 
 android_acceptance_classify_focused_window() {
-  local evidence="${1-}" current_lines focused_lines current focused
+  local evidence="${1-}" current_occurrences focused_occurrences
+  local current_lines focused_lines current focused
   local current_values focused_values current_count focused_count lower
 
   evidence="${evidence//$'\r'/}"
+  current_occurrences="$(printf '%s\n' "$evidence" | awk '
+    /^[[:space:]]*mCurrentFocus=/ { count++ }
+    END { print count + 0 }
+  ')"
+  focused_occurrences="$(printf '%s\n' "$evidence" | awk '
+    /^[[:space:]]*mFocusedWindow=/ { count++ }
+    END { print count + 0 }
+  ')"
   current_lines="$(printf '%s\n' "$evidence" | \
     sed -n 's/^[[:space:]]*mCurrentFocus=//p')"
   focused_lines="$(printf '%s\n' "$evidence" | \
     sed -n 's/^[[:space:]]*mFocusedWindow=//p')"
-  if [ -z "$current_lines" ] && [ -z "$focused_lines" ]; then
+  if [ "$current_occurrences" -eq 0 ] && [ "$focused_occurrences" -eq 0 ]; then
     printf 'missing\n'
     return 0
   fi
-  if [ -z "$current_lines" ] || [ -z "$focused_lines" ]; then
+  if [ "$current_occurrences" -eq 0 ] || [ "$focused_occurrences" -eq 0 ]; then
     printf 'malformed\n'
     return 0
   fi
@@ -283,6 +791,10 @@ android_acceptance_classify_focused_window() {
       "$current_lines")" || \
      ! focused_values="$(android_acceptance_normalize_focused_window_lines \
       "$focused_lines")"; then
+    printf 'malformed\n'
+    return 0
+  fi
+  if [ -z "$current_values" ] || [ -z "$focused_values" ]; then
     printf 'malformed\n'
     return 0
   fi
@@ -310,16 +822,22 @@ android_acceptance_classify_focused_window() {
 }
 
 android_acceptance_focused_error_subject() {
-  local evidence="${1-}" current_lines current subject
+  local evidence="${1-}" current_occurrences current_lines current subject
 
-  current_lines="$(printf '%s\n' "${evidence//$'\r'/}" | \
+  evidence="${evidence//$'\r'/}"
+  current_occurrences="$(printf '%s\n' "$evidence" | awk '
+    /^[[:space:]]*mCurrentFocus=/ { count++ }
+    END { print count + 0 }
+  ')"
+  [ "$current_occurrences" -gt 0 ] || { printf 'none\n'; return 0; }
+  current_lines="$(printf '%s\n' "$evidence" | \
     sed -n 's/^[[:space:]]*mCurrentFocus=//p')"
-  [ -n "$current_lines" ] || { printf 'none\n'; return 0; }
   if ! current="$(android_acceptance_normalize_focused_window_lines \
       "$current_lines")"; then
     printf 'unknown\n'
     return 0
   fi
+  [ -n "$current" ] || { printf 'unknown\n'; return 0; }
   current="$(printf '%s\n' "$current" | LC_ALL=C sort -u)"
   [ "$(printf '%s\n' "$current" | wc -l | tr -d '[:space:]')" = 1 ] || {
     printf 'unknown\n'
@@ -423,14 +941,25 @@ android_acceptance_preflight_device() {
 
 # Copy one build's app/test pair into the runner-owned cache before another
 # flavor is built. Gradle may replace its output directory on the next build;
-# peer-to-peer acceptance must never retain those ephemeral paths.
+# peer-to-peer acceptance must never retain those ephemeral paths. Removing the
+# input stamp first makes a half-refreshed cache invalid even if the process is
+# interrupted between the two APK moves.
 android_acceptance_cache_apks() {
-  local app_apk="$1" test_apk="$2" cache_dir="$3"
+  local app_apk="$1" test_apk="$2" cache_dir="$3" temporary
 
   [ -f "$app_apk" ] && [ -f "$test_apk" ] || return 1
   mkdir -p "$cache_dir" || return 1
-  cp "$app_apk" "$cache_dir/app.apk" || return 1
-  cp "$test_apk" "$cache_dir/test.apk" || return 1
+  rm -f "$cache_dir/build-id" "$cache_dir/input.sha256"
+  temporary="$(mktemp -d "$cache_dir/.apk-cache.XXXXXX")" || return 1
+  if ! cp "$app_apk" "$temporary/app.apk" ||
+     ! cp "$test_apk" "$temporary/test.apk" ||
+     ! mv "$temporary/app.apk" "$cache_dir/app.apk" ||
+     ! mv "$temporary/test.apk" "$cache_dir/test.apk"; then
+    rm -f "$temporary/app.apk" "$temporary/test.apk"
+    rmdir "$temporary" 2>/dev/null || true
+    return 1
+  fi
+  rmdir "$temporary" || return 1
   [ -s "$cache_dir/app.apk" ] && [ -s "$cache_dir/test.apk" ]
 }
 
@@ -563,13 +1092,81 @@ remove_android_acceptance_run_dir() {
   rm -rf -- "$run_dir"
 }
 
-android_acceptance_adb_device_ready() {
-  local adb="$1" serial="$2" state
+# Retain one fixed-schema authorization failure in the caller's private cell.
+# Never retain device values, command output, serials or credentials. An absent
+# sink keeps existing read-only callers unchanged; a failed write cannot grant
+# authority. The caller owns the existing parent directory.
+android_acceptance_authorization_failure() {
+  local diagnostic_file="$1" stage="$2" outcome="$3" command_status="$4"
+  local observed_utc temporary parent
 
-  if ! state="$(timeout 15 "$adb" -s "$serial" get-state </dev/null 2>/dev/null)"; then
+  [ -n "$diagnostic_file" ] || return 0
+  case "$diagnostic_file" in *$'\r'*|*$'\n'*) return 2 ;; esac
+  case "$stage" in
+    selection|owned-emulator|peer-emulator|adb-state|serial|qemu|boot-qemu|\
+    emulator-flags|identity-manufacturer|identity-brand|identity-model|\
+    identity-name|identity-device|hardware|api|abi) ;;
+    *) return 2 ;;
+  esac
+  case "$outcome:$command_status" in
+    command-failed:*)
+      case "$command_status" in ''|*[!0-9]*) return 2 ;; esac
+      [ "${#command_status}" -le 3 ] && [ "$command_status" -ge 1 ] && \
+        [ "$command_status" -le 255 ] || return 2
+      ;;
+    value-mismatch:0|unsupported:0|not-authorized:not-run|ownership-unverified:unknown) ;;
+    *) return 2 ;;
+  esac
+  parent="$(dirname "$diagnostic_file")"
+  [ -d "$parent" ] && [ ! -L "$parent" ] && \
+    [ ! -e "$diagnostic_file" ] && [ ! -L "$diagnostic_file" ] || return 1
+  observed_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)" || return 1
+  temporary="$(mktemp "${diagnostic_file}.tmp.XXXXXX")" || return 1
+  if ! printf '%s\n' 'version=1' 'boundary=preinstall-authorization' \
+      "stage=$stage" "outcome=$outcome" "command_exit_status=$command_status" \
+      "observed_utc=$observed_utc" >"$temporary" || \
+      ! chmod 600 "$temporary" || ! ln "$temporary" "$diagnostic_file"; then
+    rm -f "$temporary"
     return 1
   fi
-  [ "$(printf '%s' "$state" | tr -d '\r\n')" = device ]
+  rm -f "$temporary"
+}
+
+# Capture the status of the actual bounded ADB command, before whitespace
+# normalization. The optional receipt has no raw stdout/stderr; a status such
+# as 124 is evidence of that exit status, not proof of why the command exited.
+android_acceptance_authorization_read() {
+  local diagnostic_file="$1" stage="$2" adb="$3" serial="$4" value command_status
+  shift 4
+  if value="$(timeout 15 "$adb" -s "$serial" "$@" </dev/null 2>/dev/null)"; then
+    printf '%s' "$value" | tr -d '\r\n'
+  else
+    command_status=$?
+    android_acceptance_authorization_failure \
+      "$diagnostic_file" "$stage" command-failed "$command_status" || \
+      echo "could not retain Android authorization failure stage" >&2
+    return 1
+  fi
+}
+
+android_acceptance_adb_device_ready() {
+  local adb="$1" serial="$2" diagnostic_file="${3:-}" state
+
+  # Existing lifecycle/ownership callers do not opt into cell diagnostics.
+  if [ -z "$diagnostic_file" ]; then
+    if ! state="$(timeout 15 "$adb" -s "$serial" get-state </dev/null 2>/dev/null)"; then
+      return 1
+    fi
+    [ "$(printf '%s' "$state" | tr -d '\r\n')" = device ]
+    return "$?"
+  fi
+  state="$(android_acceptance_authorization_read \
+    "$diagnostic_file" adb-state "$adb" "$serial" get-state)" || return 1
+  if [ "$state" != device ]; then
+    android_acceptance_authorization_failure "$diagnostic_file" adb-state value-mismatch 0 || \
+      echo "could not retain Android authorization failure stage" >&2
+    return 1
+  fi
 }
 
 android_acceptance_write_readiness_status() {
@@ -604,7 +1201,7 @@ android_acceptance_write_owned_emulator_interactive_diagnostics() {
   case "$diagnostic_file" in ''|*$'\r'*|*$'\n'*) return 2 ;; esac
   case "$attempt" in ''|*[!0-9]*) return 2 ;; esac
   case "$serial_state" in unchecked|valid|invalid) ;; *) return 2 ;; esac
-  case "$owner_state" in unchecked|live|not-live|invalid) ;; *) return 2 ;; esac
+  case "$owner_state" in unchecked|live|not-live|mismatch|invalid) ;; *) return 2 ;; esac
   case "$adb_state" in unchecked|ready|unavailable) ;; *) return 2 ;; esac
   case "$avd_state" in unchecked|match|mismatch|unavailable|invalid) ;; *) return 2 ;; esac
   case "$wake_state" in unchecked|complete|failed) ;; *) return 2 ;; esac
@@ -631,6 +1228,48 @@ android_acceptance_write_owned_emulator_interactive_diagnostics() {
     "power=$power_state" \
     "trust=$trust_state" \
     "result=$result" >"$temporary" || return 1
+  chmod 600 "$temporary" || { rm -f "$temporary"; return 1; }
+  mv "$temporary" "$diagnostic_file"
+}
+
+# Persist only finite, non-secret physical-device interactive state. The caller
+# supplies a sanitized device ordinal and explicit role; the adb serial, unlock
+# code, and raw platform dumps are deliberately excluded. Each update is a
+# mode-0600 atomic replacement so interruption leaves one complete snapshot.
+android_acceptance_write_physical_interactive_diagnostics() {
+  local diagnostic_file="$1" device_id="$2" role="$3" stage="$4"
+  local attempt="$5" wake_command_state="$6" power_state="$7" trust_state="$8"
+  local credential_state="$9"
+  shift 9
+  local result="$1" temporary
+
+  case "$diagnostic_file" in ''|*$'\r'*|*$'\n'*) return 2 ;; esac
+  [[ "$device_id" =~ ^device-[0-9][0-9][0-9]$ ]] || return 2
+  case "$role" in readiness|smoke|instrumentation|client|provider) ;; *) return 2 ;; esac
+  case "$stage" in validate|adb|wake-command|wake-observe|pre-credential|credential-submit|post-credential|complete) ;; *) return 2 ;; esac
+  case "$attempt" in ''|*[!0-9]*) return 2 ;; esac
+  case "$wake_command_state" in not-sent|sent|failed) ;; *) return 2 ;; esac
+  case "$power_state" in unchecked|awake|not-awake|unknown) ;; *) return 2 ;; esac
+  case "$trust_state" in unchecked|unlocked|locked|unknown) ;; *) return 2 ;; esac
+  case "$credential_state" in not-submitted|not-required|submitted|failed) ;; *) return 2 ;; esac
+  case "$result" in checking|ready|failed) ;; *) return 2 ;; esac
+
+  mkdir -p "$(dirname "$diagnostic_file")" || return 1
+  temporary="${diagnostic_file}.tmp.$$"
+  (
+    umask 077
+    printf '%s\n' \
+      'version=1' \
+      "device_id=$device_id" \
+      "role=$role" \
+      "stage=$stage" \
+      "attempt=$attempt" \
+      "wake_command=$wake_command_state" \
+      "power=$power_state" \
+      "trust=$trust_state" \
+      "credential=$credential_state" \
+      "result=$result" >"$temporary"
+  ) || { rm -f "$temporary"; return 1; }
   chmod 600 "$temporary" || { rm -f "$temporary"; return 1; }
   mv "$temporary" "$diagnostic_file"
 }
@@ -833,12 +1472,17 @@ android_acceptance_validate_booted_device() {
 # Wi-Fi autoconnect is quiescent while it is asleep or keyguarded.
 android_acceptance_prepare_device() {
   local adb="$1" serial="$2" unlock_code="$3" state_dir="$4" status_file="$5"
-  local boot_attempts="${6:-180}" network_attempts="${7:-24}"
+  local diagnostic_file="$6" device_id="$7" role="$8"
+  local boot_attempts="${9:-180}"
+  shift 9
+  local network_attempts="${1:-24}" interactive_attempts="${2:-20}"
 
   mkdir -p "$state_dir" || return 1
   android_acceptance_validate_booted_device \
     "$adb" "$serial" "$status_file" "$boot_attempts" || return
-  if ! android_acceptance_unlock_device "$adb" "$serial" "$unlock_code"; then
+  if ! android_acceptance_unlock_device \
+      "$adb" "$serial" "$unlock_code" "$diagnostic_file" \
+      "$device_id" "$role" "$interactive_attempts"; then
     android_acceptance_write_readiness_status "$status_file" unlock-failed
     return 1
   fi
@@ -851,6 +1495,7 @@ android_acceptance_prepare_device() {
 # non-secure interactive state, and then apply the shared network gate.
 android_acceptance_prepare_owned_emulator() {
   local adb="$1" serial="$2" expected_avd="$3" owner_pid="$4"
+  local owner_token="${ANDROID_ACCEPTANCE_EMULATOR_OWNER_TOKEN:-$owner_pid}"
   local state_dir="$5" status_file="$6" diagnostic_file="$7"
   local boot_attempts="${8:-180}" network_attempts="${9:-24}"
   local interactive_attempts="${10:-20}"
@@ -858,7 +1503,8 @@ android_acceptance_prepare_owned_emulator() {
   mkdir -p "$state_dir" || return 1
   android_acceptance_validate_booted_device \
     "$adb" "$serial" "$status_file" "$boot_attempts" || return
-  if ! android_acceptance_runner_owned_emulator_interactive \
+  if ! ANDROID_ACCEPTANCE_EMULATOR_OWNER_TOKEN="$owner_token" \
+      android_acceptance_runner_owned_emulator_interactive \
       "$adb" "$serial" "$expected_avd" "$owner_pid" \
       "$diagnostic_file" "$interactive_attempts"; then
     android_acceptance_write_readiness_status \
@@ -915,22 +1561,46 @@ android_acceptance_device_awake() {
   return 2
 }
 
-# Wake the display once, then poll the authoritative platform state. Retrying
-# the observation handles an asynchronous OEM wake transition without
-# repeating credentials or guessing a fixed device-specific delay.
-android_acceptance_wake_device() {
-  local adb="$1" serial="$2" state
+# One bounded poll step, overridden by deterministic shell tests.
+android_acceptance_interactive_poll_sleep() {
+  sleep 0.25
+}
 
-  timeout 15 "$adb" -s "$serial" shell input keyevent KEYCODE_WAKEUP \
-    </dev/null >/dev/null 2>&1 || return 1
-  for _ in $(seq 1 20); do
+# Wake the display once, then poll the authoritative platform state. Both
+# negative and unknown observations are transient during some OEM wake paths;
+# neither resubmits input, and both fail closed when the shared bound expires.
+android_acceptance_wake_device() {
+  local adb="$1" serial="$2" diagnostic_file="$3" device_id="$4" role="$5"
+  local attempts="${6:-20}" attempt power_state result state
+
+  case "$attempts" in ''|*[!0-9]*|0) return 2 ;; esac
+  if ! timeout 15 "$adb" -s "$serial" shell input keyevent KEYCODE_WAKEUP \
+      </dev/null >/dev/null 2>&1; then
+    android_acceptance_write_physical_interactive_diagnostics \
+      "$diagnostic_file" "$device_id" "$role" wake-command 0 failed unknown \
+      unchecked not-submitted failed || return
+    return 1
+  fi
+  for attempt in $(seq 1 "$attempts"); do
     if android_acceptance_device_awake "$adb" "$serial"; then
+      android_acceptance_write_physical_interactive_diagnostics \
+        "$diagnostic_file" "$device_id" "$role" wake-observe "$attempt" sent awake \
+        unchecked not-submitted checking || return
       return 0
     else
       state=$?
     fi
-    [ "$state" -eq 1 ] || return 1
-    sleep 0.25
+    case "$state" in
+      1) power_state=not-awake ;;
+      *) power_state=unknown ;;
+    esac
+    result=checking
+    [ "$attempt" -lt "$attempts" ] || result=failed
+    android_acceptance_write_physical_interactive_diagnostics \
+      "$diagnostic_file" "$device_id" "$role" wake-observe "$attempt" \
+      sent "$power_state" unchecked not-submitted "$result" || return
+    [ "$result" = checking ] || return 1
+    android_acceptance_interactive_poll_sleep
   done
   return 1
 }
@@ -940,6 +1610,7 @@ android_acceptance_wake_device() {
 # lockscreen must agree before success; unknown state is polled, never accepted.
 android_acceptance_runner_owned_emulator_interactive() {
   local adb="$1" serial="$2" expected_avd="$3" owner_pid="$4"
+  local owner_token="${ANDROID_ACCEPTANCE_EMULATOR_OWNER_TOKEN:-$owner_pid}"
   local diagnostic_file="$5" attempts="${6:-20}"
   local port actual_avd lock_disabled raw_window_state state
   local attempt=0 serial_state=unchecked owner_state=unchecked adb_state=unchecked
@@ -1012,6 +1683,16 @@ android_acceptance_runner_owned_emulator_interactive() {
     return 1
   fi
   adb_state=ready
+  if ! android_acceptance_emulator_owner_token_matches \
+      "$adb" "$serial" "$owner_token" "$owner_pid"; then
+    owner_state=mismatch
+    result=failed
+    android_acceptance_write_owned_emulator_interactive_diagnostics \
+      "$diagnostic_file" "$attempt" "$serial_state" "$owner_state" \
+      "$adb_state" "$avd_state" "$wake_state" "$dismiss_state" \
+      "$credential_state" "$window_state" "$power_state" "$trust_state" "$result" || return
+    return 1
+  fi
   if ! actual_avd="$(timeout 15 "$adb" -s "$serial" emu avd name \
       </dev/null 2>/dev/null)"; then
     avd_state=unavailable
@@ -1168,34 +1849,97 @@ android_acceptance_enter_unlock_code() {
 # debugging authorization is necessarily a one-time manual prerequisite: adb
 # cannot inject input into a device that has not authorized this host.
 android_acceptance_unlock_device() {
-  local adb="$1" serial="$2" unlock_code="$3" state
+  local adb="$1" serial="$2" unlock_code="$3" diagnostic_file="$4"
+  local device_id="$5" role="$6" attempts="${7:-20}"
+  local attempt credential_state=not-submitted result state trust_state
 
+  case "$attempts" in ''|*[!0-9]*|0) return 2 ;; esac
+  android_acceptance_write_physical_interactive_diagnostics \
+    "$diagnostic_file" "$device_id" "$role" validate 0 not-sent unchecked \
+    unchecked not-submitted checking || return
   case "$unlock_code" in
-    ''|*[!0-9]*) return 2 ;;
+    ''|*[!0-9]*)
+      android_acceptance_write_physical_interactive_diagnostics \
+        "$diagnostic_file" "$device_id" "$role" validate 0 not-sent unchecked \
+        unchecked not-submitted failed || return
+      return 2
+      ;;
   esac
-  [ "${#unlock_code}" -ge 4 ] && [ "${#unlock_code}" -le 16 ] || return 2
-  android_acceptance_adb_device_ready "$adb" "$serial" || return 1
-  android_acceptance_wake_device "$adb" "$serial" || return 1
-
-  if android_acceptance_device_unlocked "$adb" "$serial"; then
-    return 0
-  else
-    state=$?
+  if [ "${#unlock_code}" -lt 4 ] || [ "${#unlock_code}" -gt 16 ]; then
+    android_acceptance_write_physical_interactive_diagnostics \
+      "$diagnostic_file" "$device_id" "$role" validate 0 not-sent unchecked \
+      unchecked not-submitted failed || return
+    return 2
   fi
-  [ "$state" -eq 1 ] || return 1
+  if ! android_acceptance_adb_device_ready "$adb" "$serial"; then
+    android_acceptance_write_physical_interactive_diagnostics \
+      "$diagnostic_file" "$device_id" "$role" adb 0 not-sent unchecked \
+      unchecked not-submitted failed || return
+    return 1
+  fi
+  android_acceptance_write_physical_interactive_diagnostics \
+    "$diagnostic_file" "$device_id" "$role" adb 0 not-sent unchecked \
+    unchecked not-submitted checking || return
+  android_acceptance_wake_device \
+    "$adb" "$serial" "$diagnostic_file" "$device_id" "$role" "$attempts" || return
 
-  # Submit the credential exactly once. The loop below retries only the
-  # lock-state observation, never the PIN.
-  android_acceptance_enter_unlock_code "$adb" "$serial" "$unlock_code" || return 1
-
-  for _ in $(seq 1 20); do
+  for attempt in $(seq 1 "$attempts"); do
     if android_acceptance_device_unlocked "$adb" "$serial"; then
+      android_acceptance_write_physical_interactive_diagnostics \
+        "$diagnostic_file" "$device_id" "$role" complete "$attempt" sent awake \
+        unlocked not-required ready || return
       return 0
     else
       state=$?
     fi
-    [ "$state" -eq 1 ] || return 1
-    sleep 0.25
+    case "$state" in
+      1) trust_state=locked ;;
+      *) trust_state=unknown ;;
+    esac
+    result=checking
+    [ "$trust_state" = locked ] || \
+      { [ "$attempt" -lt "$attempts" ] || result=failed; }
+    android_acceptance_write_physical_interactive_diagnostics \
+      "$diagnostic_file" "$device_id" "$role" pre-credential "$attempt" sent \
+      awake "$trust_state" not-submitted "$result" || return
+    [ "$trust_state" = locked ] && break
+    [ "$result" = checking ] || return 1
+    android_acceptance_interactive_poll_sleep
+  done
+
+  # Submit the credential exactly once. The loop below retries only the
+  # lock-state observation, never the PIN.
+  if ! android_acceptance_enter_unlock_code "$adb" "$serial" "$unlock_code"; then
+    android_acceptance_write_physical_interactive_diagnostics \
+      "$diagnostic_file" "$device_id" "$role" credential-submit 0 sent awake \
+      locked failed failed || return
+    return 1
+  fi
+  credential_state=submitted
+  android_acceptance_write_physical_interactive_diagnostics \
+    "$diagnostic_file" "$device_id" "$role" credential-submit 0 sent awake \
+    locked "$credential_state" checking || return
+
+  for attempt in $(seq 1 "$attempts"); do
+    if android_acceptance_device_unlocked "$adb" "$serial"; then
+      android_acceptance_write_physical_interactive_diagnostics \
+        "$diagnostic_file" "$device_id" "$role" complete "$attempt" sent awake \
+        unlocked "$credential_state" ready || return
+      return 0
+    else
+      state=$?
+    fi
+    case "$state" in
+      1) trust_state=locked ;;
+      *) trust_state=unknown ;;
+    esac
+    result=checking
+    [ "$attempt" -lt "$attempts" ] || result=failed
+    android_acceptance_write_physical_interactive_diagnostics \
+      "$diagnostic_file" "$device_id" "$role" post-credential "$attempt" sent \
+      awake "$trust_state" "$credential_state" "$result" || return
+    [ "$result" = checking ] || return 1
+    android_acceptance_interactive_poll_sleep
   done
   return 1
 }
@@ -1206,11 +1950,14 @@ android_acceptance_unlock_device() {
 # command without an intervening wait. This submits the private credential at
 # most once for this boundary and never retries the product command.
 android_acceptance_run_after_unlock() {
-  local adb="$1" serial="$2" unlock_code="$3"
-  shift 3
+  local adb="$1" serial="$2" unlock_code="$3" diagnostic_file="$4"
+  local device_id="$5" role="$6" attempts="$7"
+  shift 7
 
   [ "$#" -gt 0 ] || return 2
-  android_acceptance_unlock_device "$adb" "$serial" "$unlock_code" || return 1
+  android_acceptance_unlock_device \
+    "$adb" "$serial" "$unlock_code" "$diagnostic_file" \
+    "$device_id" "$role" "$attempts" || return
   "$@"
 }
 
@@ -1218,12 +1965,15 @@ android_acceptance_run_after_unlock() {
 # boundary, then invoke one product command without an intervening wait.
 android_acceptance_run_after_owned_emulator_interactive() {
   local adb="$1" serial="$2" expected_avd="$3" owner_pid="$4"
+  local owner_token="${ANDROID_ACCEPTANCE_EMULATOR_OWNER_TOKEN:-$owner_pid}"
   local diagnostic_file="$5"
   shift 5
 
   [ "$#" -gt 0 ] || return 2
-  android_acceptance_runner_owned_emulator_interactive \
-    "$adb" "$serial" "$expected_avd" "$owner_pid" "$diagnostic_file" || return 1
+  ANDROID_ACCEPTANCE_EMULATOR_OWNER_TOKEN="$owner_token" \
+    android_acceptance_runner_owned_emulator_interactive \
+    "$adb" "$serial" "$expected_avd" "$owner_pid" \
+    "$diagnostic_file" || return 1
   "$@"
 }
 
@@ -1252,17 +2002,129 @@ android_acceptance_is_solana_device() {
   return 1
 }
 
-# Resolve one immutable acceptance fleet from `adb devices -l`. Reserved
-# performance devices are recorded but never selected, even if they are the
-# only attached hardware. Every other visible adb target must be fully
-# authorized and online: silently dropping an offline/unauthorized device
-# would let a fleet run claim coverage it never exercised.
+# The adb serials of the phones reserved for the physical performance harness,
+# one per line. They are read from android.performance_device_serials in
+# tests.yml (separated by spaces) through the canonical config reader, as
+# android.unlock_code is, and never written in this repository. Acceptance must
+# never touch those phones, so a missing, placeholder or malformed value fails
+# rather than reserving nothing.
+android_acceptance_reserved_device_serials() {
+  local config_reader="$1" vault="$2" value serial
+  local -a serials
+  [ -x "$config_reader" ] || {
+    echo "test config reader is missing: $config_reader" >&2
+    return 1
+  }
+  if ! value="$(UR_ACCEPT_VAULT="$vault" "$config_reader" get android.performance_device_serials)"; then
+    echo "could not read android.performance_device_serials from $vault" >&2
+    return 1
+  fi
+  case "$value" in REPLACE_ME*) value='' ;; esac
+  read -r -a serials <<<"$value" || true
+  if [ "${#serials[@]}" -eq 0 ]; then
+    echo "set android.performance_device_serials in $vault to the adb serials of the phones reserved for performance tests, separated by spaces" >&2
+    return 1
+  fi
+  for serial in "${serials[@]}"; do
+    case "$serial" in
+      *[!A-Za-z0-9._:-]*|REPLACE_ME*)
+        echo "android.performance_device_serials in $vault holds a value that is not an adb serial" >&2
+        return 1
+        ;;
+    esac
+  done
+  printf '%s\n' "${serials[@]}"
+}
+
+# This physical phone was explicitly authorized for canonical Solana shipping
+# acceptance. Discovering another compatible phone does not authorize it.
+# Changing the physical lane requires a new explicit authorization and a tracked
+# update here; environment variables cannot broaden the mutation scope.
+android_acceptance_canonical_solana_serial() {
+  printf 'O1N1XT172304047\n'
+}
+
+# Read-only identity/capability proof, before unlocking, changing settings,
+# installing, or cleaning up packages. Do not substitute a ready foreign phone
+# or an emulator whose model was configured to look like Solana hardware.
+android_acceptance_validate_canonical_solana_device() {
+  local adb="$1" serial="$2" diagnostic_file="${3:-}" actual qemu boot_qemu api abis value property
+  local -a identity=()
+
+  [ "$serial" = "$(android_acceptance_canonical_solana_serial)" ] || {
+    echo "physical Solana device is outside canonical acceptance authorization" >&2
+    android_acceptance_authorization_failure "$diagnostic_file" selection not-authorized not-run || true
+    return 1
+  }
+  android_acceptance_adb_device_ready "$adb" "$serial" "$diagnostic_file" || return 1
+  actual="$(android_acceptance_authorization_read \
+    "$diagnostic_file" serial "$adb" "$serial" get-serialno)" || return 1
+  [ "$actual" = "$serial" ] || {
+    android_acceptance_authorization_failure "$diagnostic_file" serial value-mismatch 0 || true
+    return 1
+  }
+  qemu="$(android_acceptance_authorization_read \
+    "$diagnostic_file" qemu "$adb" "$serial" shell getprop ro.kernel.qemu)" || return 1
+  boot_qemu="$(android_acceptance_authorization_read \
+    "$diagnostic_file" boot-qemu "$adb" "$serial" shell getprop ro.boot.qemu)" || return 1
+  case "$qemu:$boot_qemu" in :|0:|:0|0:0) ;; *)
+    android_acceptance_authorization_failure "$diagnostic_file" emulator-flags value-mismatch 0 || true
+    return 1 ;;
+  esac
+  for property in ro.product.manufacturer ro.product.brand ro.product.model ro.product.name ro.product.device; do
+    value="$(android_acceptance_authorization_read \
+      "$diagnostic_file" "identity-${property##*.}" "$adb" "$serial" shell getprop "$property")" || return 1
+    identity+=("$value")
+  done
+  android_acceptance_is_solana_device "${identity[@]}" || {
+    echo "authorized physical device is not Saga or Seeker hardware" >&2
+    android_acceptance_authorization_failure "$diagnostic_file" hardware unsupported 0 || true
+    return 1
+  }
+  api="$(android_acceptance_authorization_read \
+    "$diagnostic_file" api "$adb" "$serial" shell getprop ro.build.version.sdk)" || return 1
+  case "$api" in ''|*[!0-9]*)
+    android_acceptance_authorization_failure "$diagnostic_file" api value-mismatch 0 || true
+    return 1 ;;
+  esac
+  [ "$api" -ge 26 ] || {
+    android_acceptance_authorization_failure "$diagnostic_file" api unsupported 0 || true
+    return 1
+  }
+  abis="$(android_acceptance_authorization_read \
+    "$diagnostic_file" abi "$adb" "$serial" shell getprop ro.product.cpu.abilist)" || return 1
+  android_acceptance_device_has_shipping_abi "$abis" || {
+    android_acceptance_authorization_failure "$diagnostic_file" abi unsupported 0 || true
+    return 1
+  }
+}
+
+# Resolve explicit serials from `adb devices -l`. The fourth argument is an
+# exact newline-delimited required set: canonical acceptance supplies its
+# owned AVD and the authorized physical Solana lane when that flavor is needed;
+# diagnostics supply one explicit serial. An empty selection only inventories
+# devices before owned targets start. Unrelated devices, including unauthorized
+# or offline ones, cannot block this lane or become accidental fallback targets.
+# Reserved performance devices remain excluded even if explicitly requested.
 android_acceptance_select_adb_devices() {
-  local raw_file="$1" selected_file="$2" excluded_file="$3"
-  shift 3
+  local raw_file="$1" selected_file="$2" excluded_file="$3" required_serials="$4"
+  shift 4
   local selected_tmp="${selected_file}.tmp.$$"
   local excluded_tmp="${excluded_file}.tmp.$$"
-  local line serial state reserved candidate
+  local line serial state reserved candidate required matched
+  local -a required_set=()
+
+  while IFS= read -r required; do
+    [ -n "$required" ] || continue
+    case "$required" in *[!A-Za-z0-9._:-]*) return 1 ;; esac
+    for candidate in ${required_set[@]+"${required_set[@]}"} "$@"; do
+      if [ "$required" = "$candidate" ]; then
+        echo "duplicate or reserved required adb serial: $required" >&2
+        return 1
+      fi
+    done
+    required_set+=("$required")
+  done <<<"$required_serials"
 
   : >"$selected_tmp" || return 1
   : >"$excluded_tmp" || { rm -f "$selected_tmp"; return 1; }
@@ -1295,8 +2157,16 @@ android_acceptance_select_adb_devices() {
       printf '%s\t%s\treserved-for-performance\n' "$serial" "$state" >>"$excluded_tmp"
       continue
     fi
+    matched=0
+    for required in ${required_set[@]+"${required_set[@]}"}; do
+      [ "$serial" != "$required" ] || matched=1
+    done
+    if [ "$matched" -eq 0 ]; then
+      printf '%s\t%s\toutside-acceptance-selection\n' "$serial" "$state" >>"$excluded_tmp"
+      continue
+    fi
     if [ "$state" != device ]; then
-      echo "adb device $serial is $state; every non-reserved attached device must be authorized and online" >&2
+      echo "required adb device $serial is $state; the selected target must be authorized and online" >&2
       rm -f "$selected_tmp" "$excluded_tmp"
       return 1
     fi
@@ -1307,6 +2177,13 @@ android_acceptance_select_adb_devices() {
     fi
     printf '%s\n' "$serial" >>"$selected_tmp"
   done <"$raw_file"
+  for required in ${required_set[@]+"${required_set[@]}"}; do
+    if ! grep -Fqx -- "$required" "$selected_tmp"; then
+      echo "required adb device $required is absent or reserved for performance" >&2
+      rm -f "$selected_tmp" "$excluded_tmp"
+      return 1
+    fi
+  done
 
   LC_ALL=C sort "$selected_tmp" >"${selected_tmp}.sorted" || {
     rm -f "$selected_tmp" "$selected_tmp.sorted" "$excluded_tmp"
@@ -1330,13 +2207,13 @@ android_acceptance_execution_mode() {
     0:0) printf 'canonical\n' ;;
     1:1) printf 'diagnostic\n' ;;
     *)
-      echo "--diagnostic-device and --diagnostic-case must be supplied together" >&2
+      echo "one diagnostic target (--diagnostic-device or --diagnostic-owned-avd) and --diagnostic-case must be supplied together" >&2
       return 2
       ;;
   esac
 }
 
-# A focused P2P invocation is intentionally one fresh build, one physical
+# A focused P2P invocation is intentionally one fresh build, one selected
 # device, one flavor, and one case. Three confirmations must therefore be
 # three independent invocations with independent cleanup boundaries. A
 # diagnostic may never emit the result file consumed by final proof.
@@ -1359,6 +2236,26 @@ android_acceptance_validate_diagnostic_request() {
       return 2
     fi
   done
+  android_acceptance_validate_diagnostic_settings \
+    "$requested_case" "$flavor_count" "$flavor" "$repeat_count" \
+    "$skip_build" "$smoke_only" "$keep_emulator" "$keep_fixture" "$result_matrix"
+}
+
+# An owned AVD is a separate target kind, never an exception permitting a
+# caller-supplied emulator serial. Solana remains a physical-only lane.
+android_acceptance_validate_owned_avd_diagnostic_request() {
+  case "$3" in
+    github|play|fdroid) ;;
+    *) echo "owned-AVD diagnostics require github, play, or fdroid" >&2; return 2 ;;
+  esac
+  android_acceptance_validate_diagnostic_settings "$@"
+}
+
+android_acceptance_validate_diagnostic_settings() {
+  local requested_case="$1" flavor_count="$2" flavor="$3" repeat_count="$4"
+  local skip_build="$5" smoke_only="$6" keep_emulator="$7" keep_fixture="$8"
+  local result_matrix="$9"
+
   if [ "$requested_case" != peer-to-peer ]; then
     echo "--diagnostic-case supports only peer-to-peer" >&2
     return 2
@@ -1406,7 +2303,7 @@ android_acceptance_validate_diagnostic_request() {
 android_acceptance_select_diagnostic_device() {
   local captured_file="$1" output_file="$2" requested_serial="$3"
   shift 3
-  local reserved matches temporary="${output_file}.tmp.$$"
+  local reserved
 
   case "$requested_serial" in
     ''|emulator-*|*[!A-Za-z0-9._:-]*)
@@ -1420,6 +2317,26 @@ android_acceptance_select_diagnostic_device() {
       return 2
     fi
   done
+  android_acceptance_select_captured_diagnostic_device \
+    "$captured_file" "$output_file" "$requested_serial"
+}
+
+# Prove the exact live child/guest identity again after startup and inventory
+# capture. Merely finding an emulator serial in ADB never authorizes reuse.
+android_acceptance_select_owned_avd_diagnostic_device() {
+  local captured_file="$1" output_file="$2" adb="$3" requested_serial="$4"
+  local expected_avd="$5" owner_pid="$6" owner_token="$7"
+
+  android_acceptance_runner_owns_emulator \
+    "$adb" "$requested_serial" "$expected_avd" "$owner_pid" "$owner_token" || return 1
+  android_acceptance_select_captured_diagnostic_device \
+    "$captured_file" "$output_file" "$requested_serial"
+}
+
+android_acceptance_select_captured_diagnostic_device() {
+  local captured_file="$1" output_file="$2" requested_serial="$3"
+  local matches temporary="${output_file}.tmp.$$"
+
   [ -f "$captured_file" ] || return 1
   matches="$(awk -v serial="$requested_serial" '$0 == serial { count++ } END { print count + 0 }' "$captured_file")" || \
     return 1
@@ -1468,11 +2385,33 @@ android_acceptance_write_device_records() {
 # cell. Target-major order builds each APK once, then runs it sequentially on
 # compatible devices. Capability rows are:
 #   device-id<TAB>serial<TAB>play-services(0|1)<TAB>solana-device(0|1)<TAB>api
+# Canonical mode additionally assigns the general flavors to the owned AVD
+# and solana_dapp exclusively to the authorized physical phone. Diagnostics
+# keep their separately authorized single-device capability plan.
 android_acceptance_write_device_flavor_plan() {
   local capabilities_file="$1" plan_file="$2" skipped_file="$3"
   shift 3
   local temporary="${plan_file}.tmp.$$" skipped_temporary="${skipped_file}.tmp.$$"
   local target device_id serial play_services solana_device android_api extra reason
+  local canonical=0 owned_avd='' solana_serial=''
+
+  if [ "${1:-}" = --canonical-devices ]; then
+    [ "$#" -ge 3 ] || return 2
+    canonical=1
+    owned_avd="$2"
+    solana_serial="$3"
+    shift 3
+    case "$owned_avd" in emulator-*) ;; *) return 1 ;; esac
+    case "${owned_avd#emulator-}" in ''|*[!0-9]*) return 1 ;; esac
+    [ -z "$solana_serial" ] || \
+      [ "$solana_serial" = "$(android_acceptance_canonical_solana_serial)" ] || return 1
+    # Capability inventory is immutable and exact, not a second broad selector.
+    awk -F '\t' -v avd="$owned_avd" -v solana="$solana_serial" '
+      NF != 5 || ($2 != avd && (solana == "" || $2 != solana)) { failed = 1 }
+      { if (++seen[$2] != 1) failed = 1 }
+      END { exit failed || seen[avd] != 1 || (solana != "" && seen[solana] != 1) }
+    ' "$capabilities_file" || return 1
+  fi
 
   : >"$temporary" || return 1
   : >"$skipped_temporary" || { rm -f "$temporary"; return 1; }
@@ -1494,7 +2433,11 @@ android_acceptance_write_device_flavor_plan() {
         return 1
       }
       reason=""
-      if [ "$target" = play ] && [ "$play_services" -ne 1 ]; then
+      if [ "$canonical" -eq 1 ] && [ "$target" = solana_dapp ] && [ "$serial" != "$solana_serial" ]; then
+        reason="requires-authorized-physical-solana"
+      elif [ "$canonical" -eq 1 ] && [ "$target" != solana_dapp ] && [ "$serial" != "$owned_avd" ]; then
+        reason="reserved-for-canonical-solana-flavor"
+      elif [ "$target" = play ] && [ "$play_services" -ne 1 ]; then
         reason="requires-google-play-services"
       elif [ "$target" = solana_dapp ] && [ "$solana_device" -ne 1 ]; then
         reason="requires-solana-seeker-or-saga"
@@ -1534,9 +2477,27 @@ android_acceptance_require_target_coverage() {
 # Android pass.
 android_acceptance_verify_device_flavor_results() {
   local plan_file="$1" results_file="$2"
-  awk -F '\t' '
+  shift 2
+  local required_cases="email phone instant password data-plane peer-to-peer usdc-quote"
+  local requested_case
+
+  if [ "$#" -gt 0 ]; then
+    required_cases=""
+    for requested_case in "$@"; do
+      case "$requested_case" in
+        email|phone|instant|password|data-plane|peer-to-peer|usdc-quote) ;;
+        *) return 2 ;;
+      esac
+      case " $required_cases " in
+        *" $requested_case "*) return 2 ;;
+        *) required_cases="$required_cases $requested_case" ;;
+      esac
+    done
+    required_cases="${required_cases# }"
+  fi
+  awk -F '\t' -v required_cases="$required_cases" '
     BEGIN {
-      split("email phone instant password data-plane peer-to-peer", required, " ")
+      split(required_cases, required, " ")
       failed = 0
     }
     NR == FNR {
@@ -2097,4 +3058,60 @@ android_acceptance_uninstall_package() {
   printf '\n[android acceptance] uninstall exit=%s; absence verification=%s\n' \
     "$uninstall_status" "$absence_status" >>"$log_file"
   return "$absence_status"
+}
+
+# The tabletop job (apple/DUO.md item 7) runs once per canonical acceptance
+# run, on the GitHub flavor when the run has it and else on Play: the two that
+# run on the owned emulator. Launch-only smoke runs and diagnostics skip it.
+# Prints the target, or nothing when the run has no tabletop job.
+android_acceptance_tabletop_target() {
+  local execution_mode="$1" smoke_only="$2" target
+  shift 2
+  [ "$execution_mode" = canonical ] && [ "$smoke_only" = 0 ] || return 0
+  for target in github play; do
+    case " $* " in
+      *" $target "*) printf '%s\n' "$target"; return 0 ;;
+    esac
+  done
+}
+
+# Runs the tabletop job: ConnectTabletopTest on the Gradle Managed Device that
+# app/app/build.gradle defines, a Pixel Fold. Gradle builds the flavor's debug
+# and test APKs, creates and boots that emulator, runs the one test class and
+# shuts the emulator down; it never touches the acceptance AVD or a fleet
+# device. Espresso Device folds it through the emulator console, which AGP
+# grants only with emulator control on. A first run boots the device cold to
+# save its snapshot, which can outlast AGP's default setup limit on a busy
+# host, so the limit is 30 minutes. Remaining arguments go to Gradle.
+android_acceptance_run_tabletop_job() {
+  local app_dir="$1" root="$2" flavor="$3" device="$4" test_scope="$5" build_id="$6"
+  shift 6
+  [ -d "$app_dir" ] || return 2
+  case "$flavor" in Github|Play) ;; *) return 2 ;; esac
+  [[ "$device" =~ ^[A-Za-z0-9]+$ ]] || return 2
+  [[ "$test_scope" =~ ^[A-Za-z0-9_.]+$ ]] || return 2
+  [[ "$build_id" =~ ^[A-Za-z0-9._-]+$ ]] || return 2
+  (
+    cd "$app_dir" || exit 2
+    BRINGYOUR_HOME="$root" timeout 3600 ./gradlew \
+      ":app:${device}${flavor}DebugAndroidTest" \
+      -Pandroid.experimental.androidTest.enableEmulatorControl=true \
+      -Pandroid.experimental.testOptions.managedDevices.setupTimeoutMinutes=30 \
+      "-Pandroid.testInstrumentationRunnerArguments.class=$test_scope" \
+      "-PurnetworkAcceptanceBuildId=$build_id" \
+      "$@"
+  )
+}
+
+# Copies the managed device's JUnit results and logcat for the flavor (what
+# Gradle wrote under build/outputs/androidTest-results/managedDevice) beside
+# the job's log. A run that never reached the device has none to copy.
+android_acceptance_collect_tabletop_results() {
+  local build_dir="$1" flavor="$2" device="$3" destination="$4" variant results
+  variant="$(printf '%s' "$flavor" | tr '[:upper:]' '[:lower:]')Debug"
+  results="$build_dir/outputs/androidTest-results/managedDevice/$variant/$device"
+  [ -d "$results" ] || return 1
+  mkdir -p "$destination/results" || return 1
+  cp -R "$results/." "$destination/results/" || return 1
+  chmod -R go-rwx "$destination/results" || return 1
 }

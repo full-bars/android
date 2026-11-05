@@ -38,12 +38,15 @@ import androidx.glance.layout.height
 import androidx.glance.layout.padding
 import androidx.glance.layout.size
 import androidx.glance.layout.width
+import androidx.glance.semantics.contentDescription
+import androidx.glance.semantics.semantics
 import androidx.glance.text.Text
 import androidx.glance.text.TextStyle
 import androidx.glance.ColorFilter
 import com.bringyour.network.LoginActivity
 import com.bringyour.network.QuickConnectActivity
 import com.bringyour.network.R
+import com.bringyour.network.ui.connect.textId
 import com.bringyour.network.utils.formatByteCountCompact
 import com.bringyour.network.utils.formatByteRate
 import com.bringyour.network.utils.formatPacketRate
@@ -54,7 +57,8 @@ import kotlin.math.roundToInt
 
 /**
  * The Home Screen dashboard: the transfer balance bar, the connected location
- * with its provider count, the quick connect button and, at the tall size,
+ * with its provider count (the slow internet pill in its place while the
+ * connection is slow), the quick connect button and, at the tall size,
  * the client and provider throughput for the last hour. Responsive: the
  * launcher picks the largest of the three layouts that fits, as the user
  * resizes.
@@ -79,8 +83,9 @@ class DashboardWidget : GlanceAppWidget() {
     override val sizeMode: SizeMode = SizeMode.Exact
 
     override suspend fun provideGlance(context: Context, id: GlanceId) {
-        val entry = WidgetEntry.load(context)
-        provideContent { DashboardContent(entry) }
+        // the entry is read in the composition, again on each reload: an
+        // update while this session runs recomposes it without running this
+        provideContent { DashboardContent(rememberWidgetEntry(context, WidgetKinds.DASHBOARD)) }
     }
 }
 
@@ -88,30 +93,43 @@ class DashboardWidget : GlanceAppWidget() {
 internal fun DashboardContent(entry: WidgetEntry) {
     val size = LocalSize.current
     val context = LocalContext.current
+    val slowInternet = dashboardSlowInternet(entry)
     WidgetSurface(entry, QuickConnectActivity.ROUTE_CONNECT) {
         when {
             size.height < DashboardWidget.SHORT.height -> {
                 Box(modifier = GlanceModifier.fillMaxSize(), contentAlignment = Alignment.CenterStart) {
-                    DashboardHeader(entry, compact = true)
+                    DashboardHeader(entry, slowInternet, compact = true)
                 }
             }
             size.height < DashboardWidget.TALL.height -> {
+                // the pill's header is taller than the provider count's: at the
+                // shortest heights the balance's label row gives way, the bar
+                // staying, so nothing clips
+                val balanceLabel = slowInternet == null || dashboardShortKeepsBalanceLabel(
+                    context,
+                    slowInternet,
+                    locationTitle(context, entry),
+                    roomDp = size.height.value - 2 * 14f,
+                )
                 Column(
                     modifier = GlanceModifier.fillMaxSize(),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    DashboardHeader(entry, compact = false)
+                    DashboardHeader(entry, slowInternet, compact = false)
                     Spacer(GlanceModifier.height(10.dp))
-                    BalanceBar(entry.balance)
+                    BalanceBar(entry.balance, label = balanceLabel)
                 }
             }
             else -> {
                 Column(modifier = GlanceModifier.fillMaxSize()) {
-                    DashboardHeader(entry, compact = false)
+                    DashboardHeader(entry, slowInternet, compact = false)
                     Spacer(GlanceModifier.height(10.dp))
                     BalanceBar(entry.balance)
                     Spacer(GlanceModifier.height(10.dp))
-                    val chartHeight = ((size.height.value - 130f) / 2f).coerceIn(40f, 90f).dp
+                    // the slow internet pill's taller header comes out of the
+                    // charts, so the footer keeps its place
+                    val headerGrowth = if (slowInternet != null) PILL_HEADER_GROWTH_DP else 0f
+                    val chartHeight = dashboardChartHeightDp(size.width.value, size.height.value, headerGrowth).dp
                     ThroughputChart(
                         title = context.getString(R.string.widget_client),
                         entry = entry,
@@ -140,7 +158,12 @@ internal fun DashboardContent(entry: WidgetEntry) {
  * there is no account; the quick connect button's own click wins inside it.
  */
 @Composable
-internal fun WidgetSurface(entry: WidgetEntry, route: String, content: @Composable () -> Unit) {
+internal fun WidgetSurface(
+    entry: WidgetEntry,
+    route: String,
+    padding: androidx.compose.ui.unit.Dp = 14.dp,
+    content: @Composable () -> Unit,
+) {
     val context = LocalContext.current
     val open = if (entry.isConfigured) {
         actionStartActivity(
@@ -159,16 +182,29 @@ internal fun WidgetSurface(entry: WidgetEntry, route: String, content: @Composab
             .appWidgetBackground()
             .background(WidgetTheme.background)
             .cornerRadius(android.R.dimen.system_app_widget_background_radius)
-            .padding(14.dp)
+            .padding(padding)
             .clickable(open),
     ) {
         content()
     }
 }
 
+/**
+ * The mark, the location and the quick connect. Under the location, the
+ * provider count, or the slow internet pill ([slowInternet]) in its place
+ * while the notification shows its slow content; the compact size has room
+ * for the pill only, without words. Also the overview's, whose toggle
+ * asks the user to unlock first ([unlockFirst]).
+ */
 @Composable
-private fun DashboardHeader(entry: WidgetEntry, compact: Boolean) {
+internal fun DashboardHeader(
+    entry: WidgetEntry,
+    slowInternet: DashboardSlowInternet?,
+    compact: Boolean,
+    unlockFirst: Boolean = false,
+) {
     val context = LocalContext.current
+    val title = locationTitle(context, entry)
     Row(
         modifier = GlanceModifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically,
@@ -179,39 +215,69 @@ private fun DashboardHeader(entry: WidgetEntry, compact: Boolean) {
         // all (off, not configured) so the title keeps its place. A bitmap, so it
         // is round on every Android version (Glance corner radii only apply on 12+).
         val markSize = LOCATION_MARK_SIZE_DP.dp
+        val markDensity = widgetBitmapDensity()
         Image(
             provider = ImageProvider(
-                locationMarkBitmap((markSize.value * context.resources.displayMetrics.density).toInt(), locationMarkColor(entry)),
+                locationMarkBitmap((markSize.value * markDensity).roundToInt(), locationMarkColor(entry), markDensity),
             ),
             contentDescription = null,
             modifier = GlanceModifier.size(markSize),
         )
         Spacer(GlanceModifier.width(10.dp))
-        Column(modifier = GlanceModifier.defaultWeight()) {
-            Text(locationTitle(context, entry), style = WidgetTheme.title, maxLines = 1)
-            if (!compact) {
+        var column = GlanceModifier.defaultWeight()
+        if (slowInternet != null) {
+            // TalkBack reads the title and the pill as one element, every number
+            val description = dashboardSlowInternetDescription(
+                title = title,
+                label = context.getString(slowInternet.content.label.textId),
+                content = slowInternet.content,
+                uploadDelay = context.getString(R.string.slow_internet_upload_delay),
+                downloadDelay = context.getString(R.string.slow_internet_download_delay),
+            )
+            column = column.semantics { contentDescription = description }
+        }
+        Column(modifier = column) {
+            Text(title, style = WidgetTheme.title, maxLines = 1)
+            if (slowInternet != null) {
+                Spacer(GlanceModifier.height(PILL_SPACE_DP.dp))
+                // the column's room: the widget less the surface's padding,
+                // the mark, the button and the spaces between them
+                DashboardSlowInternetPill(
+                    slowInternet,
+                    compact,
+                    roomDp = LocalSize.current.width.value - (2 * 14f + LOCATION_MARK_SIZE_DP + 10f + 8f + 48f),
+                )
+            } else if (!compact) {
                 Text(subtitle(context, entry), style = WidgetTheme.caption, maxLines = 1)
             }
         }
         Spacer(GlanceModifier.width(8.dp))
-        QuickConnectButton(entry)
+        QuickConnectButton(entry, unlockFirst)
     }
 }
 
 /**
  * The in-widget quick connect: the connector mark in a capsule, gray when
- * off and the accent pink when on. A tap runs the same trampoline as the
- * launcher shortcuts (QuickConnectActivity, no UI), which toggles and opens
- * the app only when it is needed. The widget re-renders from the device's
- * new state within the same second, so no separate optimistic state is kept.
+ * off and the accent pink when on, also while a start waits on its balance
+ * (connecting). A tap runs the same trampoline as the launcher shortcuts
+ * (QuickConnectActivity, no UI), which toggles and opens the app only when
+ * it is needed; a tap while connecting ends the wait. The writer asks for
+ * a re-render on each connect and disconnect, and the quick connect start
+ * on each start and end of a wait (StartConnect); each reads the entry
+ * again (rememberWidgetEntry), so no separate optimistic state is kept.
+ * With [unlockFirst] (the overview, also on the lock screen) the trampoline
+ * has the user unlock before it toggles.
  */
 @Composable
-private fun QuickConnectButton(entry: WidgetEntry) {
+private fun QuickConnectButton(entry: WidgetEntry, unlockFirst: Boolean) {
     val context = LocalContext.current
     val action = if (entry.isConfigured) {
         actionStartActivity(
             ComponentName(context, QuickConnectActivity::class.java),
-            actionParametersOf(QuickConnectActivity.ACTION_PARAMETER to QuickConnectActivity.ACTION_TOGGLE),
+            actionParametersOf(
+                QuickConnectActivity.ACTION_PARAMETER to
+                    if (unlockFirst) QuickConnectActivity.ACTION_UNLOCK_TOGGLE else QuickConnectActivity.ACTION_TOGGLE,
+            ),
         )
     } else {
         actionStartActivity(ComponentName(context, LoginActivity::class.java))
@@ -220,37 +286,40 @@ private fun QuickConnectButton(entry: WidgetEntry) {
         modifier = GlanceModifier
             .size(48.dp, 36.dp)
             .cornerRadius(18.dp)
-            .background(if (entry.isOn) WidgetTheme.tint else WidgetTheme.card)
+            .background(if (entry.quickConnectOn) WidgetTheme.tint else WidgetTheme.card)
             .clickable(action),
         contentAlignment = Alignment.Center,
     ) {
         Image(
             provider = ImageProvider(R.drawable.ic_tile_quick_on),
-            contentDescription = context.getString(if (entry.isOn) R.string.disconnect else R.string.connect),
+            contentDescription = context.getString(if (entry.quickConnectOn) R.string.disconnect else R.string.connect),
             modifier = GlanceModifier.size(18.dp),
             colorFilter = ColorFilter.tint(WidgetTheme.text),
         )
     }
 }
 
-/** The three-segment transfer balance bar, as the app's UsageBar draws it (a bitmap: Glance rows only weight equally). */
+/**
+ * The three-segment transfer balance bar, as the app's UsageBar draws it (a
+ * bitmap: Glance rows only weight equally), under its label row. Without
+ * [label], the bar alone, which then says the row's words to TalkBack.
+ */
 @Composable
-internal fun BalanceBar(balance: WidgetBalanceSnapshot?) {
+internal fun BalanceBar(balance: WidgetBalanceSnapshot?, label: Boolean = true) {
     val context = LocalContext.current
     val size = LocalSize.current
-    val density = context.resources.displayMetrics.density
+    val density = widgetBitmapDensity()
+    val amounts = if (balance == null) "—" else
+        "${formatByteCountCompact(balance.balanceByteCount)} / ${formatByteCountCompact(balance.startBalanceByteCount)}"
     Column(modifier = GlanceModifier.fillMaxWidth()) {
-        Row(modifier = GlanceModifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Text(context.getString(R.string.balance), style = WidgetTheme.caption)
-            Spacer(GlanceModifier.defaultWeight())
-            Text(
-                if (balance == null) "—" else
-                    "${formatByteCountCompact(balance.balanceByteCount)} / ${formatByteCountCompact(balance.startBalanceByteCount)}",
-                style = WidgetTheme.label,
-                maxLines = 1,
-            )
+        if (label) {
+            Row(modifier = GlanceModifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(context.getString(R.string.balance), style = WidgetTheme.caption)
+                Spacer(GlanceModifier.defaultWeight())
+                Text(amounts, style = WidgetTheme.label, maxLines = 1)
+            }
+            Spacer(GlanceModifier.height(4.dp))
         }
-        Spacer(GlanceModifier.height(4.dp))
         Image(
             provider = ImageProvider(
                 BalanceBarRenderer.render(
@@ -263,7 +332,7 @@ internal fun BalanceBar(balance: WidgetBalanceSnapshot?) {
                     density,
                 )
             ),
-            contentDescription = null,
+            contentDescription = if (label) null else listOf(context.getString(R.string.balance), amounts).joinToString(" "),
             modifier = GlanceModifier.fillMaxWidth().height(8.dp),
             contentScale = ContentScale.FillBounds,
         )
@@ -274,7 +343,7 @@ internal fun BalanceBar(balance: WidgetBalanceSnapshot?) {
 private fun ThroughputChart(title: String, entry: WidgetEntry, provider: Boolean, height: androidx.compose.ui.unit.Dp) {
     val context = LocalContext.current
     val size = LocalSize.current
-    val density = context.resources.displayMetrics.density
+    val density = widgetBitmapDensity()
     val throughput = entry.tunnel.throughput
     val points = throughputPoints(entry, provider)
     val peakLabel = throughputPeakLabel(points, throughput.bucketSeconds)
@@ -324,6 +393,25 @@ private fun ThroughputChart(title: String, entry: WidgetEntry, provider: Boolean
         }
     }
 }
+
+/**
+ * The tall layout's chart height: the two charts share what the header, the
+ * balance bar, the spaces and the footer leave ([headerGrowthDp] more for the
+ * slow internet pill's taller header), at least 40dp, and at most half the
+ * chart's width, or 90dp where that is less, so a tall narrow widget keeps
+ * charts rather than columns. A tablet or an unfolded phone grows them; at
+ * 310dp tall and under they are the 90dp or less they always were.
+ */
+internal fun dashboardChartHeightDp(widthDp: Float, heightDp: Float, headerGrowthDp: Float): Float =
+    ((heightDp - DASHBOARD_TALL_FIXED_DP - headerGrowthDp) / 2f)
+        .coerceIn(DASHBOARD_CHART_MIN_DP, maxOf(DASHBOARD_CHART_CAP_DP, (widthDp - 2 * WIDGET_PADDING_DP) / 2f))
+
+/** The tall layout's rows other than the charts, with the surface's padding. */
+private const val DASHBOARD_TALL_FIXED_DP = 130f
+private const val DASHBOARD_CHART_MIN_DP = 40f
+private const val DASHBOARD_CHART_CAP_DP = 90f
+/** The widget surface's padding on each side (WidgetSurface). */
+private const val WIDGET_PADDING_DP = 14f
 
 /** The chart's points for one side: the client's remote traffic or the provider's local + blocked traffic. */
 internal fun throughputPoints(entry: WidgetEntry, provider: Boolean): List<ThroughputChartRenderer.Point> =
@@ -376,18 +464,22 @@ internal fun locationMarkArgb(hasLocation: Boolean, colorHex: String?): Int {
     return WidgetColors.parseHex(colorHex ?: "", LOCATION_MARK_UNKNOWN)
 }
 
-/** A filled circle of [color], [sizePx] wide, for a Glance image. */
-internal fun locationMarkBitmap(sizePx: Int, color: Int): Bitmap {
+/** A filled circle of [color], [sizePx] wide at [density] pixels per dp, for a Glance image. */
+internal fun locationMarkBitmap(sizePx: Int, color: Int, density: Float): Bitmap {
     val size = sizePx.coerceAtLeast(2)
-    val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+    val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888).drawnAt(density)
     val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { this.color = color; style = Paint.Style.FILL }
     Canvas(bitmap).drawCircle(size / 2f, size / 2f, size / 2f, paint)
     return bitmap
 }
 
 internal fun locationTitle(context: Context, entry: WidgetEntry): String {
-    if (!entry.isConfigured) return context.getString(R.string.widget_not_signed_in)
-    if (!entry.isOn) return context.getString(R.string.tile_status_disconnected)
+    // the location only once connected, with the tunnel up; else the connect
+    // screen's line for the status (not signed in, disconnected, connecting,
+    // couldn't connect, tunnel down)
+    if (entry.status != com.bringyour.network.ui.connect.QuickConnectStatus.CONNECTED) {
+        return context.getString(com.bringyour.network.ui.connect.quickConnectStatusText(entry.status))
+    }
     val location = entry.tunnel.location
     if (!entry.showsTunnelData || location == null) return context.getString(R.string.tile_status_connected)
     if (location.bestAvailable) return context.getString(R.string.best_available_provider)

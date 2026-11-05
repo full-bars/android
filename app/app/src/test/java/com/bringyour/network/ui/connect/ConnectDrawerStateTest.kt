@@ -1,0 +1,80 @@
+package com.bringyour.network.ui.connect
+
+import androidx.compose.runtime.saveable.SaverScope
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class ConnectDrawerStateTest {
+
+    // offsets grow downward: the expanded drawer sits at 800, the collapsed one at 2200
+    private val expanded = 800f
+    private val collapsed = 2200f
+    private val velocityThreshold = 350f
+    private val positionalThreshold = 150f
+
+    private fun target(offset: Float, velocity: Float, from: ConnectDrawerValue) =
+        ConnectDrawerState.releaseTarget(
+            offset = offset,
+            velocity = velocity,
+            from = from,
+            expandedOffset = expanded,
+            collapsedOffset = collapsed,
+            velocityThresholdPx = velocityThreshold,
+            positionalThresholdPx = positionalThreshold,
+        )
+
+    @Test
+    fun aFastReleaseGoesTheWayItMoves() {
+        assertEquals(ConnectDrawerValue.Expanded, target(2150f, -2000f, ConnectDrawerValue.Collapsed))
+        assertEquals(ConnectDrawerValue.Collapsed, target(850f, 2000f, ConnectDrawerValue.Expanded))
+        // even against the distance travelled so far
+        assertEquals(ConnectDrawerValue.Collapsed, target(900f, 400f, ConnectDrawerValue.Collapsed))
+        assertEquals(ConnectDrawerValue.Expanded, target(2100f, -400f, ConnectDrawerValue.Expanded))
+    }
+
+    @Test
+    fun aSlowReleaseNeedsTheTravelDistance() {
+        // from collapsed, opening
+        assertEquals(ConnectDrawerValue.Collapsed, target(2100f, -50f, ConnectDrawerValue.Collapsed))
+        assertEquals(ConnectDrawerValue.Expanded, target(2050f, -50f, ConnectDrawerValue.Collapsed))
+        assertEquals(ConnectDrawerValue.Expanded, target(1000f, 0f, ConnectDrawerValue.Collapsed))
+        // from expanded, closing
+        assertEquals(ConnectDrawerValue.Expanded, target(900f, 50f, ConnectDrawerValue.Expanded))
+        assertEquals(ConnectDrawerValue.Collapsed, target(950f, 50f, ConnectDrawerValue.Expanded))
+        assertEquals(ConnectDrawerValue.Collapsed, target(2000f, 0f, ConnectDrawerValue.Expanded))
+    }
+
+    @Test
+    fun aSlowReleaseBackTowardsRestStaysAtRest() {
+        assertEquals(ConnectDrawerValue.Collapsed, target(2200f, 100f, ConnectDrawerValue.Collapsed))
+        assertEquals(ConnectDrawerValue.Expanded, target(800f, -100f, ConnectDrawerValue.Expanded))
+    }
+
+    @Test
+    fun aRecreatedScreenReopensTheDrawerWhereItWas() {
+        // a fold the activity does not handle, or the process coming back,
+        // restores the drawer's position instead of collapsing it
+        val scope = SaverScope { true }
+        for (value in ConnectDrawerValue.entries) {
+            val saved = with(ConnectDrawerState.Saver) { scope.save(ConnectDrawerState(value)) }
+            assertEquals(value, ConnectDrawerState.Saver.restore(saved!!)!!.targetValue)
+        }
+    }
+
+    @Test
+    fun anUnknownSavedPositionReopensCollapsed() {
+        assertEquals(ConnectDrawerValue.Collapsed, ConnectDrawerState.Saver.restore("Gone")!!.targetValue)
+    }
+
+    @Test
+    fun keyboardFocusBelowTheScreenOpensTheCollapsedDrawer() {
+        assertTrue(ConnectDrawerState.opensForFocus(collapsed = true, focusedBottom = 2300f, visibleBottom = 2200f))
+        // in view, as the location row and the connect button in the peek are
+        assertFalse(ConnectDrawerState.opensForFocus(collapsed = true, focusedBottom = 2100f, visibleBottom = 2200f))
+        assertFalse(ConnectDrawerState.opensForFocus(collapsed = true, focusedBottom = 2200f, visibleBottom = 2200f))
+        // the open drawer scrolls its content to the focus instead
+        assertFalse(ConnectDrawerState.opensForFocus(collapsed = false, focusedBottom = 2300f, visibleBottom = 2200f))
+    }
+}

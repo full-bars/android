@@ -1,0 +1,293 @@
+package com.bringyour.network.ui.upgrade
+
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.res.pluralStringResource
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.unit.dp
+import com.bringyour.network.R
+import com.bringyour.network.ui.components.BestValuePill
+import com.bringyour.network.ui.components.PlanOptionContainer
+import com.bringyour.network.ui.shared.enums.PlanType
+import com.bringyour.network.ui.theme.ProGoldLight
+import com.bringyour.network.ui.theme.TextMuted
+import com.bringyour.network.ui.theme.TopBarTitleTextStyle
+import java.text.DateFormat
+import java.util.Date
+
+/**
+ * The two plan cards every plan surface renders (mmm/onboarding/PLAN.md "PRICE
+ * PRESENTATION" and "Plan screens alignment"): yearly on top in the Pro-gold
+ * dress with the Best value pill, monthly below as the quiet alternative.
+ *
+ * Yearly prints the headline "$39.99/year", the per-month equivalent as a
+ * sub-line only when the SDK says so (never on the regional tier), the saving
+ * against monthly, and the trial line. While the welcome offer is active the
+ * yearly card becomes the offer card: "$29.99 for your first year", "then
+ * $39.99/year", the trial line, and the static deadline. Monthly prints
+ * "$4.99/month" and "Billed monthly · cancel anytime"; while a returning
+ * subscriber's win-back offer is active (mmm/reengagement/PLAN.md "THE
+ * STORES") the monthly card becomes its offer card the same way: "$2.49 for
+ * your first month", "then $4.99/month", the percent off, and the static
+ * deadline. The two cards are always the same height.
+ *
+ * With a [monthlyNote] the chosen payment method does not sell monthly
+ * ("Monthly is card only", PlanAlternative): the monthly card is greyed, can't
+ * be selected, and prints the note under its price.
+ *
+ * With [oneTimeYear] the chosen payment method buys one year once, with no
+ * trial and no renewal (mmm/ZCASH-CONTRACT.md §6.1): the yearly card shows
+ * no trial line and no "then …/year", only what that year costs. The card
+ * keeps its height, its lines centered in it as the monthly card's are, so
+ * the cards, and the button under them, stay put when the method changes.
+ */
+@Composable
+fun PlanCards(
+    presentation: PlanPresentation,
+    selectedPlan: PlanType,
+    setSelectedPlan: (PlanType) -> Unit,
+    freeTrialDays: Int = FREE_TRIAL_DAYS,
+    // the regional tier names the country its price is for
+    countryName: String? = null,
+    // the final offer page shows the yearly (offer) card alone
+    showMonthly: Boolean = true,
+    monthlyNote: String? = null,
+    oneTimeYear: Boolean = false,
+) {
+    val yearlySelected = selectedPlan == PlanType.YEARLY
+    val trialOffered = 0 < freeTrialDays
+    val offer = presentation.offer
+
+    Column {
+        PlanOptionContainer(
+            isSelected = yearlySelected,
+            select = { setSelectedPlan(PlanType.YEARLY) },
+            content = {
+                if (oneTimeYear) {
+                    Box(contentAlignment = Alignment.CenterStart) {
+                        Column(
+                            modifier = Modifier
+                                .alpha(0f)
+                                .clearAndSetSemantics {}
+                        ) {
+                            YearlyCardLines(presentation, offer, trialOffered, freeTrialDays, countryName, oneTimeYear = false)
+                        }
+                        YearlyCardLines(presentation, offer, trialOffered, freeTrialDays, countryName, oneTimeYear = true)
+                    }
+                } else if (showMonthly && monthlyNote == null && presentation.winback != null) {
+                    // the monthly card's win-back lines can outnumber the yearly
+                    // card's: an invisible copy of them keeps the cards one height
+                    Box(contentAlignment = Alignment.CenterStart) {
+                        Column(
+                            modifier = Modifier
+                                .alpha(0f)
+                                .clearAndSetSemantics {}
+                        ) {
+                            MonthlyCardLines(presentation, monthlyNote = null)
+                        }
+                        YearlyCardLines(presentation, offer, trialOffered, freeTrialDays, countryName, oneTimeYear = false)
+                    }
+                } else {
+                    YearlyCardLines(presentation, offer, trialOffered, freeTrialDays, countryName, oneTimeYear = false)
+                }
+            },
+            badge = {
+                BestValuePill()
+            },
+            glow = true
+        )
+
+        if (!showMonthly) {
+            return@Column
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        PlanOptionContainer(
+            isSelected = !yearlySelected,
+            select = { setSelectedPlan(PlanType.MONTHLY) },
+            enabled = monthlyNote == null,
+            content = {
+                // size the monthly card like the yearly card (an invisible copy of
+                // its lines, not read aloud) so both are equal height at any font
+                // scale, and center the visible lines in that space
+                Box(contentAlignment = Alignment.CenterStart) {
+                    Column(
+                        modifier = Modifier
+                            .alpha(0f)
+                            .clearAndSetSemantics {}
+                    ) {
+                        YearlyCardLines(presentation, offer, trialOffered, freeTrialDays, countryName, oneTimeYear = false)
+                    }
+                    MonthlyCardLines(presentation, monthlyNote)
+                }
+            }
+        )
+    }
+}
+
+/**
+ * The monthly card's lines: the win-back offer's while it is active and the
+ * chosen payment method sells the monthly plan, else the plain price with its
+ * billing line (or the method's note, when the method sells no monthly plan).
+ */
+@Composable
+private fun MonthlyCardLines(
+    presentation: PlanPresentation,
+    monthlyNote: String?,
+) {
+    val winback = presentation.winback?.takeIf { monthlyNote == null }
+    Column {
+        if (winback != null) {
+            Text(
+                stringResource(id = R.string.offer_first_month_price, winback.firstMonthPrice),
+                style = TopBarTitleTextStyle
+            )
+            Text(
+                stringResource(id = R.string.offer_then_regular_monthly_price, winback.regularMonthPrice),
+                style = MaterialTheme.typography.bodyMedium,
+                color = TextMuted
+            )
+            Text(
+                stringResource(id = R.string.offer_percent_off_first_month, winback.percentOff),
+                style = MaterialTheme.typography.bodyMedium,
+                color = ProGoldLight
+            )
+            if (0L < winback.expiresAtMillis) {
+                Text(
+                    stringResource(id = R.string.offer_available_until, formatOfferDeadline(winback.expiresAtMillis)),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = TextMuted
+                )
+            }
+        } else {
+            Text(
+                stringResource(id = R.string.plan_price_per_month, presentation.monthlyPrice),
+                style = TopBarTitleTextStyle
+            )
+            Text(
+                monthlyNote ?: stringResource(id = R.string.plan_billed_monthly_cancel_anytime),
+                style = MaterialTheme.typography.bodyMedium,
+                color = TextMuted
+            )
+        }
+    }
+}
+
+@Composable
+private fun YearlyCardLines(
+    presentation: PlanPresentation,
+    offer: OfferPresentation?,
+    trialOffered: Boolean,
+    freeTrialDays: Int,
+    countryName: String?,
+    // one year once, with no trial and no renewal: no trial line and no "then …/year"
+    oneTimeYear: Boolean,
+) {
+    Column {
+        if (offer != null) {
+            Text(
+                stringResource(id = R.string.offer_first_year_price, offer.firstYearPrice),
+                style = TopBarTitleTextStyle
+            )
+            if (!oneTimeYear) {
+                Text(
+                    stringResource(id = R.string.offer_then_regular_price, offer.regularYearPrice),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = TextMuted
+                )
+            }
+        } else {
+            Text(
+                stringResource(id = R.string.plan_price_per_year, presentation.yearlyPrice),
+                style = TopBarTitleTextStyle
+            )
+            val equivalent = presentation.monthlyEquivalent
+            if (equivalent != null) {
+                Text(
+                    stringResource(id = R.string.plan_monthly_equivalent_line, equivalent),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = TextMuted
+                )
+            } else if (presentation.isRegional && countryName != null) {
+                Text(
+                    stringResource(id = R.string.plan_billed_yearly_price_for_country, countryName),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = TextMuted
+                )
+            }
+        }
+        if (trialOffered && !oneTimeYear) {
+            Text(
+                stringResource(id = R.string.includes_free_trial_days, freeTrialDays),
+                style = MaterialTheme.typography.bodyMedium,
+                color = ProGoldLight
+            )
+        }
+        if (offer != null && 0L < offer.expiresAtMillis) {
+            Text(
+                stringResource(id = R.string.offer_available_until, formatOfferDeadline(offer.expiresAtMillis)),
+                style = MaterialTheme.typography.bodyMedium,
+                color = TextMuted
+            )
+        } else if (offer == null && 0 < presentation.savingPercent) {
+            Text(
+                stringResource(id = R.string.plan_save_percent, presentation.savingPercent),
+                style = MaterialTheme.typography.bodyMedium,
+                color = ProGoldLight
+            )
+        }
+    }
+}
+
+/** "Sep 14, 2026, 9:41 AM" in the device's locale and time zone: a static deadline, never a countdown. */
+fun formatOfferDeadline(expiresAtMillis: Long): String =
+    DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(expiresAtMillis))
+
+/**
+ * The terms line under the primary button: the trial, the first charge and
+ * the cancel rule, so the price is never hidden (App Store 3.1.2(c) and the
+ * Play equivalent). With the win-back offer the monthly line names the
+ * discounted first month and the price after it.
+ */
+@Composable
+fun PlanTermsLine(
+    presentation: PlanPresentation,
+    selectedPlan: PlanType,
+    freeTrialDays: Int = FREE_TRIAL_DAYS,
+) {
+    val offer = presentation.offer
+    val winback = presentation.winback
+    val text = when {
+        selectedPlan == PlanType.MONTHLY && winback != null ->
+            stringResource(id = R.string.offer_terms_first_month, winback.firstMonthPrice, winback.regularMonthPrice)
+        selectedPlan == PlanType.MONTHLY ->
+            stringResource(id = R.string.plan_billed_monthly_cancel_anytime)
+        offer != null ->
+            pluralStringResource(id = R.plurals.offer_terms_first_year, count = freeTrialDays, freeTrialDays, offer.firstYearPrice, offer.regularYearPrice)
+        else ->
+            pluralStringResource(id = R.plurals.plan_terms_yearly, count = freeTrialDays, freeTrialDays, presentation.yearlyPrice)
+    }
+    PlanFinePrintLine(text)
+}
+
+/** The small print under a plan surface's primary button: the terms line, or a payment method's own. */
+@Composable
+fun PlanFinePrintLine(text: String) {
+    Text(
+        text,
+        style = MaterialTheme.typography.bodySmall,
+        color = TextMuted,
+        modifier = Modifier.fillMaxWidth()
+    )
+}

@@ -26,6 +26,8 @@ import androidx.compose.ui.unit.dp
 import androidx.navigation.NavHostController
 import com.bringyour.network.ui.components.UpgradeScreenHeader
 import com.bringyour.network.ui.shared.viewmodels.PlanViewModel
+import com.bringyour.network.ui.shared.viewmodels.SubscriptionBalanceViewModel
+import com.bringyour.sdk.Sdk
 import com.bringyour.network.ui.theme.Black
 import com.bringyour.network.ui.theme.URNetworkTheme
 
@@ -34,15 +36,8 @@ import com.bringyour.network.ui.theme.URNetworkTheme
 fun UpgradeScreen(
     navController: NavHostController,
     planViewModel: PlanViewModel,
-    setPendingSolanaSubscriptionReference: (String) -> Unit,
-    createSolanaPaymentIntent: (
-        reference: String,
-        plan: String,
-        onSuccess: (amountUsd: Double) -> Unit,
-        onError: () -> Unit
-    ) -> Unit,
+    subscriptionBalanceViewModel: SubscriptionBalanceViewModel,
     onStripePaymentSuccess: () -> Unit,
-    isCheckingSolanaTransaction: Boolean
 ) {
     // the store offers load at launch; repeat the query here when that one
     // failed, so the picker shows the yearly plan Play has for this account
@@ -88,12 +83,9 @@ fun UpgradeScreen(
 
                 SubscriptionOptions(
                     planViewModel = planViewModel,
-                    createSolanaPaymentIntent = createSolanaPaymentIntent,
-                    onSolanaUriOpened = { reference ->
-                        setPendingSolanaSubscriptionReference(reference)
-                    },
+                    subscriptionBalanceViewModel = subscriptionBalanceViewModel,
+                    surface = Sdk.OfferSurfaceAccount,
                     onStripePaymentSuccess = onStripePaymentSuccess,
-                    isCheckingSolanaTransaction = isCheckingSolanaTransaction
                 )
                 Spacer(modifier = Modifier.height(16.dp))
             }
@@ -110,12 +102,7 @@ private fun UpgradeScreenContentPreview() {
         Column(modifier = Modifier.padding(horizontal = 16.dp)) {
             UpgradeScreenHeader()
             Spacer(modifier = Modifier.height(32.dp))
-            SubscriptionOptions(
-                upgrade = {},
-                upgradeInProgress = false,
-                monthlyCostFormatted = FALLBACK_MONTHLY_PRICE,
-                yearlyCostFormatted = FALLBACK_YEARLY_PRICE
-            )
+            SubscriptionOptions(presentation = PlanPresentations.fallback())
         }
     }
 }

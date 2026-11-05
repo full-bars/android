@@ -1,5 +1,13 @@
 package com.bringyour.network.ui.wallet
 
+import com.bringyour.network.ui.leaderboard.ProtocolFleet
+import com.bringyour.network.ui.leaderboard.ProtocolHistoryPoint
+import com.bringyour.network.ui.leaderboard.ProtocolLabel
+import com.bringyour.network.ui.leaderboard.ProtocolMe
+import com.bringyour.network.ui.leaderboard.ProtocolNotMeasurableReason
+import com.bringyour.network.ui.leaderboard.ProtocolRow
+import com.bringyour.network.ui.leaderboard.ProtocolSnapshot
+import com.bringyour.network.ui.leaderboard.ProtocolTopMe
 import com.bringyour.network.utils.Ss58
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -36,6 +44,14 @@ data class SnGasBalanceState(
     val tao: Double,
 )
 
+/**
+ * The SDK's SnEpochClaim.Status. OPEN: the vault has not finalized the epoch, so
+ * nothing is claimable yet. NOT_FINALIZED ("not-finalized"): despite the SDK's
+ * name, the vault has finalized the epoch with nothing for this coldkey to claim,
+ * either because no payout root was published for it (the root was missed, which
+ * is final) or because its payout list holds no share for this coldkey. A status
+ * this build does not know is OPEN, which promises nothing.
+ */
 enum class EpochClaimStatus {
     OPEN,
     CLAIMABLE,
@@ -49,7 +65,8 @@ enum class EpochClaimStatus {
             "claimable" -> CLAIMABLE
             "claimed" -> CLAIMED
             "expired" -> EXPIRED
-            else -> NOT_FINALIZED
+            "not-finalized" -> NOT_FINALIZED
+            else -> OPEN
         }
     }
 }
@@ -67,6 +84,8 @@ data class EpochClaim(
 data class ClaimsSnapshot(
     val claims: List<EpochClaim>,
     val totalClaimableRao: Long,
+    // the current epoch's schedule; null when the SDK could not read the policy
+    val schedule: SnEpochScheduleState? = null,
 )
 
 /** One finalized epoch of the network's points history. */
@@ -77,25 +96,6 @@ data class AccountEpoch(
     val points: Double,
     val shareBps: Long,
 )
-
-/** Head miner (Top 200) eligibility and binding for this network. */
-data class SnHeadState(
-    val eligible: Boolean,
-    val score: Double,
-    val floor: Double,
-    val rankEstimate: Long,
-    val cutoff: Long,
-    val bound: Boolean,
-    val hotkey: String?,
-    val uid: Long,
-    val rank: Long,
-    val epoch: Long,
-    val source: String,
-) {
-    /** bound and within 15% of the eviction floor */
-    val nearFloor: Boolean
-        get() = bound && 0.0 < floor && score < floor * 1.15
-}
 
 data class WalletValidation(
     val validSyntax: Boolean,
@@ -117,7 +117,7 @@ class EarningsUnavailableException(message: String = "The UR protocol is not ava
 /**
  * The SDK seam. Wallet, gas key and claims live in the SDK on the device; claims go
  * directly from the SDK to the settlement vault contract (no URnetwork API in the
- * alpha path). Points history and head eligibility come from the URnetwork API.
+ * alpha path). Points history and the Top 200 standing come from the URnetwork API.
  */
 interface EarningsProtocolSource {
 
@@ -148,9 +148,55 @@ interface EarningsProtocolSource {
     /** events arrive on an arbitrary thread */
     fun claim(epochs: List<Long>, onEvent: (ClaimEvent) -> Unit)
 
+    /** settlement v2: the coldkey's accounts, one per pool; a failure is unavailable, never zero */
+    suspend fun ledgerAccounts(): Result<List<SnLedgerAccountState>>
+
+    /** vault2's address is configured, so v2 accounts can be claimed */
+    fun ledgerClaimConfigured(): Boolean
+
+    /** claims every v2 account with something to claim; events arrive on an arbitrary thread */
+    fun ledgerClaim(onEvent: (SnLedgerClaimEvent) -> Unit)
+
+    /** the network's newest payout consent (SnNetworkConsentStatus); a failure is unavailable */
+    suspend fun consentStatus(): Result<SnConsentStatusState>
+
+    /**
+     * the api holds the network credential (Api.hasNetworkCredential): only then
+     * can it ask for and submit a consent; without it the SDK refuses with
+     * network_owner_only
+     */
+    fun hasNetworkCredential(): Boolean
+
+    /**
+     * a consent session for the wallet over a fresh challenge for the coldkey
+     * (SnNetworkConsentChallenge); refusals in the SDK's "code: message" form
+     */
+    suspend fun consentSession(walletId: String, coldkeySs58: String): Result<BittensorProofSession>
+
+    /**
+     * submits the signed consent (SnNetworkConsentSubmit); a refused signature
+     * fails with the server's code (signature_mismatch)
+     */
+    suspend fun consentSubmit(coldkeySs58: String, message: String, signature: String): Result<Unit>
+
+    /**
+     * what URnetwork's claim relay says of the network's settlement v2 balance
+     * (SnClaimStatus); null when nothing can ask, and a status that could not
+     * be read is unavailable, never zero
+     */
+    suspend fun claimStatus(): SnClaimStatusState? = null
+
+    /** asks URnetwork to claim the coldkey's balance now (SnClaimNow) */
+    suspend fun claimNow(coldkeySs58: String): SnClaimNowOutcome =
+        SnClaimNowOutcome.Failed(EarningsUnavailableException().message ?: "")
+
     suspend fun accountEpochs(): Result<List<AccountEpoch>>
 
-    suspend fun head(): Result<SnHeadState?>
+    /**
+     * the network's standing on the Protocol leaderboard (GET /sn/top/me,
+     * apple/LEADERTOP.md §8), which the Top 200 tile shows
+     */
+    suspend fun topMe(): Result<ProtocolTopMe?>
 
     fun formatAlpha(rao: Long): String
 
@@ -172,6 +218,10 @@ object EarningsFormat {
     fun alpha(rao: Long): String =
         String.format(Locale.US, "%.4f %s", rao / RAO_PER_ALPHA, ALPHA_SYMBOL)
 
+    /** "0.8420" (no symbol): an amount of α for a sentence that names SN25α itself, as sn_claim_relay_claimed does */
+    fun alphaAmount(rao: Long): String =
+        String.format(Locale.US, "%.4f", rao / RAO_PER_ALPHA)
+
     fun shareBps(shareBps: Long): String =
         String.format(Locale.US, "%.2f%%", shareBps / 100.0)
 
@@ -180,6 +230,20 @@ object EarningsFormat {
 
     fun tao(tao: Double): String =
         String.format(Locale.US, "%.4f", tao)
+
+    /** "0.0125" (no symbol): an amount in rao of TAO, for a sentence that names TAO itself */
+    fun taoAmount(rao: Long): String =
+        String.format(Locale.US, "%.4f", rao / RAO_PER_ALPHA)
+
+    /** "3", "1.5" or "0.0420" (no symbol): an estimate, as precise as its size needs, for "about 3 SN25α" */
+    fun approx(rao: Long): String {
+        val value = rao / RAO_PER_ALPHA
+        return when {
+            10 <= value -> String.format(Locale.US, "%.0f", value)
+            1 <= value -> String.format(Locale.US, "%.1f", value)
+            else -> String.format(Locale.US, "%.4f", value)
+        }
+    }
 }
 
 /** No device (signed out): points-only, nothing protocol-side. */
@@ -200,8 +264,22 @@ object NoProtocolSource : EarningsProtocolSource {
         epochs.forEach { onEvent(ClaimEvent.Failed(it, EarningsUnavailableException().message ?: "")) }
         onEvent(ClaimEvent.Done)
     }
+    override suspend fun ledgerAccounts(): Result<List<SnLedgerAccountState>> =
+        Result.failure(EarningsUnavailableException())
+    override fun ledgerClaimConfigured(): Boolean = false
+    override fun ledgerClaim(onEvent: (SnLedgerClaimEvent) -> Unit) {
+        // about no one account: pool 0
+        onEvent(SnLedgerClaimEvent.Failed(0, 0, EarningsUnavailableException().message ?: ""))
+        onEvent(SnLedgerClaimEvent.Done)
+    }
+    override suspend fun consentStatus(): Result<SnConsentStatusState> = Result.failure(EarningsUnavailableException())
+    override fun hasNetworkCredential(): Boolean = false
+    override suspend fun consentSession(walletId: String, coldkeySs58: String): Result<BittensorProofSession> =
+        Result.failure(EarningsUnavailableException())
+    override suspend fun consentSubmit(coldkeySs58: String, message: String, signature: String): Result<Unit> =
+        Result.failure(EarningsUnavailableException())
     override suspend fun accountEpochs(): Result<List<AccountEpoch>> = Result.success(emptyList())
-    override suspend fun head(): Result<SnHeadState?> = Result.success(null)
+    override suspend fun topMe(): Result<ProtocolTopMe?> = Result.success(null)
     override fun formatAlpha(rao: Long): String = EarningsFormat.alpha(rao)
     override fun formatShareBps(shareBps: Long): String = EarningsFormat.shareBps(shareBps)
     override fun shortSs58(address: String): String = Ss58.short(address)
@@ -285,7 +363,24 @@ class SampleProtocolSource(
         }
         val list = synchronized(claimList) { claimList.sortedByDescending { it.epoch } }
         return Result.success(
-            ClaimsSnapshot(list, list.filter { it.status == EpochClaimStatus.CLAIMABLE }.sumOf { it.amountRao })
+            ClaimsSnapshot(
+                list,
+                list.filter { it.status == EpochClaimStatus.CLAIMABLE }.sumOf { it.amountRao },
+                sampleSchedule(),
+            )
+        )
+    }
+
+    // epoch 1219 at the sample chain's 12 s blocks: 21,600 blocks to the close, the
+    // 14,400-block finalize offset, then 8 claim epochs plus 1 grace epoch of 50,400
+    private fun sampleSchedule(): SnEpochScheduleState {
+        val blockMillis = 12_000L
+        val end = now + 21_600 * blockMillis
+        return SnEpochScheduleState(
+            epoch = 1_219,
+            endMillis = end,
+            claimOpenMillis = end + 14_400 * blockMillis,
+            expiryMillis = end + (9 * 50_400 - 1) * blockMillis,
         )
     }
 
@@ -319,6 +414,92 @@ class SampleProtocolSource(
         }
     }
 
+    // settlement v2: one account in the pool, with a pending root above the finalized one
+    private val ledgerAccount = MutableStateFlow(
+        SnLedgerAccountState(
+            noId = 1,
+            index = 42,
+            finalizedRao = 5_120_000_000,
+            claimableRao = 4_120_000_000,
+            paidRao = 1_000_000_000,
+            pending = true,
+            pendingRao = 5_870_000_000,
+        )
+    )
+
+    override suspend fun ledgerAccounts(): Result<List<SnLedgerAccountState>> {
+        delay(400)
+        return Result.success(if (wallet.value == null) emptyList() else listOf(ledgerAccount.value))
+    }
+
+    override fun ledgerClaimConfigured(): Boolean = true
+
+    override fun ledgerClaim(onEvent: (SnLedgerClaimEvent) -> Unit) {
+        scope.launch {
+            val account = ledgerAccount.value
+            if (account.claimableRao <= 0) {
+                onEvent(SnLedgerClaimEvent.Done)
+                return@launch
+            }
+            delay(700)
+            if (gasUnfunded) {
+                onEvent(SnLedgerClaimEvent.Failed(account.noId, account.index, "needs_gas: insufficient funds"))
+                onEvent(SnLedgerClaimEvent.Done)
+                return@launch
+            }
+            val txHash = "0x" + String.format(Locale.US, "%064x", account.index * 7_919L + 0x5a5a5bL)
+            onEvent(SnLedgerClaimEvent.Sent(account.noId, account.index, txHash))
+            delay(1_600)
+            ledgerAccount.value = account.copy(claimableRao = 0, paidRao = account.finalizedRao)
+            onEvent(SnLedgerClaimEvent.Confirmed(account.noId, account.index, txHash, account.claimableRao))
+            onEvent(SnLedgerClaimEvent.Done)
+        }
+    }
+
+    // the payout consent: none until the manual sheet's answer is submitted, then
+    // that coldkey, starting next epoch
+    private val consentColdkey = MutableStateFlow<String?>(null)
+
+    override suspend fun consentStatus(): Result<SnConsentStatusState> {
+        delay(300)
+        val coldkey = consentColdkey.value
+        return Result.success(SnConsentStatusState(active = coldkey != null, coldkeySs58 = coldkey ?: ""))
+    }
+
+    override fun hasNetworkCredential(): Boolean = true
+
+    override suspend fun consentSession(walletId: String, coldkeySs58: String): Result<BittensorProofSession> {
+        delay(400)
+        return Result.success(SampleConsentSession(walletId, coldkeySs58))
+    }
+
+    override suspend fun consentSubmit(coldkeySs58: String, message: String, signature: String): Result<Unit> {
+        delay(600)
+        consentColdkey.value = coldkeySs58
+        return Result.success(Unit)
+    }
+
+    /** A manual consent session over a sample message, accepting any well-formed signature by the coldkey. */
+    private class SampleConsentSession(
+        override val walletId: String,
+        private val coldkeySs58: String,
+    ) : BittensorProofSession {
+        override val purpose: String = BittensorWallets.PURPOSE_CONSENT
+        override val message: String = "Approve URnetwork network wallet mapping\n" +
+            "{\"schema\":\"urnetwork-network-wallet-mapping-consent-v1\",\"scope\":\"network\"," +
+            "\"coldkey\":\"$coldkeySs58\",\"from_epoch\":1220,\"through_epoch\":66755}"
+
+        override fun handleSignature(address: String, signature: String, nowMillis: Long): BittensorProofOutcome {
+            if (address.trim() != coldkeySs58) {
+                return BittensorProofOutcome.Refused(BittensorWallets.ERROR_ADDRESS_MISMATCH)
+            }
+            if (!Regex("^0x[0-9a-fA-F]{128}$").matches(signature.trim())) {
+                return BittensorProofOutcome.Refused(BittensorWallets.ERROR_INVALID_SIGNATURE)
+            }
+            return BittensorProofOutcome.Proven(BittensorProof(walletId, purpose, coldkeySs58, message, signature.trim()))
+        }
+    }
+
     override suspend fun accountEpochs(): Result<List<AccountEpoch>> {
         delay(350)
         val epochs = (0 until 8).map { i ->
@@ -335,21 +516,51 @@ class SampleProtocolSource(
         return Result.success(epochs)
     }
 
-    override suspend fun head(): Result<SnHeadState?> {
+    // projected inside the head seats, with binding still closed on mainnet
+    override suspend fun topMe(): Result<ProtocolTopMe?> {
         delay(300)
+        val row = ProtocolRow(
+            position = 143,
+            name = "",
+            tag = "",
+            projectedScore = 52.4,
+            margin = 0.27,
+            trend = 6,
+            label = ProtocolLabel.ESTIMATE,
+            measurable = true,
+            claimPrompt = true,
+            isMe = true,
+            fleets = listOf<ProtocolFleet>(),
+        )
         return Result.success(
-            SnHeadState(
-                eligible = true,
-                score = 812.0,
-                floor = 640.0,
-                rankEstimate = 143,
-                cutoff = 200,
-                bound = false,
-                hotkey = null,
-                uid = 0,
-                rank = 0,
-                epoch = 1_219,
-                source = "server",
+            ProtocolTopMe(
+                snapshot = ProtocolSnapshot(
+                    id = "sample-snapshot",
+                    tempoIndex = 1_219,
+                    computedAtMillis = now,
+                    totalRanked = 41_230,
+                    headSeats = 200,
+                    claimedFleets = 0,
+                    openSeats = 200,
+                    projectedCutoff = 41.2,
+                    bindingOpen = false,
+                    stale = false,
+                ),
+                me = ProtocolMe(
+                    row = row,
+                    soloScore = 61.0,
+                    distinctPrefixes = 58,
+                    sharedPrefixes = 4,
+                    sharedWithUnits = 3,
+                    notMeasurableReason = ProtocolNotMeasurableReason.NONE,
+                    history = (0 until 30).map { day ->
+                        ProtocolHistoryPoint(
+                            day = java.time.LocalDate.now().minusDays((29 - day).toLong()).toString(),
+                            rank = 412L - day * 9L,
+                            score = 30.0 + day * 0.7,
+                        )
+                    },
+                ),
             )
         )
     }
@@ -382,6 +593,14 @@ object EarningsDebugFlags {
     @Volatile var sampleStartDisconnected: Boolean = false
         private set
 
+    // start the sample with a Solana payout wallet (legacy USDC payouts)
+    @Volatile var sampleSolanaWallet: Boolean = false
+        private set
+
+    // the sample network has USDC held for want of a payout wallet
+    @Volatile var sampleUsdcWaiting: Boolean = false
+        private set
+
     fun setUseSampleData(value: Boolean) {
         useSampleData = value
         version.value += 1
@@ -394,6 +613,16 @@ object EarningsDebugFlags {
 
     fun setSampleStartDisconnected(value: Boolean) {
         sampleStartDisconnected = value
+        version.value += 1
+    }
+
+    fun setSampleSolanaWallet(value: Boolean) {
+        sampleSolanaWallet = value
+        version.value += 1
+    }
+
+    fun setSampleUsdcWaiting(value: Boolean) {
+        sampleUsdcWaiting = value
         version.value += 1
     }
 }

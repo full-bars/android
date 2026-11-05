@@ -47,6 +47,13 @@ if (!(urnetworkMemoryProfileRateBytes ==~ /[0-9]+/)) {
     throw new GradleException('urnetworkMemoryProfileRateBytes must be a non-negative integer')
 }
 
+// Explicit acceptance-only profile; production defaults keep Android's budget.
+def urnetworkMemoryProfile =
+        (project.findProperty('urnetworkMemoryProfile') ?: 'android').toString()
+if (!(urnetworkMemoryProfile in ['android', 'ios-memory-audit-v1', 'ios-memory-audit-v2'])) {
+    throw new GradleException('urnetworkMemoryProfile must be android, ios-memory-audit-v1 or ios-memory-audit-v2')
+}
+
 ext.signingSecret = { key ->
     def signingPropertiesFile = file("${warpHomeDir}/release/android/signing/app.properties")
     if (signingPropertiesFile.exists()) {
@@ -69,6 +76,8 @@ ext.warpctlPath = { ->
         case 'Mac OS X':
             osName = 'darwin'
             break
+        default:
+            throw new GradleException('Unsupported warpctl host OS')
     }
     switch (System.getProperty('os.arch')) {
         case 'x86_64':
@@ -78,8 +87,11 @@ ext.warpctlPath = { ->
             osArch = 'amd64'
             break
         case 'aarch64':
+        case 'arm64':
             osArch = 'arm64'
             break
+        default:
+            throw new GradleException('Unsupported warpctl host architecture')
     }
 
     "${bringyourHomeDir}/warp/warpctl/build/${osName}/${osArch}/warpctl"
@@ -166,7 +178,9 @@ android {
             archivesName = "${applicationId}-${versionName}-${versionCode}"
         }
 
-        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
+        // starts the app with the SDK's extender network client off, except for
+        // acceptance and the startup-memory diagnostic (androidTest manifest)
+        testInstrumentationRunner 'com.bringyour.network.ExtenderNetworkClientOffRunner'
 
         // A per-run marker lets the acceptance test prove that the APK it is
         // driving came from this invocation, rather than a stale install.
@@ -179,6 +193,7 @@ android {
         // Optional diagnostic-only Go heap sampling density. Ordinary release
         // AARs start with profiling disabled at native-runtime initialization.
         buildConfigField "long", "URNETWORK_MEMORY_PROFILE_RATE_BYTES", "${urnetworkMemoryProfileRateBytes}L"
+        buildConfigField "String", "URNETWORK_MEMORY_PROFILE", "\"${urnetworkMemoryProfile}\""
 
         // see https://developer.android.com/build/shrink-code
         ndk {
@@ -270,21 +285,27 @@ android {
             applicationId 'com.bringyour.network'
 //            versionNameSuffix '-github'
 
-            buildConfigField "String", "BRINGYOUR_BUNDLE_HOST_NAME", '"ur.network"'
+            buildConfigField "String", "BRINGYOUR_BUNDLE_HOST_NAME", '"bringyour.com"'
+            // the key an earlier bundle stored the operator space under; migrated to
+            // BRINGYOUR_BUNDLE_HOST_NAME at startup (see MainApplication)
+            buildConfigField "String", "BRINGYOUR_BUNDLE_LEGACY_HOST_NAME", '"ur.network"'
             buildConfigField "String", "BRINGYOUR_BUNDLE_ENV_NAME", '"main"'
             buildConfigField "String", "BRINGYOUR_BUNDLE_ENV_SECRET", 'null'
             buildConfigField "boolean", "BRINGYOUR_BUNDLE_NET_EXPOSE_SERVER_IPS", 'true'
             buildConfigField "boolean", "BRINGYOUR_BUNDLE_NET_EXPOSE_SERVER_HOST_NAMES", 'true'
             buildConfigField "String", "BRINGYOUR_BUNDLE_LINK_HOST_NAME", '"ur.io"'
-            // the migratioon host name is used for services
-            // TODO this will be removed once we fully migrate to ur.network
-            buildConfigField "String", "BRINGYOUR_BUNDLE_MIGRATION_HOST_NAME", '"bringyour.com"'
+            // the migration host name, when set, is used for services instead of the host name
+            buildConfigField "String", "BRINGYOUR_BUNDLE_MIGRATION_HOST_NAME", '""'
             buildConfigField "String", "BRINGYOUR_BUNDLE_STORE", 'null'
             // hard coded initial extender networks
             // this can avoid the need for an initial doh query
             // json string array
             buildConfigField "String[]", "BRINGYOUR_BUNDLE_NET_EXTENDER_NETWORKS", 'new String[]{}'
-            buildConfigField "boolean", "BRINGYOUR_BUNDLE_SSO_GOOGLE", 'false'
+            // Google (and Apple) sign-in are offered on the login and the add
+            // sign-in method sheet. Without Play services both run as the
+            // provider's web flow in a Custom Tab (LoginUtils launchSsoOAuth),
+            // never play-services-auth.
+            buildConfigField "boolean", "BRINGYOUR_BUNDLE_SSO_GOOGLE", 'true'
             buildConfigField "String", "BRINGYOUR_BUNDLE_WALLET", '"solana"'
 
             signingConfig = signingConfigs.github
@@ -310,13 +331,16 @@ android {
             applicationId 'com.bringyour.network'
             versionNameSuffix '-play'
 
-            buildConfigField "String", "BRINGYOUR_BUNDLE_HOST_NAME", '"ur.network"'
+            buildConfigField "String", "BRINGYOUR_BUNDLE_HOST_NAME", '"bringyour.com"'
+            // the key an earlier bundle stored the operator space under; migrated to
+            // BRINGYOUR_BUNDLE_HOST_NAME at startup (see MainApplication)
+            buildConfigField "String", "BRINGYOUR_BUNDLE_LEGACY_HOST_NAME", '"ur.network"'
             buildConfigField "String", "BRINGYOUR_BUNDLE_ENV_NAME", '"main"'
             buildConfigField "String", "BRINGYOUR_BUNDLE_ENV_SECRET", 'null'
             buildConfigField "boolean", "BRINGYOUR_BUNDLE_NET_EXPOSE_SERVER_IPS", 'true'
             buildConfigField "boolean", "BRINGYOUR_BUNDLE_NET_EXPOSE_SERVER_HOST_NAMES", 'true'
             buildConfigField "String", "BRINGYOUR_BUNDLE_LINK_HOST_NAME", '"ur.io"'
-            buildConfigField "String", "BRINGYOUR_BUNDLE_MIGRATION_HOST_NAME", '"bringyour.com"'
+            buildConfigField "String", "BRINGYOUR_BUNDLE_MIGRATION_HOST_NAME", '""'
             buildConfigField "String", "BRINGYOUR_BUNDLE_STORE", '"play"'
             buildConfigField "String[]", "BRINGYOUR_BUNDLE_NET_EXTENDER_NETWORKS", 'new String[]{}'
             buildConfigField "boolean", "BRINGYOUR_BUNDLE_SSO_GOOGLE", 'true'
@@ -333,13 +357,16 @@ android {
             applicationId 'com.bringyour.network'
             versionNameSuffix '-solana_dapp'
 
-            buildConfigField "String", "BRINGYOUR_BUNDLE_HOST_NAME", '"ur.network"'
+            buildConfigField "String", "BRINGYOUR_BUNDLE_HOST_NAME", '"bringyour.com"'
+            // the key an earlier bundle stored the operator space under; migrated to
+            // BRINGYOUR_BUNDLE_HOST_NAME at startup (see MainApplication)
+            buildConfigField "String", "BRINGYOUR_BUNDLE_LEGACY_HOST_NAME", '"ur.network"'
             buildConfigField "String", "BRINGYOUR_BUNDLE_ENV_NAME", '"main"'
             buildConfigField "String", "BRINGYOUR_BUNDLE_ENV_SECRET", 'null'
             buildConfigField "boolean", "BRINGYOUR_BUNDLE_NET_EXPOSE_SERVER_IPS", 'true'
             buildConfigField "boolean", "BRINGYOUR_BUNDLE_NET_EXPOSE_SERVER_HOST_NAMES", 'true'
             buildConfigField "String", "BRINGYOUR_BUNDLE_LINK_HOST_NAME", '"ur.io"'
-            buildConfigField "String", "BRINGYOUR_BUNDLE_MIGRATION_HOST_NAME", '"bringyour.com"'
+            buildConfigField "String", "BRINGYOUR_BUNDLE_MIGRATION_HOST_NAME", '""'
             buildConfigField "String", "BRINGYOUR_BUNDLE_STORE", '"solana_dapp"'
             buildConfigField "String", "BRINGYOUR_BUNDLE_WALLET", '"solana"'
             buildConfigField "String[]", "BRINGYOUR_BUNDLE_NET_EXTENDER_NETWORKS", 'new String[]{}'
@@ -367,13 +394,16 @@ android {
             applicationId 'com.bringyour.network'
             versionNameSuffix '-ethos_dapp'
 
-            buildConfigField "String", "BRINGYOUR_BUNDLE_HOST_NAME", '"ur.network"'
+            buildConfigField "String", "BRINGYOUR_BUNDLE_HOST_NAME", '"bringyour.com"'
+            // the key an earlier bundle stored the operator space under; migrated to
+            // BRINGYOUR_BUNDLE_HOST_NAME at startup (see MainApplication)
+            buildConfigField "String", "BRINGYOUR_BUNDLE_LEGACY_HOST_NAME", '"ur.network"'
             buildConfigField "String", "BRINGYOUR_BUNDLE_ENV_NAME", '"main"'
             buildConfigField "String", "BRINGYOUR_BUNDLE_ENV_SECRET", 'null'
             buildConfigField "boolean", "BRINGYOUR_BUNDLE_NET_EXPOSE_SERVER_IPS", 'true'
             buildConfigField "boolean", "BRINGYOUR_BUNDLE_NET_EXPOSE_SERVER_HOST_NAMES", 'true'
             buildConfigField "String", "BRINGYOUR_BUNDLE_LINK_HOST_NAME", '"ur.io"'
-            buildConfigField "String", "BRINGYOUR_BUNDLE_MIGRATION_HOST_NAME", '"bringyour.com"'
+            buildConfigField "String", "BRINGYOUR_BUNDLE_MIGRATION_HOST_NAME", '""'
             buildConfigField "String", "BRINGYOUR_BUNDLE_STORE", '"ethos_dapp"'
             buildConfigField "String", "BRINGYOUR_BUNDLE_WALLET", '"ethos"'
             buildConfigField "String[]", "BRINGYOUR_BUNDLE_NET_EXTENDER_NETWORKS", 'new String[]{}'
@@ -414,7 +444,15 @@ android {
         }
         github {
             java {
-                srcDirs += ['src/ungoogle/java']
+                // the F-Droid build sells through the ur.io pay page in a web
+                // view: the Stripe SDK depends on Google Play Services (wallet,
+                // maps, identity), which F-Droid rejects. The dapp flavors add
+                // src/stripeSheet/java (the inline sheet). Every flavor but
+                // play adds src/cryptoPay/java: the Card · USDC · Zcash ·
+                // Monero method row and the crypto invoice (crypto-pay
+                // mmm/ZCASH-CONTRACT.md §6). Play sells through Play Billing only and
+                // compiles none of it (src/google/java has the empty hooks).
+                srcDirs += ['src/ungoogle/java', 'src/webPay/java', 'src/cryptoPay/java']
             }
         }
         play {
@@ -424,12 +462,28 @@ android {
         }
         solana_dapp {
             java {
-                srcDirs += ['src/solana_dapp/java']
+                srcDirs += ['src/solana_dapp/java', 'src/stripeSheet/java', 'src/cryptoPay/java']
             }
         }
         ethos_dapp {
             java {
-                srcDirs += ['src/ethos_dapp/java']
+                srcDirs += ['src/ethos_dapp/java', 'src/stripeSheet/java', 'src/cryptoPay/java']
+            }
+        }
+        // the crypto payment tests run with the flavors that compile src/cryptoPay
+        testGithub {
+            java {
+                srcDirs += ['src/testCryptoPay/java']
+            }
+        }
+        testSolana_dapp {
+            java {
+                srcDirs += ['src/testCryptoPay/java']
+            }
+        }
+        testEthos_dapp {
+            java {
+                srcDirs += ['src/testCryptoPay/java']
             }
         }
     }
@@ -462,6 +516,81 @@ android {
 
     composeOptions {
         kotlinCompilerExtensionVersion = "1.5.15"
+    }
+
+    // Window size tests (apple/DUO.md item 7). Nothing here changes an app
+    // build: unitTests configures only the JVM test tasks, and the managed
+    // device and emulator control only the androidTest tasks.
+    testOptions {
+        unitTests {
+            // the screenshot tests render on Robolectric, which reads the
+            // merged resources and manifest
+            includeAndroidResources = true
+            all { test ->
+                // JVM screenshot tests (src/testPlayDebug/.../screenshots, run
+                // by testPlayDebugUnitTest). -Pscreenshots=verify (the default)
+                // compares each screen with its baseline in
+                // src/testPlayDebug/screenshots, record rewrites the baselines,
+                // compare writes the differences without failing. Differences
+                // land in build/outputs/roborazzi
+                if (test.name == 'testPlayDebugUnitTest') {
+                    def screenshotMode = (project.findProperty('screenshots') ?: 'verify').toString()
+                    if (!(screenshotMode in ['verify', 'record', 'compare'])) {
+                        throw new GradleException('screenshots must be verify, record or compare')
+                    }
+                    test.systemProperty 'roborazzi.test.verify', screenshotMode == 'verify'
+                    test.systemProperty 'roborazzi.test.record', screenshotMode == 'record'
+                    test.systemProperty 'roborazzi.test.compare', screenshotMode == 'compare'
+                    // shadows and elevation drawn as on a device
+                    test.systemProperty 'robolectric.pixelCopyRenderMode', 'hardware'
+                    // Robolectric reaches into the JDK, which Java 17 and up
+                    // must open to it (robolectric.org/getting-started)
+                    test.jvmArgs(
+                            '--add-opens=java.base/java.io=ALL-UNNAMED',
+                            '--add-opens=java.base/java.lang=ALL-UNNAMED',
+                            '--add-opens=java.base/java.net=ALL-UNNAMED',
+                            '--add-opens=java.base/java.security=ALL-UNNAMED',
+                            '--add-opens=java.base/java.text=ALL-UNNAMED',
+                            '--add-opens=java.base/java.util=ALL-UNNAMED',
+                            '--add-opens=java.base/jdk.internal.access=ALL-UNNAMED',
+                            '--add-opens=java.desktop/java.awt.font=ALL-UNNAMED',
+                            '--add-opens=jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED'
+                    )
+                    def baselines = fileTree('src/testPlayDebug/screenshots')
+                    if (screenshotMode == 'record') {
+                        test.outputs.upToDateWhen { false }
+                    } else {
+                        test.inputs.files(baselines)
+                                .withPropertyName('screenshotBaselines')
+                                .withPathSensitivity(PathSensitivity.RELATIVE)
+                    }
+                }
+            }
+        }
+
+        // The tabletop job (androidTest ConnectTabletopTest, android/test-main.sh):
+        // a Pixel Fold that Gradle creates, boots and shuts down. Run with
+        //   ./gradlew :app:pixelFoldApi36GithubDebugAndroidTest \
+        //       -Pandroid.experimental.androidTest.enableEmulatorControl=true \
+        //       -Pandroid.experimental.testOptions.managedDevices.setupTimeoutMinutes=30 \
+        //       -Pandroid.testInstrumentationRunnerArguments.class=com.bringyour.network.ui.connect.ConnectTabletopTest
+        // API 36 with Google APIs is the system image the urnetwork AVDs use
+        managedDevices {
+            localDevices {
+                create('pixelFoldApi36') {
+                    device = 'Pixel Fold'
+                    apiLevel = 36
+                    systemImageSource = 'google'
+                }
+            }
+        }
+
+        // Espresso Device folds the emulator through its console (gRPC).
+        // AGP grants it only with the experimental property above, passed on
+        // the command line so that no other build sees it
+        emulatorControl {
+            enable = true
+        }
     }
 
     tasks.register('buildSdk', Exec) {
@@ -507,6 +636,11 @@ android {
     }
 }
 
+// a flavor and build type's own configuration exists only once declared
+configurations {
+    testPlayDebugImplementation
+}
+
 // local URnetwork SDK
 dependencies {
     compileOnly fileTree(dir: "${bringyourHomeDir}/build/android", include: ['*-sources.jar'])
@@ -516,6 +650,9 @@ dependencies {
 dependencies {
     implementation 'androidx.appcompat:appcompat:1.7.1'
     testImplementation 'junit:junit:4.13.2'
+    // a test main dispatcher, so a view model's viewModelScope work runs in a
+    // JVM test (ConnectViewModelTest); the coroutines version the app resolves
+    testImplementation 'org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0'
 
     // custom tabs, used for the wallet-connect sign message flow
     implementation 'androidx.browser:browser:1.8.0'
@@ -523,8 +660,16 @@ dependencies {
     // serialization
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
 
-    // for QR Code generation
+    // for QR Code generation and the extender share code scanner
     implementation 'com.google.zxing:core:3.5.4'
+
+    // the extender share code scanner (EXTENDER.md K8): CameraX preview and
+    // frame analysis, decoded by zxing above. Never ML Kit, which the F-Droid
+    // build cannot carry.
+    implementation 'androidx.camera:camera-core:1.5.3'
+    implementation 'androidx.camera:camera-camera2:1.5.3'
+    implementation 'androidx.camera:camera-lifecycle:1.5.3'
+    implementation 'androidx.camera:camera-view:1.5.3'
     implementation 'androidx.biometric:biometric-ktx:1.4.0-alpha02'
 
     // hilt
@@ -565,15 +710,34 @@ dependencies {
     // Material Design 3
     implementation 'androidx.compose.material3:material3:1.4.0'
     implementation 'androidx.compose.material3:material3-adaptive-navigation-suite-android:1.4.0'
-    implementation 'androidx.compose.material3:material3-window-size-class-android:1.4.0'
+    // window size class and fold posture (ui/components/WindowLayout.kt). Held at
+    // 1.2.0, the version the navigation suite resolves: 1.3.0's AARs require AGP
+    // 9.1.0 and compileSdk 37, and AGP stays on 8.11.1 for F-Droid
+    implementation 'androidx.compose.material3.adaptive:adaptive-android:1.2.0'
     implementation "androidx.compose.material:material-icons-extended:1.7.8"
 
     // UI Tests
     androidTestImplementation 'androidx.compose.ui:ui-test-junit4:1.11.2'
+    androidTestImplementation 'androidx.test.espresso:espresso-core:3.7.0'
     androidTestImplementation 'androidx.test:runner:1.7.0'
     androidTestImplementation 'androidx.test:rules:1.7.0'
     androidTestImplementation 'androidx.test.uiautomator:uiautomator:2.3.0'
+    // folds the emulator into tabletop (ConnectTabletopTest)
+    androidTestImplementation 'androidx.test.espresso:espresso-device:1.1.0'
     debugImplementation 'androidx.compose.ui:ui-test-manifest:1.11.2'
+
+    // JVM screenshot tests at each window size (src/testPlayDebug): Robolectric
+    // renders the screens, Roborazzi records and compares them. Only the
+    // playDebug unit tests see these; no app build, the F-Droid (github)
+    // build included, resolves them
+    testPlayDebugImplementation composeBom
+    testPlayDebugImplementation 'androidx.compose.ui:ui-test-junit4:1.11.2'
+    testPlayDebugImplementation 'org.robolectric:robolectric:4.17'
+    testPlayDebugImplementation 'io.github.takahirom.roborazzi:roborazzi:1.77.0'
+    testPlayDebugImplementation 'io.github.takahirom.roborazzi:roborazzi-compose:1.77.0'
+    // the Accessibility Scanner's touch target check (Google's Accessibility
+    // Test Framework) on the same screens (checkTouchTargets)
+    testPlayDebugImplementation 'io.github.takahirom.roborazzi:roborazzi-accessibility-check:1.77.0'
 
     // Android Studio Preview support
     implementation 'androidx.compose.ui:ui-tooling-preview:1.11.2'
@@ -586,7 +750,11 @@ dependencies {
 
 // solana saga
 dependencies {
-    implementation("com.solanamobile:mobile-wallet-adapter-clientlib-ktx:2.1.0")
+    implementation("com.solanamobile:mobile-wallet-adapter-clientlib-ktx:2.1.0") {
+        // 2.1.0 publishes its test library as a runtime dependency, which would
+        // ship junit, hamcrest and androidx.test in the app
+        exclude group: "androidx.test.ext", module: "junit-ktx"
+    }
     implementation("com.solanamobile:web3-solana:0.3.1")
     implementation("com.solanamobile:rpc-core:0.2.11")
     implementation("io.github.funkatronics:multimult:0.2.6")

@@ -1,15 +1,47 @@
 package com.bringyour.network.ui
 
+import com.bringyour.network.ui.components.FoldSafeAlertDialog
+import com.bringyour.network.ui.connection_region.CantReachRegionPrompt
 import com.bringyour.network.ui.introduction.LocalIntroConnector
 import com.bringyour.network.ui.introduction.IntroConnectorState
 import com.bringyour.network.ui.introduction.FloatingIntroConnector
+import androidx.navigation.NavDestination.Companion.hasRoute
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.unit.LayoutDirection
+import androidx.navigation.NavDestination.Companion.hierarchy
+import com.bringyour.network.ui.account.AccountDetailPlaceholder
+import com.bringyour.network.ui.components.ConnectArrangement
+import com.bringyour.network.ui.components.DialogAnchor
+import com.bringyour.network.ui.components.LocalDialogAnchor
+import com.bringyour.network.ui.components.LocalWindowLayout
+import com.bringyour.network.ui.components.NavigationLayout
+import com.bringyour.network.ui.components.connectArrangementFor
+import com.bringyour.network.ui.components.navigationLayoutFor
+import com.bringyour.network.ui.components.recordDialogAnchor
+import com.bringyour.network.ui.components.rememberWindowLayout
+import com.bringyour.network.ui.components.sideBySideSplit
+import com.bringyour.network.ui.components.sidePaneWidth
+import com.bringyour.network.ui.connect.rememberLocationListPosition
 import androidx.navigation.compose.currentBackStackEntryAsState
 import com.bringyour.network.ui.introduction.IntroductionQuickConnect
+import com.bringyour.network.ui.introduction.IntroductionOffer
+import com.bringyour.network.ui.introduction.IntroStepTimer
+import com.bringyour.network.ui.shared.enums.PlanType
+import com.bringyour.network.ui.upgrade.rememberPlanPresentation
+import com.bringyour.network.ui.upgrade.CryptoInvoiceHost
+import com.bringyour.network.ui.upgrade.PaymentMethodsScope
+import com.bringyour.network.ui.upgrade.PaymentPastDueNotice
+import com.bringyour.network.ui.upgrade.rememberPlanMethodSlot
+import com.bringyour.network.ui.upgrade.rememberPlanPurchaser
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.AlertDialog
-import android.content.res.Configuration
 import android.util.Log
+import android.widget.Toast
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedContentTransitionScope
 import androidx.compose.animation.EnterTransition
@@ -26,7 +58,6 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
@@ -37,15 +68,18 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.StackedLineChart
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.NavigationDrawerItemDefaults
 import androidx.compose.material3.NavigationRailItemDefaults
-import androidx.compose.material3.SheetState
+import com.bringyour.network.ui.connect.InsufficientBalanceNoticeEffect
+import com.bringyour.network.ui.connect.upgradeShowsFreeRefresh
+import com.bringyour.network.ui.components.LocalUpgradeWaitForRefresh
+import com.bringyour.network.ui.connect.ConnectDrawerState
+import com.bringyour.network.ui.connect.rememberConnectDrawerState
 import androidx.compose.material3.SheetValue
 import androidx.compose.material3.VerticalDivider
-import androidx.compose.material3.adaptive.currentWindowAdaptiveInfo
 import androidx.compose.material3.adaptive.navigationsuite.NavigationSuiteDefaults
 import androidx.compose.material3.adaptive.navigationsuite.NavigationSuiteScaffold
 import androidx.compose.material3.adaptive.navigationsuite.NavigationSuiteType
@@ -63,7 +97,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
@@ -82,9 +116,20 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import com.bringyour.network.ui.account.AccountScreen
 import com.bringyour.network.ui.settings.DeveloperScreen
+import com.bringyour.network.ui.settings.LicenseDetailScreen
+import com.bringyour.network.ui.settings.LicensesScreen
+import com.bringyour.network.ui.account.ExtendersScreen
+import com.bringyour.network.ui.account.ImportExtendersScreen
 import com.bringyour.network.ui.account.ProviderIdentitiesScreen
+import com.bringyour.network.ui.account.SessionsScreen
+import com.bringyour.network.ui.account.ApiKeysScreen
+import com.bringyour.network.ui.account.ShareExtendersScreen
+import com.bringyour.network.ui.components.ProSunglassesFlight
+import com.bringyour.network.ui.components.proFlightPixelation
+import com.bringyour.network.ui.components.rememberProFlightClock
 import com.bringyour.network.ui.components.overlays.FullScreenOverlay
 import com.bringyour.network.ui.components.overlays.WelcomeAnimatedMainOverlay
+import com.bringyour.network.ui.components.referral.LocalReferralCountLoad
 import com.bringyour.network.ui.components.referral.LocalReferralTerms
 import com.bringyour.network.ui.components.referral.ReferralRoyalToast
 import com.bringyour.network.ui.connect.ConnectScreen
@@ -97,11 +142,14 @@ import com.bringyour.network.ui.shared.viewmodels.ReferralCelebration
 import com.bringyour.network.ui.shared.viewmodels.ReferralCodeViewModel
 import com.bringyour.network.ui.theme.Black
 import com.bringyour.network.ui.theme.MainBorderBase
-import com.bringyour.network.utils.isTablet
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.navigation
 import androidx.navigation.toRoute
 import com.bringyour.network.ui.account.AccountViewModel
+import com.bringyour.network.ui.account.GuestAccount
+import com.bringyour.network.ui.account.GuestConversionSheet
+import com.bringyour.network.ui.account.IntroFunnel
+import com.bringyour.network.ui.account.UpgradeEntry
 import com.bringyour.network.ui.components.nestedLinkBottomSheet.NestedLinkBottomSheet
 import com.bringyour.network.ui.connect.BrowseLocationsScreen
 import com.bringyour.network.ui.connect.LocationsListViewModel
@@ -111,9 +159,13 @@ import com.bringyour.network.ui.widgets.WidgetsScreen
 import com.bringyour.network.ui.profile.ProfileScreen
 import com.bringyour.network.ui.profile.ProfileViewModel
 import com.bringyour.network.ui.settings.SettingsScreen
+import com.bringyour.network.ui.settings.VlessSettingsScreen
 import com.bringyour.network.ui.shared.viewmodels.SubscriptionBalanceViewModel
+import com.bringyour.network.ui.wallet.BittensorKeyScreenRequests
 import com.bringyour.network.ui.wallet.EarningsViewModel
 import com.bringyour.network.ui.wallet.EarningsScreen
+import com.bringyour.network.ui.wallet.Top200SignLinks
+import com.bringyour.network.ui.wallet.Top200SignScreen
 import com.solana.mobilewalletadapter.clientlib.ActivityResultSender
 import com.bringyour.network.R
 import com.bringyour.network.TAG
@@ -128,6 +180,7 @@ import com.bringyour.network.ui.introduction.IntroductionUsageBar
 import com.bringyour.network.ui.shared.models.BundleStore
 import com.bringyour.network.ui.shared.models.ProvideControlMode
 import com.bringyour.network.ui.shared.viewmodels.AccountPointsViewModel
+import com.bringyour.network.ui.shared.models.SectionLoad
 import com.bringyour.network.ui.shared.viewmodels.NetworkReliabilityViewModel
 import com.bringyour.network.ui.shared.viewmodels.Plan
 import com.bringyour.network.ui.shared.viewmodels.SolanaPaymentViewModel
@@ -171,8 +224,30 @@ fun MainNavHost(
     // the referral cap and bonus come from the server with the referral code;
     // everything signed-in reads them from here instead of hardcoding numbers
     val referralTerms by referralCodeViewModel.terms.collectAsState()
+    // the usage bar's referral figures wait for the same read
+    val referralCountLoad by referralCodeViewModel.codeLoad.collectAsState()
+    // the window's size class and fold, for every layout below, its dialogs
+    // and sheets included (ui/components/AdaptiveLayout.kt)
+    val windowLayout = rememberWindowLayout()
+    // the touch each dialog and sheet is opened from, so beside a fold it
+    // opens on that touch's side (ui/components/FoldSafeDialogs.kt)
+    val dialogAnchor = remember { DialogAnchor() }
 
-    CompositionLocalProvider(LocalReferralTerms provides referralTerms) {
+    CompositionLocalProvider(
+        LocalReferralTerms provides referralTerms,
+        LocalReferralCountLoad provides referralCountLoad,
+        LocalWindowLayout provides windowLayout,
+        LocalDialogAnchor provides dialogAnchor,
+    ) {
+        // over every screen, to see where each touch goes down; its children
+        // measure as they did directly in the window
+        Box(
+            modifier = Modifier.fillMaxSize().recordDialogAnchor(dialogAnchor),
+            propagateMinConstraints = true,
+        ) {
+        // the flavors that sell outside a store share one crypto invoice in the
+        // activity (src/cryptoPay); on Play this is the content as it is
+        PaymentMethodsScope {
         MainNavHostContent(
         earningsViewModel = earningsViewModel,
         settingsViewModel = settingsViewModel,
@@ -192,6 +267,8 @@ fun MainNavHost(
         networkReliabilityViewModel = networkReliabilityViewModel,
         solanaPaymentViewModel = solanaPaymentViewModel
         )
+        }
+        }
     }
 }
 
@@ -222,9 +299,9 @@ private fun MainNavHostContent(
     val reliabilityWindow by networkReliabilityViewModel.reliabilityWindow.collectAsState()
     val totalReferralCount by referralCodeViewModel.totalReferralCount.collectAsState()
     val referralCode by referralCodeViewModel.referralCode.collectAsState()
+    val referralCodeLoad by referralCodeViewModel.codeLoad.collectAsState()
     val pendingReferralCelebration by referralCodeViewModel.pendingCelebration.collectAsState()
     val pendingSolanaSubReference by solanaPaymentViewModel.pendingSolanaSubscriptionReference.collectAsState()
-    val isCheckingSolanaTransaction by subscriptionBalanceViewModel.isCheckingSolanaTransaction.collectAsState()
     val displayIntroFunnel by mainNavViewModel.displayIntroFunnel.collectAsState()
     val allowPromptIntroFunnel by mainNavViewModel.allowDisplayIntroFunnel.collectAsState()
     val hasActiveSubscription by subscriptionBalanceViewModel.hasActiveSubscription.collectAsState()
@@ -247,28 +324,22 @@ private fun MainNavHostContent(
         navigationBarContainerColor = Black,
     )
 
-    val configuration = LocalConfiguration.current
-
-    val adaptiveInfo = currentWindowAdaptiveInfo()
+    val windowLayout = LocalWindowLayout.current
 
     val lifecycleOwner = LocalLifecycleOwner.current
 
     val scope = rememberCoroutineScope()
 
     // hoisted here so re-tapping the connect tab can collapse it
-    val connectActionsSheetState = rememberStandardBottomSheetState(
-        initialValue = SheetValue.PartiallyExpanded,
-        skipHiddenState = true
-    )
+    val connectActionsSheetState = rememberConnectDrawerState()
 
-    val navSuiteLayoutType = with(adaptiveInfo) {
-
-        if (configuration.orientation == Configuration.ORIENTATION_LANDSCAPE && isTablet()) {
-            NavigationSuiteType.NavigationRail
-        } else {
-            NavigationSuiteType.NavigationBar
-        }
-
+    // the bar or the rail from the window size class and posture, never the
+    // device: the rail from medium width in a window at least 480 dp tall,
+    // the bar otherwise and in tabletop (navigationLayoutFor)
+    val navigationLayout = navigationLayoutFor(windowLayout.widthDp, windowLayout.heightDp, windowLayout.tabletop)
+    val navSuiteLayoutType = when (navigationLayout) {
+        NavigationLayout.Rail -> NavigationSuiteType.NavigationRail
+        NavigationLayout.BottomBar -> NavigationSuiteType.NavigationBar
     }
 
     val navController = rememberNavController()
@@ -366,9 +437,35 @@ private fun MainNavHostContent(
     LaunchedEffect(widgetRoute) {
         val route = widgetRoute ?: return@LaunchedEffect
         widgetApp?.widgetRoute?.value = null
-        if (route == com.bringyour.network.QuickConnectActivity.ROUTE_CONNECT) {
-            // the dashboard widget does exactly what a tap on the Connect tab does
+        if (route == com.bringyour.network.QuickConnectActivity.ROUTE_CONNECT ||
+            route == com.bringyour.network.analytics.OnboardingLink.ROUTE_PREFIX + com.bringyour.network.analytics.OnboardingLink.STEP_CONNECT
+        ) {
+            // the dashboard widget (and the "connect" email link) do exactly what a tap on the Connect tab does
             selectTopLevelRoute(TopLevelScaffoldRoutes.CONNECT_CONTAINER)
+            return@LaunchedEffect
+        }
+        if (route == com.bringyour.network.QuickConnectActivity.ROUTE_UPGRADE) {
+            // a connect blocked by insufficient balance: the upgrade the connect
+            // screen offers in place of Connect
+            selectTopLevelRoute(TopLevelScaffoldRoutes.CONNECT_CONTAINER)
+            navController.navigateToUpgradeForBalanceBlock()
+            return@LaunchedEffect
+        }
+        if (route == com.bringyour.network.QuickConnectActivity.ROUTE_EARNINGS_KEY) {
+            // the payout key's reminder, tapped: Earnings with its Key screen
+            BittensorKeyScreenRequests.request()
+            return@LaunchedEffect
+        }
+        // the campaign email links land on Account screens: the widgets page, the
+        // Get Pro screen (which shows the welcome offer while it is active), or
+        // the feedback screen with the email's rating or reason pre-filled
+        com.bringyour.network.analytics.OnboardingLink.stepForRoute(route)?.let { step ->
+            selectTopLevelRoute(TopLevelScaffoldRoutes.ACCOUNT_CONTAINER)
+            when (step) {
+                com.bringyour.network.analytics.OnboardingLink.STEP_WIDGETS -> navController.navigate(Route.Widgets)
+                com.bringyour.network.analytics.OnboardingLink.STEP_OFFER -> navController.navigate(Route.Upgrade)
+                com.bringyour.network.analytics.OnboardingLink.STEP_FEEDBACK -> navController.navigate(Route.Support)
+            }
             return@LaunchedEffect
         }
         navController.navigate(TopLevelScaffoldRoutes.CONNECT_CONTAINER.route) {
@@ -397,20 +494,67 @@ private fun MainNavHostContent(
         navController.navigate(Route.Earnings)
     }
 
+    // Back up first (sign out, account deletion) and the payout key's reminder:
+    // Earnings, which opens its Key screen once the key's flow is ready
+    val pendingKeyScreenNavigation by BittensorKeyScreenRequests.navigation.collectAsState()
+    LaunchedEffect(pendingKeyScreenNavigation) {
+        if (!pendingKeyScreenNavigation) {
+            return@LaunchedEffect
+        }
+        BittensorKeyScreenRequests.consumeNavigation()
+        selectTopLevelRoute(TopLevelScaffoldRoutes.ACCOUNT_CONTAINER)
+        // the account stack it restores may already end on Earnings: that one
+        // opens the Key screen, rather than a second Earnings on top of it
+        navController.navigate(Route.Earnings) {
+            launchSingleTop = true
+        }
+    }
+
+    // a ur://top200/sign app link: open the sign screen whatever the Top 200 state;
+    // the screen takes the link, which only fills its field
+    val pendingTop200SignNavigation by Top200SignLinks.navigation.collectAsState()
+    LaunchedEffect(pendingTop200SignNavigation) {
+        if (!pendingTop200SignNavigation) {
+            return@LaunchedEffect
+        }
+        Top200SignLinks.consumeNavigation()
+        if (navController.currentDestination?.hasRoute<Route.Top200Sign>() == true) {
+            return@LaunchedEffect
+        }
+        selectTopLevelRoute(TopLevelScaffoldRoutes.ACCOUNT_CONTAINER)
+        navController.navigate(Route.Top200Sign)
+    }
+
+    InsufficientBalanceNoticeEffect(
+        connectViewModel = connectViewModel,
+        isPro = isPro,
+        isPollingSubscriptionBalance = subscriptionBalanceViewModel.isPollingSubscriptionBalance,
+    )
+
     /**
      * For initial intro funnel prompting
      */
-    LaunchedEffect(isPro, allowPromptIntroFunnel) {
+    val isGuestNetworkForIntro by subscriptionBalanceViewModel.isGuestNetwork.collectAsState()
+    // a refreshed guest is a guest only once the balance has loaded
+    val guestStatusKnownForIntro by subscriptionBalanceViewModel.guestStatusKnown.collectAsState()
+    LaunchedEffect(isPro, allowPromptIntroFunnel, isGuestNetworkForIntro, guestStatusKnownForIntro) {
 
-        if (isPro) {
-            mainNavViewModel.setDisplayIntroFunnel(false)
-        } else {
-            if (allowPromptIntroFunnel) {
+        // the intro sells a plan; a guest network is not sold one (GuestAccount),
+        // and it waits until the guest status is known
+        when (GuestAccount.introFunnel(
+            isPro = isPro,
+            isGuest = isGuestNetworkForIntro,
+            guestStatusKnown = guestStatusKnownForIntro,
+            allowPrompt = allowPromptIntroFunnel,
+        )) {
+            IntroFunnel.Hide -> mainNavViewModel.setDisplayIntroFunnel(false)
+            IntroFunnel.Show -> {
                 // display intro funnel
                 mainNavViewModel.setDisplayIntroFunnel(true)
                 // set time last prompted in localstorage
                 mainNavViewModel.setIntroFunnelLastPrompted()
             }
+            IntroFunnel.Unchanged -> {}
         }
 
     }
@@ -424,6 +568,8 @@ private fun MainNavHostContent(
                 return@collect
             }
 
+            // the celebration flight plays over the "Nicely done" overlay
+            overlayViewModel.launchSunglassesFlight()
             overlayViewModel.launch(OverlayMode.Upgrade)
             subscriptionBalanceViewModel.pollSubscriptionBalance()
 
@@ -436,18 +582,57 @@ private fun MainNavHostContent(
     }
 
     /**
-     * EVERY billing error reaches the user, with a way out.
+     * A Stripe sheet / pay page / checkout-return purchase the server has confirmed
+     * (SubscriptionBalanceViewModel.confirmPurchase). The overlay launches only now,
+     * never when the payment UI merely reported success.
+     */
+    LaunchedEffect(Unit) {
+        subscriptionBalanceViewModel.purchaseConfirmedSequence.collect { sequence ->
+            if (!subscriptionBalanceViewModel.consumePurchaseConfirmedSequence(sequence)) {
+                return@collect
+            }
+
+            overlayViewModel.launchSunglassesFlight()
+            overlayViewModel.launch(OverlayMode.Upgrade)
+        }
+    }
+
+    /**
+     * The server refused a purchase for a guest network the app did not know
+     * about (SubscriptionBalanceViewModel.guestSignInRequired), which now reads
+     * as a guest: the upgrade route shows the add-sign-in sheet in place of
+     * checkout, and the intro funnel hides itself, so a refusal from the intro
+     * opens the upgrade route on that sheet.
+     */
+    LaunchedEffect(Unit) {
+        subscriptionBalanceViewModel.guestSignInRequiredSequence.collect { sequence ->
+            if (!subscriptionBalanceViewModel.consumeGuestSignInRequiredSequence(sequence)) {
+                return@collect
+            }
+
+            if (navController.currentDestination?.hasRoute<Route.Upgrade>() != true) {
+                navController.navigate(Route.Upgrade)
+            }
+        }
+    }
+
+    /**
+     * Every billing error reaches the user, with a way out.
      *
      * `changePlanError` was set in half a dozen places -- a declined card, a billing
-     * client failure, "Network not found" -- and rendered NOWHERE. A failed purchase
+     * client failure, "Network not found" -- and rendered nowhere. A failed purchase
      * therefore looked exactly like nothing happening: the spinner stopped and the user
      * was left staring at the plan screen with no idea what went wrong or what to do.
      *
      * A payment error the user cannot see is a payment error they will hit again, so
      * this always offers the remedy (try again) rather than just reporting the failure.
      */
+    // a network-level failure reaching URnetwork offers the connection
+    // region picker; it never changes the region by itself
+    CantReachRegionPrompt()
+
     planViewModel.changePlanError?.let { changePlanError ->
-        AlertDialog(
+        FoldSafeAlertDialog(
             onDismissRequest = { planViewModel.setChangePlanError(null) },
             title = { Text(stringResource(id = R.string.payment_problem)) },
             text = { Text(changePlanError) },
@@ -481,9 +666,9 @@ private fun MainNavHostContent(
      * The post-payment confirmation poll exhausted its 2-minute budget without the
      * server confirming the subscription. This used to end in a log line
      * ("polling timed out") -- the honest terminal state is: payment received,
-     * confirmation still in flight, the plan updates by itself, do NOT buy again.
+     * confirmation still in flight, the plan updates by itself, do not buy again.
      */
-    var showConfirmationDelayedDialog by remember { mutableStateOf(false) }
+    var showConfirmationDelayedDialog by rememberSaveable { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         subscriptionBalanceViewModel.confirmationTimedOutSequence.collect { sequence ->
@@ -499,7 +684,7 @@ private fun MainNavHostContent(
      * The purchase is persisted client-side but the server never gave a terminal
      * answer to the report within the bounded in-session retries (Play flavor). Same
      * honest terminal state as the poll timeout: payment received, confirmation in
-     * flight, do NOT buy again -- the daily reconcile worker carries the report.
+     * flight, do not buy again -- the daily reconcile worker carries the report.
      */
     LaunchedEffect(Unit) {
         planViewModel.purchaseReportDeferredSequence.collect { sequence ->
@@ -511,8 +696,50 @@ private fun MainNavHostContent(
         }
     }
 
+    /**
+     * The Solana return-path check passed the old 20 s cap: say it is still checking
+     * rather than going quiet. If it runs out its two minutes, the confirmation-delayed
+     * notice follows -- without the "Payment received" title, since the app cannot
+     * know the wallet sent anything.
+     */
+    val solanaStillCheckingMessage = stringResource(id = R.string.solana_payment_still_checking)
+    val navHostContext = LocalContext.current
+    LaunchedEffect(Unit) {
+        subscriptionBalanceViewModel.solanaStillCheckingSequence.collect { sequence ->
+            if (!subscriptionBalanceViewModel.consumeSolanaStillCheckingSequence(sequence)) {
+                return@collect
+            }
+
+            Toast.makeText(navHostContext, solanaStillCheckingMessage, Toast.LENGTH_LONG).show()
+        }
+    }
+
+    var showSolanaCheckDelayedDialog by rememberSaveable { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        subscriptionBalanceViewModel.solanaCheckTimedOutSequence.collect { sequence ->
+            if (!subscriptionBalanceViewModel.consumeSolanaCheckTimedOutSequence(sequence)) {
+                return@collect
+            }
+
+            showSolanaCheckDelayedDialog = true
+        }
+    }
+
+    if (showSolanaCheckDelayedDialog) {
+        FoldSafeAlertDialog(
+            onDismissRequest = { showSolanaCheckDelayedDialog = false },
+            text = { Text(stringResource(id = R.string.payment_confirmation_delayed)) },
+            confirmButton = {
+                TextButton(onClick = { showSolanaCheckDelayedDialog = false }) {
+                    Text(stringResource(id = R.string.close))
+                }
+            }
+        )
+    }
+
     if (showConfirmationDelayedDialog) {
-        AlertDialog(
+        FoldSafeAlertDialog(
             onDismissRequest = { showConfirmationDelayedDialog = false },
             title = { Text(stringResource(id = R.string.payment_received_title)) },
             text = { Text(stringResource(id = R.string.payment_confirmation_delayed)) },
@@ -525,13 +752,13 @@ private fun MainNavHostContent(
     }
 
     /**
-     * The server verified the Play purchase but it belongs to a DIFFERENT network
+     * The server verified the Play purchase but it belongs to a different network
      * than the one logged in. The purchase is real (it stays acknowledged so Play
      * does not auto-refund it) and the linked network is the one credited -- so no
      * success overlay here, just the honest way out: use the account it was
      * purchased under.
      */
-    var showPurchaseWrongNetworkDialog by remember { mutableStateOf(false) }
+    var showPurchaseWrongNetworkDialog by rememberSaveable { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         planViewModel.purchaseWrongNetworkSequence.collect { sequence ->
@@ -544,7 +771,7 @@ private fun MainNavHostContent(
     }
 
     if (showPurchaseWrongNetworkDialog) {
-        AlertDialog(
+        FoldSafeAlertDialog(
             onDismissRequest = { showPurchaseWrongNetworkDialog = false },
             text = { Text(stringResource(id = R.string.subscription_purchased_under_different_account)) },
             confirmButton = {
@@ -556,9 +783,9 @@ private fun MainNavHostContent(
     }
 
     /**
-     * A purchase Play accepted but has NOT completed (awaiting approval, or an
+     * A purchase Play accepted but has not completed (awaiting approval, or an
      * out-of-band payment). There is nothing to poll for -- the PURCHASED state does
-     * not arrive now -- so just tell the user, and do NOT close the screen or claim an
+     * not arrive now -- so just tell the user, and do not close the screen or claim an
      * upgrade.
      *
      * Without this the pending case was silent: the spinner stopped, nothing else
@@ -590,7 +817,11 @@ private fun MainNavHostContent(
 
     /**
      * This is for listening to Solana Wallet subscriptions
-     * If there is a pending sub reference + the app regains focus, we start polling the subscription balance
+     * If there is a pending sub reference + the app regains focus, we start polling the subscription balance.
+     * The reference is persisted (it survives the app being killed while the wallet is
+     * in front) and is only dropped once the check is confirmed or timed out. Only an
+     * earlier version of the app records one now: USDC is sold through the crypto
+     * invoice (CryptoInvoiceHost), which follows its own payment.
      */
     DisposableEffect(lifecycleOwner, pendingSolanaSubReference) {
 
@@ -598,9 +829,18 @@ private fun MainNavHostContent(
             if (event == Lifecycle.Event.ON_RESUME) {
                 if (!pendingSolanaSubReference.isNullOrEmpty()) {
                     scope.launch {
+                        // a restart after process death lost the in-memory expectation
+                        solanaPaymentViewModel.pendingSolanaPayment?.let { payment ->
+                            if (payment.plan.isNotEmpty()) {
+                                subscriptionBalanceViewModel.expectSolanaPurchase(payment.plan, payment.amountUsd)
+                            }
+                        }
                         // poll subscription balance until it's updated
-                        subscriptionBalanceViewModel.pollSolanaTransaction()
-                        solanaPaymentViewModel.setPendingSolanaSubscriptionReference(null)
+                        subscriptionBalanceViewModel.pollSolanaTransaction(
+                            onFinished = {
+                                solanaPaymentViewModel.clearPendingSolanaPayment()
+                            }
+                        )
                     }
                 }
             }
@@ -628,6 +868,21 @@ private fun MainNavHostContent(
         }
     }
 
+    // The Pro celebration flight clock. Everything under the flight (the nav
+    // content and the overlays) sits in one layer that pixelates while a
+    // flight is in the air; the flight itself draws above it, sharp.
+    val sunglassesFlightSequence by overlayViewModel.sunglassesFlightSequence.collectAsState()
+    val proFlightClock = rememberProFlightClock(
+        sequence = sunglassesFlightSequence,
+        onFinished = { overlayViewModel.finishSunglassesFlight(it) },
+    )
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .proFlightPixelation(proFlightClock)
+    ) {
+
     AnimatedContent(
         targetState = displayIntroFunnel,
         label = "intro-main-switch",
@@ -653,14 +908,14 @@ private fun MainNavHostContent(
                 meanReliabilityWeight = reliabilityWindow?.meanReliabilityWeight ?: 0.0,
                 totalReferralCount = totalReferralCount,
                 referralCode = referralCode,
+                referralCodeFailed = referralCodeLoad == SectionLoad.Failed,
+                retryReferralCode = referralCodeViewModel.retryReferralCode,
                 provideControlMode = settingsViewModel.provideControlMode,
                 setProvideControlMode = settingsViewModel.setProvideControlMode,
                 provideIndicatorColor = settingsViewModel.provideIndicatorColor,
                 allowProvideCell = settingsViewModel.allowProvideOnCell.collectAsState().value,
                 toggleProvideCell = settingsViewModel.toggleAllowProvideOnCell,
                 planViewModel = planViewModel,
-                solanaPaymentViewModel = solanaPaymentViewModel,
-                isCheckingSolanaTransaction = isCheckingSolanaTransaction,
                 overlayViewModel = overlayViewModel
             )
         } else {
@@ -681,8 +936,22 @@ private fun MainNavHostContent(
                 ) {
 
                     NavigationSuiteScaffold(
+                        // The collected flags can lag the effect that shows intro
+                        // and then clears its prompt gate. Read that pair's current
+                        // values together on the UI thread; collectors above still
+                        // schedule recomposition. This tag never changes the UI.
+                        modifier = if (postLoginMainNavigationReady(
+                            isPro = isPro,
+                            isGuest = isGuestNetworkForIntro,
+                            guestStatusKnown = guestStatusKnownForIntro,
+                            allowPrompt = mainNavViewModel.allowDisplayIntroFunnel.value,
+                            introDisplayed = mainNavViewModel.displayIntroFunnel.value,
+                        )) Modifier.testTag(POST_LOGIN_MAIN_READY_TAG) else Modifier,
                         containerColor = Black,
-                        contentColor = Black,
+                        // the content's color on the black container, as a
+                        // Scaffold gives every other screen: the connect
+                        // screen's ripples, hover and focus layers draw in it
+                        contentColor = MaterialTheme.colorScheme.onBackground,
                         navigationSuiteColors = customColors,
                         layoutType = navSuiteLayoutType,
 
@@ -702,8 +971,8 @@ private fun MainNavHostContent(
                                         } else {
                                             Icon(
                                                 painter = painterResource(id = iconRes),
-                                                contentDescription = screen.description,
-                                                modifier = Modifier.testTag("acceptance.nav.${screen.description.lowercase()}")
+                                                contentDescription = stringResource(id = screen.descriptionId),
+                                                modifier = Modifier.testTag(screen.testTag)
                                             )
                                         }
 
@@ -716,75 +985,57 @@ private fun MainNavHostContent(
                         }
                     ) {
 
-                        if (isTablet()) {
-
-                            Column(
-                                modifier = Modifier.padding(bottom = 1.dp)
-                            ) {
-                                Row {
-                                    MainNavContent(
-                                        settingsViewModel = settingsViewModel,
-                                        planViewModel = planViewModel,
-                                        overlayViewModel = overlayViewModel,
-                                        navController = navController,
-                                        earningsViewModel = earningsViewModel,
-                                        connectViewModel = connectViewModel,
-                                        locationsListViewModel = locationsListViewModel,
-                                        activityResultSender = activityResultSender,
-                                        subscriptionBalanceViewModel = subscriptionBalanceViewModel,
-                                        referralCodeViewModel = referralCodeViewModel,
-                                        bundleStore = bundleStore,
-                                        reliabilityWindow = reliabilityWindow,
-                                        totalReferralCount = totalReferralCount,
-                                        solanaPaymentViewModel = solanaPaymentViewModel,
-                                        isCheckingSolanaTransaction = isCheckingSolanaTransaction,
-                                        isPro = isPro,
-                                        connectActionsSheetState = connectActionsSheetState
-                                    )
-                                }
-
-                                if (configuration.orientation == Configuration.ORIENTATION_PORTRAIT) {
-                                    HorizontalDivider(
-                                        modifier = Modifier
-                                            .height(1.dp)
-                                            .fillMaxWidth(),
-                                        color = MainBorderBase
-                                    )
-                                }
-                            }
-
-                        } else {
-
-                            Column(
-                                modifier = Modifier.padding(bottom = 1.dp)
-                            ) {
-                                MainNavContent(
-                                    settingsViewModel = settingsViewModel,
-                                    planViewModel = planViewModel,
-                                    overlayViewModel = overlayViewModel,
-                                    navController = navController,
-                                    earningsViewModel = earningsViewModel,
-                                    connectViewModel = connectViewModel,
-                                    locationsListViewModel = locationsListViewModel,
-                                    activityResultSender = activityResultSender,
-                                    subscriptionBalanceViewModel = subscriptionBalanceViewModel,
-                                    referralCodeViewModel = referralCodeViewModel,
-                                    bundleStore = bundleStore,
-                                    reliabilityWindow = reliabilityWindow,
-                                    totalReferralCount = totalReferralCount,
-                                    solanaPaymentViewModel = solanaPaymentViewModel,
-                                    isCheckingSolanaTransaction = isCheckingSolanaTransaction,
-                                    isPro = isPro,
-                                    connectActionsSheetState = connectActionsSheetState
-                                )
-
-                                HorizontalDivider(
+                        // one container in every layout, so the screens keep
+                        // their state when the bar becomes a rail: a hairline
+                        // beside the rail, a gap above the bar
+                        Row(
+                            modifier = Modifier.padding(
+                                bottom = if (navigationLayout == NavigationLayout.BottomBar) 1.dp else 0.dp
+                            )
+                        ) {
+                            if (navigationLayout == NavigationLayout.Rail) {
+                                VerticalDivider(
                                     modifier = Modifier
-                                        .height(1.dp)
-                                        .fillMaxWidth(),
+                                        .width(1.dp)
+                                        .fillMaxHeight(),
                                     color = MainBorderBase
                                 )
                             }
+
+                            MainNavContent(
+                                settingsViewModel = settingsViewModel,
+                                planViewModel = planViewModel,
+                                overlayViewModel = overlayViewModel,
+                                navController = navController,
+                                earningsViewModel = earningsViewModel,
+                                connectViewModel = connectViewModel,
+                                locationsListViewModel = locationsListViewModel,
+                                activityResultSender = activityResultSender,
+                                subscriptionBalanceViewModel = subscriptionBalanceViewModel,
+                                referralCodeViewModel = referralCodeViewModel,
+                                bundleStore = bundleStore,
+                                reliabilityWindow = reliabilityWindow,
+                                totalReferralCount = totalReferralCount,
+                                isPro = isPro,
+                                connectActionsSheetState = connectActionsSheetState,
+                                // the Protocol card's "Claim on Earnings": Earnings at its Top 200 tile
+                                openEarningsTop200 = {
+                                    earningsViewModel.requestTop200Focus()
+                                    selectTopLevelRoute(TopLevelScaffoldRoutes.ACCOUNT_CONTAINER)
+                                    // the account stack it restores may already end on Earnings:
+                                    // that one shows the tile, rather than a second on top of it
+                                    navController.navigate(Route.Earnings) {
+                                        launchSingleTop = true
+                                    }
+                                },
+                                // the Top 200 tile's "See the Protocol leaderboard"
+                                openProtocolLeaderboard = {
+                                    mainNavViewModel.requestProtocolTab()
+                                    selectTopLevelRoute(TopLevelScaffoldRoutes.LEADERBOARD)
+                                },
+                                protocolTabRequested = mainNavViewModel.protocolTabRequested.collectAsState().value,
+                                consumeProtocolTabRequest = mainNavViewModel.consumeProtocolTabRequest,
+                            )
                         }
                     }
                 }
@@ -803,6 +1054,32 @@ private fun MainNavHostContent(
         referralCelebrationJoined = pendingReferralCelebration?.joined ?: 1L,
         onReferralCelebrationDismissed = {
             referralCodeViewModel.clearCelebration()
+        },
+    )
+
+    } // pixelation layer
+
+    // the Pro celebration flight, above every overlay, sharp
+    ProSunglassesFlight(clock = proFlightClock)
+
+    /**
+     * The crypto invoice of the flavors that sell outside a store, above the
+     * screen that opened it, so leaving that screen doesn't end a payment
+     * (src/cryptoPay; nothing on Play). A paid invoice does what a card
+     * purchase does once it is done: the server confirms and the overlay
+     * celebrates (purchaseConfirmedSequence), and the surface that sold it
+     * closes -- the intro funnel, or Get Pro if it is still the screen shown.
+     */
+    CryptoInvoiceHost(
+        subscriptionBalanceViewModel = subscriptionBalanceViewModel,
+        planViewModel = planViewModel,
+        onPaid = {
+            subscriptionBalanceViewModel.confirmPurchase()
+            if (mainNavViewModel.displayIntroFunnel.value) {
+                mainNavViewModel.setDisplayIntroFunnel(false)
+            } else if (navController.currentDestination?.hasRoute<Route.Upgrade>() == true) {
+                navController.popBackStack()
+            }
         },
     )
 
@@ -856,6 +1133,8 @@ fun IntroNavHost(
     meanReliabilityWeight: Double,
     totalReferralCount: Long,
     referralCode: String,
+    referralCodeFailed: Boolean = false,
+    retryReferralCode: () -> Unit = {},
     provideControlMode: ProvideControlMode,
     setProvideControlMode: (ProvideControlMode) -> Unit,
     provideIndicatorColor: Color,
@@ -863,13 +1142,10 @@ fun IntroNavHost(
     toggleProvideCell: () -> Unit,
     subscriptionBalanceViewModel: SubscriptionBalanceViewModel,
     planViewModel: PlanViewModel,
-    isCheckingSolanaTransaction: Boolean,
-    solanaPaymentViewModel: SolanaPaymentViewModel,
     overlayViewModel: OverlayViewModel
 ) {
 
     val introNavController = rememberNavController()
-    val scope = rememberCoroutineScope()
 
     // the connector mark that flies from page 1's route line into the header
     val introConnector = remember { IntroConnectorState() }
@@ -877,6 +1153,34 @@ fun IntroNavHost(
     LaunchedEffect(introEntry) {
         val route = introEntry?.destination?.route ?: return@LaunchedEffect
         introConnector.inHeader = !route.contains(IntroRoute.IntroductionInitial::class.qualifiedName.toString())
+    }
+
+    // The onboarding plan data: the tier, the welcome offer and the experiment
+    // variant. The final offer page is reached by everyone who is not in the
+    // in-app holdout -- Skip from any earlier page lands there once, and its
+    // free-plan link is the only way out (mmm/onboarding/PLAN.md).
+    val priceTier by subscriptionBalanceViewModel.priceTier.collectAsState()
+    val onboardingOffer by subscriptionBalanceViewModel.onboardingOffer.collectAsState()
+    val experiments by subscriptionBalanceViewModel.experiments.collectAsState()
+    val offerHoldout = experiments?.isHoldout(com.bringyour.sdk.Sdk.ExperimentSurfaceOfferInApp) == true
+    val introSteps = remember { IntroStepTimer() }
+    val skipToOffer: () -> Unit = {
+        val current = introEntry?.destination?.route ?: ""
+        when (com.bringyour.network.ui.introduction.IntroSkip.decide(current, offerHoldout)) {
+            com.bringyour.network.ui.introduction.IntroSkip.Action.DISMISS -> {
+                introSteps.skipped(current)
+                dismiss()
+            }
+            com.bringyour.network.ui.introduction.IntroSkip.Action.GO_TO_OFFER -> {
+                introSteps.skipped(current)
+                introNavController.navigate(IntroRoute.IntroductionOffer)
+            }
+        }
+    }
+    // one shown / completed event per page, timed from when it appeared
+    LaunchedEffect(introEntry) {
+        val route = introEntry?.destination?.route ?: return@LaunchedEffect
+        introSteps.shown(route)
     }
 
     CompositionLocalProvider(LocalIntroConnector provides introConnector) {
@@ -890,31 +1194,28 @@ fun IntroNavHost(
         composable<IntroRoute.IntroductionInitial> {
             IntroductionInitial(
                 navController = introNavController,
-                dismiss = dismiss,
+                dismiss = skipToOffer,
                 planViewModel = planViewModel,
-                createSolanaPaymentIntent = solanaPaymentViewModel.createSolanaPaymentIntent,
-                setPendingSolanaSubscriptionReference = solanaPaymentViewModel.setPendingSolanaSubscriptionReference,
+                subscriptionBalanceViewModel = subscriptionBalanceViewModel,
                 onStripePaymentSuccess = {
-                    subscriptionBalanceViewModel.pollSubscriptionBalance()
+                    subscriptionBalanceViewModel.confirmPurchase()
                     dismiss()
                 },
                 onRedeemTransferBalanceCodeSuccess = {
-                    subscriptionBalanceViewModel.pollSubscriptionBalance()
-                    overlayViewModel.launch(OverlayMode.Upgrade)
-                    scope.launch {
-                        // bandaid for overlapping modal state getting weird
-                        delay(1000)
-                        dismiss()
-                    }
+                    // a balance code is data only: the sheet confirmed the data it
+                    // added; read the balance once and finish the intro. The Pro
+                    // overlay and the Pro confirmation poll would wait for a plan a
+                    // code never grants.
+                    subscriptionBalanceViewModel.fetchSubscriptionBalance()
+                    dismiss()
                 },
-                isCheckingSolanaTransaction = isCheckingSolanaTransaction
             )
         }
 
         composable<IntroRoute.IntroductionUsageBar> {
             IntroductionUsageBar(
                 navController = introNavController,
-                dismiss = dismiss,
+                dismiss = skipToOffer,
                 usedBytes = subscriptionBalanceViewModel.usedBalanceByteCount,
                 pendingBytes = subscriptionBalanceViewModel.pendingBalanceByteCount,
                 availableBytes = subscriptionBalanceViewModel.availableBalanceByteCount.collectAsState().value,
@@ -927,7 +1228,7 @@ fun IntroNavHost(
         composable<IntroRoute.IntroductionSettings> {
             IntroductionSettings(
                 navController = introNavController,
-                dismiss = dismiss,
+                dismiss = skipToOffer,
                 provideControlMode = provideControlMode,
                 setProvideControlMode = setProvideControlMode,
                 provideIndicatorColor = provideIndicatorColor,
@@ -939,16 +1240,54 @@ fun IntroNavHost(
         composable<IntroRoute.IntroductionReferral> {
             IntroductionReferral(
                 navController = introNavController,
-                dismiss = dismiss,
+                dismiss = skipToOffer,
                 totalReferrals = totalReferralCount,
-                referralCode = referralCode
+                referralCode = referralCode,
+                referralCodeFailed = referralCodeFailed,
+                retryReferralCode = retryReferralCode,
             )
         }
 
         composable<IntroRoute.IntroductionQuickConnect> {
             IntroductionQuickConnect(
                 navController = introNavController,
-                dismiss = dismiss
+                dismiss = skipToOffer,
+                // the closing button continues to the offer page; the holdout leaves here
+                next = {
+                    introSteps.completed(IntroRoute.IntroductionQuickConnect::class.qualifiedName.toString())
+                    if (offerHoldout) dismiss() else introNavController.navigate(IntroRoute.IntroductionOffer)
+                }
+            )
+        }
+
+        composable<IntroRoute.IntroductionOffer> {
+            val presentation = rememberPlanPresentation(planViewModel, priceTier, onboardingOffer)
+            val purchaser = rememberPlanPurchaser(
+                planViewModel = planViewModel,
+                subscriptionBalanceViewModel = subscriptionBalanceViewModel,
+                onPurchaseSuccess = {
+                    // the overlay follows the server's confirmation (purchaseConfirmedSequence)
+                    subscriptionBalanceViewModel.confirmPurchase()
+                    dismiss()
+                },
+            )
+            IntroductionOffer(
+                presentation = presentation,
+                experiment = subscriptionBalanceViewModel.offerExperiment,
+                store = purchaser.store,
+                upgradeInProgress = planViewModel.inProgress,
+                startTrial = {
+                    purchaser.purchase(PlanType.YEARLY, presentation)
+                },
+                dismiss = dismiss,
+                onBack = { introNavController.popBackStack() },
+                // the yearly (offer) card alone: a coin buys it too
+                methodSlot = rememberPlanMethodSlot(
+                    presentation = presentation,
+                    subscriptionBalanceViewModel = subscriptionBalanceViewModel,
+                    selectedPlan = PlanType.YEARLY,
+                    setSelectedPlan = {},
+                ),
             )
         }
 
@@ -977,14 +1316,21 @@ fun MainNavContent(
     bundleStore: BundleStore?,
     reliabilityWindow: ReliabilityWindow?,
     totalReferralCount: Long,
-    solanaPaymentViewModel: SolanaPaymentViewModel,
-    isCheckingSolanaTransaction: Boolean,
     isPro: Boolean,
-    connectActionsSheetState: SheetState,
+    connectActionsSheetState: ConnectDrawerState,
+    openEarningsTop200: () -> Unit = {},
+    openProtocolLeaderboard: () -> Unit = {},
+    protocolTabRequested: Boolean = false,
+    consumeProtocolTabRequest: () -> Unit = {},
     accountViewModel: AccountViewModel = hiltViewModel<AccountViewModel>(),
     profileViewModel: ProfileViewModel = hiltViewModel<ProfileViewModel>(),
     accountPointsViewModel: AccountPointsViewModel = hiltViewModel<AccountPointsViewModel>(),
 ) {
+    val isGuestNetwork by subscriptionBalanceViewModel.isGuestNetwork.collectAsState()
+    LaunchedEffect(isGuestNetwork) {
+        accountViewModel.setGuestNetwork(isGuestNetwork)
+    }
+
     val localDensityCurrent = LocalDensity.current
     val canvasSizePx =
         with(localDensityCurrent) { connectViewModel.canvasSize.times(0.4f).toPx() }
@@ -1001,314 +1347,546 @@ fun MainNavContent(
         }
     }
 
-    val configuration = LocalConfiguration.current
+    // the location picker open as a dialog beside the connect panes, and its
+    // list's scroll position: above the screens, so a fold or a resize carries
+    // both between the dialog and the picker's own screen
+    var locationPickerOpen by rememberSaveable { mutableStateOf(false) }
+    val locationListPosition = rememberLocationListPosition()
 
-    if (isTablet() && configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) {
-        VerticalDivider(
-            modifier = Modifier
-                .width(1.dp)
-                .fillMaxHeight(),
-            color = MainBorderBase
+    // Account at medium width and up is a list-detail layout: the account list
+    // stays at the start and the chosen screen opens beside it. The list lives
+    // outside the NavHost, so choosing a screen moves only the detail.
+    val windowLayout = LocalWindowLayout.current
+    val backStack by navController.currentBackStack.collectAsState()
+    val accountListDetail = windowLayout.isMediumWidthOrWider &&
+        backStack.lastOrNull()?.destination?.hierarchy?.any { it.hasRoute<Route.AccountContainer>() } == true
+    // the screen chosen from the list: the one right above the account root
+    val accountRootIndex = backStack.indexOfLast { it.destination.hasRoute<Route.Account>() }
+    val chosenAccountRoute = if (accountRootIndex < 0) null else {
+        backStack.getOrNull(accountRootIndex + 1)?.destination?.route?.let { Route.fromString(it) }
+    }
+    // above the list's two homes (the start pane, the account destination), so
+    // a resize keeps its scroll and an open redeem sheet
+    val accountScrollState = rememberScrollState()
+    var accountRedeemSheetOpen by rememberSaveable { mutableStateOf(false) }
+    val accountScreen: @Composable (navigate: (Route) -> Unit) -> Unit = { navigate ->
+        AccountScreen(
+            navController,
+            accountViewModel,
+            totalAccountPoints = accountPointsViewModel.totalAccountPoints.collectAsState().value,
+            accountPointsLoaded = accountPointsViewModel.pointsLoaded.collectAsState().value,
+            accountPointsFailed = accountPointsViewModel.pointsLoad.collectAsState().value == SectionLoad.Failed,
+            retryAccountPoints = { accountPointsViewModel.fetchAccountPoints() },
+            planViewModel = planViewModel,
+            subscriptionBalanceViewModel = subscriptionBalanceViewModel,
+            overlayViewModel = overlayViewModel,
+            totalReferrals = totalReferralCount,
+            meanReliabilityWeight = reliabilityWindow?.meanReliabilityWeight ?: 0.0,
+            isPro = isPro,
+            navigate = navigate,
+            chosenRoute = if (accountListDetail) chosenAccountRoute else null,
+            scrollState = accountScrollState,
+            isPresentingRedeemTransferBalanceSheet = accountRedeemSheetOpen,
+            setPresentingRedeemTransferBalanceSheet = { accountRedeemSheetOpen = it },
         )
     }
 
-    NavHost(
-        navController = navController,
-        startDestination = Route.ConnectContainer,
+    // where the account panes sit in the window, to split them at a fold
+    var paneRowInWindow by remember { mutableStateOf(Rect.Zero) }
+    val density = LocalDensity.current
+    val listOnLeft = LocalLayoutDirection.current == LayoutDirection.Ltr
+    val paneRowWidth = paneRowInWindow.width / density.density
+    val accountListWidth = sidePaneWidth(
+        split = sideBySideSplit(
+            containerStart = paneRowInWindow.left / density.density,
+            width = paneRowWidth,
+            fold = windowLayout.hinge,
+            sidePaneOnLeft = listOnLeft,
+        ),
+        width = paneRowWidth,
+        sidePaneOnLeft = listOnLeft,
+    ).dp
+
+    Row(
+        modifier = Modifier
+            .fillMaxSize()
+            .onGloballyPositioned { paneRowInWindow = it.boundsInWindow() }
     ) {
 
-        navigation<Route.ConnectContainer>(
-            startDestination = Route.Connect,
-            enterTransition = { EnterTransition.None },
-            exitTransition = { ExitTransition.None }
+        if (accountListDetail) {
+            Box(modifier = Modifier.width(accountListWidth.coerceAtLeast(0.dp))) {
+                // a choice replaces the screen beside the list instead of
+                // stacking on it
+                accountScreen { route ->
+                    navController.navigate(route) {
+                        popUpTo(Route.Account) { inclusive = false }
+                        launchSingleTop = true
+                    }
+                }
+            }
+            VerticalDivider(
+                modifier = Modifier
+                    .width(1.dp)
+                    .fillMaxHeight(),
+                color = MainBorderBase
+            )
+        }
+
+        NavHost(
+            navController = navController,
+            startDestination = Route.ConnectContainer,
+            modifier = Modifier.weight(1f),
         ) {
-            composable<Route.Connect> {
-                ConnectScreen(
-                    connectViewModel,
-                    overlayViewModel,
-                    locationsListViewModel,
-                    navController,
-                    subscriptionBalanceViewModel,
-                    planViewModel,
-                    bundleStore,
-                    meanReliabilityWeight = reliabilityWindow?.meanReliabilityWeight ?: 0.0,
-                    totalReferrals = totalReferralCount,
-                    isPro = isPro,
-                    connectActionsSheetState = connectActionsSheetState
-                )
-            }
 
-            composable<Route.BrowseLocations>(
-                enterTransition = NavigationAnimations.enterTransition(),
-                exitTransition = NavigationAnimations.exitTransition(),
-                popEnterTransition = NavigationAnimations.popEnterTransition(),
-                popExitTransition = NavigationAnimations.popExitTransition()
+            navigation<Route.ConnectContainer>(
+                startDestination = Route.Connect,
+                enterTransition = { EnterTransition.None },
+                exitTransition = { ExitTransition.None }
             ) {
-                BrowseLocationsScreen(
-                    navController = navController,
-                    connectViewModel = connectViewModel,
-                    locationsListViewModel = locationsListViewModel,
-                    connectActionsSheetState = connectActionsSheetState
-                )
+                composable<Route.Connect> {
+                    // the referral toast (MainNavHostContent) shows for every
+                    // celebration but the first
+                    val pendingReferralCelebration by referralCodeViewModel.pendingCelebration.collectAsState()
+                    ConnectScreen(
+                        connectViewModel,
+                        overlayViewModel,
+                        locationsListViewModel,
+                        navController,
+                        subscriptionBalanceViewModel,
+                        planViewModel,
+                        bundleStore,
+                        meanReliabilityWeight = reliabilityWindow?.meanReliabilityWeight ?: 0.0,
+                        totalReferrals = totalReferralCount,
+                        isPro = isPro,
+                        connectActionsSheetState = connectActionsSheetState,
+                        referralToastVisible = pendingReferralCelebration?.isFirst == false,
+                        locationPickerOpen = locationPickerOpen,
+                        setLocationPickerOpen = { locationPickerOpen = it },
+                        locationListPosition = locationListPosition,
+                    )
+                }
+
+                composable<Route.BrowseLocations>(
+                    enterTransition = NavigationAnimations.enterTransition(),
+                    exitTransition = NavigationAnimations.exitTransition(),
+                    popEnterTransition = NavigationAnimations.popEnterTransition(),
+                    popExitTransition = NavigationAnimations.popExitTransition()
+                ) {
+                    // unfolded or widened onto the connect panes: the picker
+                    // continues as their location dialog, search and scroll kept
+                    if (connectArrangementFor(windowLayout.widthDp, windowLayout.heightDp, windowLayout.fold) != ConnectArrangement.Drawer) {
+                        LaunchedEffect(Unit) {
+                            locationPickerOpen = true
+                            navController.popBackStack(Route.BrowseLocations, inclusive = true)
+                        }
+                    }
+                    BrowseLocationsScreen(
+                        navController = navController,
+                        connectViewModel = connectViewModel,
+                        locationsListViewModel = locationsListViewModel,
+                        connectActionsSheetState = connectActionsSheetState,
+                        listPosition = locationListPosition,
+                    )
+                }
+
+                composable<Route.ContractStats>(
+                    enterTransition = NavigationAnimations.enterTransition(),
+                    exitTransition = NavigationAnimations.exitTransition(),
+                    popEnterTransition = NavigationAnimations.popEnterTransition(),
+                    popExitTransition = NavigationAnimations.popExitTransition()
+                ) { backStackEntry ->
+                    val route: Route.ContractStats = backStackEntry.toRoute()
+                    ContractStatsScreen(
+                        navController = navController,
+                        provider = route.provider,
+                    )
+                }
+
+                composable<Route.SplitRules>(
+                    enterTransition = NavigationAnimations.enterTransition(),
+                    exitTransition = NavigationAnimations.exitTransition(),
+                    popEnterTransition = NavigationAnimations.popEnterTransition(),
+                    popExitTransition = NavigationAnimations.popExitTransition()
+                ) {
+                    SplitRulesScreen(
+                        navController = navController,
+                    )
+                }
+
+                composable<Route.AppSplitRules>(
+                    enterTransition = NavigationAnimations.enterTransition(),
+                    exitTransition = NavigationAnimations.exitTransition(),
+                    popEnterTransition = NavigationAnimations.popEnterTransition(),
+                    popExitTransition = NavigationAnimations.popExitTransition()
+                ) {
+                    AppSplitRulesScreen(
+                        navController = navController,
+                    )
+                }
+
+                composable<Route.DnsSettings>(
+                    enterTransition = NavigationAnimations.enterTransition(),
+                    exitTransition = NavigationAnimations.exitTransition(),
+                    popEnterTransition = NavigationAnimations.popEnterTransition(),
+                    popExitTransition = NavigationAnimations.popExitTransition()
+                ) {
+                    DnsSettingsScreen(
+                        navController = navController,
+                    )
+                }
+
+                composable<Route.TransportSettings>(
+                    enterTransition = NavigationAnimations.enterTransition(),
+                    exitTransition = NavigationAnimations.exitTransition(),
+                    popEnterTransition = NavigationAnimations.popEnterTransition(),
+                    popExitTransition = NavigationAnimations.popExitTransition()
+                ) { backStackEntry ->
+                    val route: Route.TransportSettings = backStackEntry.toRoute()
+                    TransportSettingsScreen(
+                        navController = navController,
+                        kind = if (route.provider) TransportSettingsKind.PROVIDER else TransportSettingsKind.CLIENT,
+                    )
+                }
+
+                composable<Route.ProviderLocations>(
+                    enterTransition = NavigationAnimations.enterTransition(),
+                    exitTransition = NavigationAnimations.exitTransition(),
+                    popEnterTransition = NavigationAnimations.popEnterTransition(),
+                    popExitTransition = NavigationAnimations.popExitTransition()
+                ) {
+                    ProviderLocationsScreen(
+                        navController = navController,
+                        getLocationColor = locationsListViewModel.getLocationColor,
+                        mockLocationSection = {
+                            MockLocationSection(navController = navController)
+                        },
+                        stayingClientId = connectViewModel.selectedLocation?.connectLocationId?.clientId?.idStr,
+                        // Stay on this exit reconnects to the one provider, through the
+                        // same connect gate as a location pick, and returns to the grid
+                        onStayOnExit = { location ->
+                            connectViewModel.connect(location)
+                            navController.popBackStack()
+                        },
+                    )
+                }
+
+                composable<Route.MockLocationGuide>(
+                    enterTransition = NavigationAnimations.enterTransition(),
+                    exitTransition = NavigationAnimations.exitTransition(),
+                    popEnterTransition = NavigationAnimations.popEnterTransition(),
+                    popExitTransition = NavigationAnimations.popExitTransition()
+                ) {
+                    MockLocationGuideScreen(
+                        navController = navController,
+                    )
+                }
             }
 
-            composable<Route.ContractStats>(
-                enterTransition = NavigationAnimations.enterTransition(),
-                exitTransition = NavigationAnimations.exitTransition(),
-                popEnterTransition = NavigationAnimations.popEnterTransition(),
-                popExitTransition = NavigationAnimations.popExitTransition()
-            ) { backStackEntry ->
-                val route: Route.ContractStats = backStackEntry.toRoute()
-                ContractStatsScreen(
-                    navController = navController,
-                    provider = route.provider,
-                )
-            }
-
-            composable<Route.SplitRules>(
-                enterTransition = NavigationAnimations.enterTransition(),
-                exitTransition = NavigationAnimations.exitTransition(),
-                popEnterTransition = NavigationAnimations.popEnterTransition(),
-                popExitTransition = NavigationAnimations.popExitTransition()
+            composable<Route.Support>(
+                enterTransition = { EnterTransition.None },
+                exitTransition = { ExitTransition.None }
             ) {
-                SplitRulesScreen(
-                    navController = navController,
+                FeedbackScreen(
+                    overlayViewModel = overlayViewModel,
+                    bundleStore = bundleStore
                 )
             }
 
-            composable<Route.AppSplitRules>(
-                enterTransition = NavigationAnimations.enterTransition(),
-                exitTransition = NavigationAnimations.exitTransition(),
-                popEnterTransition = NavigationAnimations.popEnterTransition(),
-                popExitTransition = NavigationAnimations.popExitTransition()
+            composable<Route.Leaderboard>(
+                enterTransition = { EnterTransition.None },
+                exitTransition = { ExitTransition.None }
             ) {
-                AppSplitRulesScreen(
-                    navController = navController,
+                LeaderboardScreen(
+                    onOpenEarnings = openEarningsTop200,
+                    protocolTabRequested = protocolTabRequested,
+                    onProtocolTabShown = consumeProtocolTabRequest,
                 )
             }
 
-            composable<Route.DnsSettings>(
-                enterTransition = NavigationAnimations.enterTransition(),
-                exitTransition = NavigationAnimations.exitTransition(),
-                popEnterTransition = NavigationAnimations.popEnterTransition(),
-                popExitTransition = NavigationAnimations.popExitTransition()
-            ) {
-                DnsSettingsScreen(
-                    navController = navController,
-                )
-            }
-
-            composable<Route.TransportSettings>(
-                enterTransition = NavigationAnimations.enterTransition(),
-                exitTransition = NavigationAnimations.exitTransition(),
-                popEnterTransition = NavigationAnimations.popEnterTransition(),
-                popExitTransition = NavigationAnimations.popExitTransition()
-            ) { backStackEntry ->
-                val route: Route.TransportSettings = backStackEntry.toRoute()
-                TransportSettingsScreen(
-                    navController = navController,
-                    kind = if (route.provider) TransportSettingsKind.PROVIDER else TransportSettingsKind.CLIENT,
-                )
-            }
-
-            composable<Route.ProviderLocations>(
-                enterTransition = NavigationAnimations.enterTransition(),
-                exitTransition = NavigationAnimations.exitTransition(),
-                popEnterTransition = NavigationAnimations.popEnterTransition(),
-                popExitTransition = NavigationAnimations.popExitTransition()
-            ) {
-                ProviderLocationsScreen(
-                    navController = navController,
-                    getLocationColor = locationsListViewModel.getLocationColor,
-                    mockLocationSection = {
-                        MockLocationSection(navController = navController)
+            composable<Route.GuestConversion> {
+                GuestConversionSheet(
+                    settingsViewModel = settingsViewModel,
+                    activityResultSender = activityResultSender,
+                    refreshJwt = subscriptionBalanceViewModel.refreshJwt,
+                    onAdded = {
+                        // the server stops reporting a guest once the method exists
+                        subscriptionBalanceViewModel.fetchSubscriptionBalance()
+                        navController.popBackStack()
                     },
+                    onDismiss = { navController.popBackStack() }
                 )
             }
 
-            composable<Route.MockLocationGuide>(
+            composable<Route.Upgrade>(
                 enterTransition = NavigationAnimations.enterTransition(),
                 exitTransition = NavigationAnimations.exitTransition(),
                 popEnterTransition = NavigationAnimations.popEnterTransition(),
                 popExitTransition = NavigationAnimations.popExitTransition()
-            ) {
-                MockLocationGuideScreen(
-                    navController = navController,
-                )
+            ) { backStackEntry ->
+                // every upgrade entry lands here; a guest network has no login to
+                // come back to, so it adds a sign-in method first and is not sold a plan
+                if (GuestAccount.upgradeEntry(isGuestNetwork) == UpgradeEntry.AddSignInMethod) {
+                    GuestConversionSheet(
+                        settingsViewModel = settingsViewModel,
+                        activityResultSender = activityResultSender,
+                        refreshJwt = subscriptionBalanceViewModel.refreshJwt,
+                        onAdded = { subscriptionBalanceViewModel.fetchSubscriptionBalance() },
+                        onDismiss = { navController.popBackStack() }
+                    )
+                    return@composable
+                }
+                // opened by a blocked start connect: the header leads with when the
+                // free data refreshes and offers Wait for refresh, which closes it
+                val openedByBalanceBlock =
+                    backStackEntry.savedStateHandle.get<Boolean>(UPGRADE_OPENED_BY_BALANCE_BLOCK) == true
+                val waitForRefresh: (() -> Unit)? =
+                    if (upgradeShowsFreeRefresh(openedByBalanceBlock, if (isPro) Plan.Supporter else Plan.Basic)) {
+                        { navController.popBackStack() }
+                    } else {
+                        null
+                    }
+                CompositionLocalProvider(LocalUpgradeWaitForRefresh provides waitForRefresh) {
+                    UpgradeScreen(
+                        navController = navController,
+                        planViewModel = planViewModel,
+                        subscriptionBalanceViewModel = subscriptionBalanceViewModel,
+                        onStripePaymentSuccess = {
+                            // the overlay follows the server's confirmation (purchaseConfirmedSequence)
+                            subscriptionBalanceViewModel.confirmPurchase()
+                            navController.popBackStack()
+                        },
+                    )
+                }
             }
-        }
 
-        composable<Route.Support>(
-            enterTransition = { EnterTransition.None },
-            exitTransition = { ExitTransition.None }
-        ) {
-            FeedbackScreen(
-                overlayViewModel = overlayViewModel,
-                bundleStore = bundleStore
-            )
-        }
-
-        composable<Route.Leaderboard>(
-            enterTransition = { EnterTransition.None },
-            exitTransition = { ExitTransition.None }
-        ) {
-            LeaderboardScreen()
-        }
-
-        composable<Route.Upgrade>(
-            enterTransition = NavigationAnimations.enterTransition(),
-            exitTransition = NavigationAnimations.exitTransition(),
-            popEnterTransition = NavigationAnimations.popEnterTransition(),
-            popExitTransition = NavigationAnimations.popExitTransition()
-        ) {
-            UpgradeScreen(
-                navController = navController,
-                planViewModel = planViewModel,
-                setPendingSolanaSubscriptionReference = solanaPaymentViewModel.setPendingSolanaSubscriptionReference,
-                createSolanaPaymentIntent = solanaPaymentViewModel.createSolanaPaymentIntent,
-                onStripePaymentSuccess = {
-                    subscriptionBalanceViewModel.pollSubscriptionBalance()
-                    overlayViewModel.launch(OverlayMode.Upgrade)
-                    navController.popBackStack()
-                },
-                isCheckingSolanaTransaction = isCheckingSolanaTransaction
-            )
-        }
-
-        navigation<Route.AccountContainer>(
-            startDestination = Route.Account,
-            enterTransition = { EnterTransition.None },
-            exitTransition = { ExitTransition.None }
-        ) {
-            composable<Route.Account> {
-                AccountScreen(
+            navigation<Route.AccountContainer>(
+                startDestination = Route.Account,
+                enterTransition = { EnterTransition.None },
+                exitTransition = { ExitTransition.None }
+            ) {
+                composable<Route.Account> {
+                    if (accountListDetail) {
+                        // the list is beside it: no screen chosen yet
+                        AccountDetailPlaceholder()
+                    } else {
+                        accountScreen { route -> navController.navigate(route) }
+                    }
+                }
+                composable<Route.Profile>(
+                    enterTransition = NavigationAnimations.enterTransition(),
+                    exitTransition = NavigationAnimations.exitTransition(),
+                    popEnterTransition = NavigationAnimations.popEnterTransition(),
+                    popExitTransition = NavigationAnimations.popExitTransition()
+                ) { ProfileScreen(
                     navController,
                     accountViewModel,
-                    totalAccountPoints = accountPointsViewModel.totalAccountPoints.collectAsState().value,
-                    accountPointsLoaded = accountPointsViewModel.pointsLoaded.collectAsState().value,
-                    planViewModel = planViewModel,
-                    subscriptionBalanceViewModel = subscriptionBalanceViewModel,
-                    overlayViewModel = overlayViewModel,
-                    totalReferrals = totalReferralCount,
-                    meanReliabilityWeight = reliabilityWindow?.meanReliabilityWeight ?: 0.0,
-                    isPro = isPro
-                )
-            }
-            composable<Route.Profile>(
-                enterTransition = NavigationAnimations.enterTransition(),
-                exitTransition = NavigationAnimations.exitTransition(),
-                popEnterTransition = NavigationAnimations.popEnterTransition(),
-                popExitTransition = NavigationAnimations.popExitTransition()
-            ) { ProfileScreen(
-                navController,
-                accountViewModel,
-                profileViewModel,
-                overlayViewModel
-            ) }
-            composable<Route.Settings>(
-                enterTransition = NavigationAnimations.enterTransition(),
-                exitTransition = NavigationAnimations.exitTransition(),
-                popEnterTransition = NavigationAnimations.popEnterTransition(),
-                popExitTransition = NavigationAnimations.popExitTransition()
-            ) { SettingsScreen(
-                navController,
-                accountViewModel,
-                planViewModel,
-                settingsViewModel,
-                overlayViewModel,
-                activityResultSender,
-                earningsViewModel,
-                isPro = isPro
-            ) }
+                    profileViewModel,
+                    overlayViewModel
+                ) }
+                composable<Route.Sessions>(
+                    enterTransition = NavigationAnimations.enterTransition(),
+                    exitTransition = NavigationAnimations.exitTransition(),
+                    popEnterTransition = NavigationAnimations.popEnterTransition(),
+                    popExitTransition = NavigationAnimations.popExitTransition()
+                ) {
+                    SessionsScreen(navController = navController)
+                }
+                composable<Route.ApiKeys>(
+                    enterTransition = NavigationAnimations.enterTransition(),
+                    exitTransition = NavigationAnimations.exitTransition(),
+                    popEnterTransition = NavigationAnimations.popEnterTransition(),
+                    popExitTransition = NavigationAnimations.popExitTransition()
+                ) {
+                    ApiKeysScreen(navController = navController)
+                }
+                composable<Route.Settings>(
+                    enterTransition = NavigationAnimations.enterTransition(),
+                    exitTransition = NavigationAnimations.exitTransition(),
+                    popEnterTransition = NavigationAnimations.popEnterTransition(),
+                    popExitTransition = NavigationAnimations.popExitTransition()
+                ) { SettingsScreen(
+                    navController,
+                    accountViewModel,
+                    planViewModel,
+                    settingsViewModel,
+                    overlayViewModel,
+                    activityResultSender,
+                    earningsViewModel,
+                    isPro = isPro,
+                    currentStore = subscriptionBalanceViewModel.currentStore.collectAsState().value,
+                    planNotices = {
+                        PaymentPastDueNotice(subscriptionBalanceViewModel = subscriptionBalanceViewModel)
+                    },
+                ) }
 
-            composable<Route.ProviderIdentities>(
-                enterTransition = NavigationAnimations.enterTransition(),
-                exitTransition = NavigationAnimations.exitTransition(),
-                popEnterTransition = NavigationAnimations.popEnterTransition(),
-                popExitTransition = NavigationAnimations.popExitTransition()
-            ) {
-                ProviderIdentitiesScreen(
-                    navController = navController,
-                )
-            }
+                composable<Route.Vless>(
+                    enterTransition = NavigationAnimations.enterTransition(),
+                    exitTransition = NavigationAnimations.exitTransition(),
+                    popEnterTransition = NavigationAnimations.popEnterTransition(),
+                    popExitTransition = NavigationAnimations.popExitTransition()
+                ) {
+                    VlessSettingsScreen(navController = navController)
+                }
 
-            composable<Route.Developer>(
-                enterTransition = NavigationAnimations.enterTransition(),
-                exitTransition = NavigationAnimations.exitTransition(),
-                popEnterTransition = NavigationAnimations.popEnterTransition(),
-                popExitTransition = NavigationAnimations.popExitTransition()
-            ) {
-                DeveloperScreen(navController = navController)
-            }
+                composable<Route.ProviderIdentities>(
+                    enterTransition = NavigationAnimations.enterTransition(),
+                    exitTransition = NavigationAnimations.exitTransition(),
+                    popEnterTransition = NavigationAnimations.popEnterTransition(),
+                    popExitTransition = NavigationAnimations.popExitTransition()
+                ) {
+                    ProviderIdentitiesScreen(
+                        navController = navController,
+                    )
+                }
 
-            composable<Route.BlockedRegions>(
-                enterTransition = NavigationAnimations.enterTransition(),
-                exitTransition = NavigationAnimations.exitTransition(),
-                popEnterTransition = NavigationAnimations.popEnterTransition(),
-                popExitTransition = NavigationAnimations.popExitTransition()
-            ) {
-                BlockedRegionsScreen(
-                    navController = navController,
-                    countries = locationsListViewModel.connectCountries,
-                    getLocationColor = locationsListViewModel.getLocationColor
-                )
-            }
+                composable<Route.Extenders>(
+                    enterTransition = NavigationAnimations.enterTransition(),
+                    exitTransition = NavigationAnimations.exitTransition(),
+                    popEnterTransition = NavigationAnimations.popEnterTransition(),
+                    popExitTransition = NavigationAnimations.popExitTransition()
+                ) {
+                    ExtendersScreen(
+                        navController = navController,
+                    )
+                }
 
-            composable<Route.BalanceCodes>(
-                enterTransition = NavigationAnimations.enterTransition(),
-                exitTransition = NavigationAnimations.exitTransition(),
-                popEnterTransition = NavigationAnimations.popEnterTransition(),
-                popExitTransition = NavigationAnimations.popExitTransition()
-            ) {
-                BalanceCodesScreen(
-                    navController = navController,
-                )
-            }
+                composable<Route.ShareExtenders>(
+                    enterTransition = NavigationAnimations.enterTransition(),
+                    exitTransition = NavigationAnimations.exitTransition(),
+                    popEnterTransition = NavigationAnimations.popEnterTransition(),
+                    popExitTransition = NavigationAnimations.popExitTransition()
+                ) {
+                    ShareExtendersScreen(
+                        navController = navController,
+                    )
+                }
 
-            composable<Route.Earnings>(
-                enterTransition = NavigationAnimations.enterTransition(),
-                exitTransition = NavigationAnimations.exitTransition(),
-                popEnterTransition = NavigationAnimations.popEnterTransition(),
-                popExitTransition = NavigationAnimations.popExitTransition()
-            ) {
-                EarningsScreen(
-                    navController = navController,
-                    earningsViewModel = earningsViewModel,
-                    overlayViewModel = overlayViewModel,
-                    totalAccountPoints = accountPointsViewModel.totalAccountPoints.collectAsState().value,
-                    payoutPoints = accountPointsViewModel.payoutPoints.collectAsState().value,
-                    referralPoints = accountPointsViewModel.referralPoints.collectAsState().value,
-                    multiplierPoints = accountPointsViewModel.multiplierPoints.collectAsState().value,
-                    reliabilityPoints = accountPointsViewModel.reliabilityPoints.collectAsState().value,
-                    fetchAccountPoints = { accountPointsViewModel.fetchAccountPoints() },
-                    reliabilityWindow = reliabilityWindow
-                )
-            }
+                composable<Route.ImportExtenders>(
+                    enterTransition = NavigationAnimations.enterTransition(),
+                    exitTransition = NavigationAnimations.exitTransition(),
+                    popEnterTransition = NavigationAnimations.popEnterTransition(),
+                    popExitTransition = NavigationAnimations.popExitTransition()
+                ) {
+                    ImportExtendersScreen(
+                        navController = navController,
+                    )
+                }
 
-            composable<Route.Referrals>(
-                enterTransition = NavigationAnimations.enterTransition(),
-                exitTransition = NavigationAnimations.exitTransition(),
-                popEnterTransition = NavigationAnimations.popEnterTransition(),
-                popExitTransition = NavigationAnimations.popExitTransition()
-            ) {
-                ReferralsScreen(
-                    navController = navController,
-                    settingsViewModel = settingsViewModel,
-                    referralCode = referralCodeViewModel.referralCode.collectAsState().value,
-                    totalReferrals = totalReferralCount,
-                    referralPoints = accountPointsViewModel.referralPoints.collectAsState().value,
-                    pointsLoaded = accountPointsViewModel.pointsLoaded.collectAsState().value,
-                    fetchAccountPoints = { accountPointsViewModel.fetchAccountPoints() },
-                )
-            }
+                composable<Route.Developer>(
+                    enterTransition = NavigationAnimations.enterTransition(),
+                    exitTransition = NavigationAnimations.exitTransition(),
+                    popEnterTransition = NavigationAnimations.popEnterTransition(),
+                    popExitTransition = NavigationAnimations.popExitTransition()
+                ) {
+                    DeveloperScreen(navController = navController)
+                }
 
-            composable<Route.Widgets>(
-                enterTransition = NavigationAnimations.enterTransition(),
-                exitTransition = NavigationAnimations.exitTransition(),
-                popEnterTransition = NavigationAnimations.popEnterTransition(),
-                popExitTransition = NavigationAnimations.popExitTransition()
-            ) {
-                WidgetsScreen(navController = navController)
+                composable<Route.Licenses>(
+                    enterTransition = NavigationAnimations.enterTransition(),
+                    exitTransition = NavigationAnimations.exitTransition(),
+                    popEnterTransition = NavigationAnimations.popEnterTransition(),
+                    popExitTransition = NavigationAnimations.popExitTransition()
+                ) {
+                    LicensesScreen(navController = navController)
+                }
+
+                composable<Route.LicenseDetail>(
+                    enterTransition = NavigationAnimations.enterTransition(),
+                    exitTransition = NavigationAnimations.exitTransition(),
+                    popEnterTransition = NavigationAnimations.popEnterTransition(),
+                    popExitTransition = NavigationAnimations.popExitTransition()
+                ) { backStackEntry ->
+                    val route: Route.LicenseDetail = backStackEntry.toRoute()
+                    LicenseDetailScreen(navController = navController, index = route.index)
+                }
+
+                composable<Route.BlockedRegions>(
+                    enterTransition = NavigationAnimations.enterTransition(),
+                    exitTransition = NavigationAnimations.exitTransition(),
+                    popEnterTransition = NavigationAnimations.popEnterTransition(),
+                    popExitTransition = NavigationAnimations.popExitTransition()
+                ) {
+                    BlockedRegionsScreen(
+                        navController = navController,
+                        countries = locationsListViewModel.connectCountries,
+                        getLocationColor = locationsListViewModel.getLocationColor
+                    )
+                }
+
+                composable<Route.BalanceCodes>(
+                    enterTransition = NavigationAnimations.enterTransition(),
+                    exitTransition = NavigationAnimations.exitTransition(),
+                    popEnterTransition = NavigationAnimations.popEnterTransition(),
+                    popExitTransition = NavigationAnimations.popExitTransition()
+                ) {
+                    BalanceCodesScreen(
+                        navController = navController,
+                    )
+                }
+
+                composable<Route.Earnings>(
+                    enterTransition = NavigationAnimations.enterTransition(),
+                    exitTransition = NavigationAnimations.exitTransition(),
+                    popEnterTransition = NavigationAnimations.popEnterTransition(),
+                    popExitTransition = NavigationAnimations.popExitTransition()
+                ) {
+                    EarningsScreen(
+                        navController = navController,
+                        earningsViewModel = earningsViewModel,
+                        overlayViewModel = overlayViewModel,
+                        totalAccountPoints = accountPointsViewModel.totalAccountPoints.collectAsState().value,
+                        payoutPoints = accountPointsViewModel.payoutPoints.collectAsState().value,
+                        referralPoints = accountPointsViewModel.referralPoints.collectAsState().value,
+                        multiplierPoints = accountPointsViewModel.multiplierPoints.collectAsState().value,
+                        reliabilityPoints = accountPointsViewModel.reliabilityPoints.collectAsState().value,
+                        fetchAccountPoints = { accountPointsViewModel.fetchAccountPoints() },
+                        reliabilityWindow = reliabilityWindow,
+                        activityResultSender = activityResultSender,
+                        accountPointsFailed = accountPointsViewModel.pointsLoad.collectAsState().value == SectionLoad.Failed,
+                        onSeeProtocolBoard = openProtocolLeaderboard,
+                        // a guest gets no payout key, only the wallet card
+                        isGuest = isGuestNetwork,
+                    )
+                }
+
+                composable<Route.Top200Sign>(
+                    enterTransition = NavigationAnimations.enterTransition(),
+                    exitTransition = NavigationAnimations.exitTransition(),
+                    popEnterTransition = NavigationAnimations.popEnterTransition(),
+                    popExitTransition = NavigationAnimations.popExitTransition()
+                ) {
+                    Top200SignScreen(
+                        navController = navController,
+                    )
+                }
+
+                composable<Route.Referrals>(
+                    enterTransition = NavigationAnimations.enterTransition(),
+                    exitTransition = NavigationAnimations.exitTransition(),
+                    popEnterTransition = NavigationAnimations.popEnterTransition(),
+                    popExitTransition = NavigationAnimations.popExitTransition()
+                ) {
+                    ReferralsScreen(
+                        navController = navController,
+                        settingsViewModel = settingsViewModel,
+                        referralCode = referralCodeViewModel.referralCode.collectAsState().value,
+                        referralCodeLoad = referralCodeViewModel.codeLoad.collectAsState().value,
+                        retryReferralCode = referralCodeViewModel.retryReferralCode,
+                        totalReferrals = totalReferralCount,
+                        referralPoints = accountPointsViewModel.referralPoints.collectAsState().value,
+                        pointsLoad = accountPointsViewModel.pointsLoad.collectAsState().value,
+                        fetchAccountPoints = { accountPointsViewModel.fetchAccountPoints() },
+                    )
+                }
+
+                composable<Route.Widgets>(
+                    enterTransition = NavigationAnimations.enterTransition(),
+                    exitTransition = NavigationAnimations.exitTransition(),
+                    popEnterTransition = NavigationAnimations.popEnterTransition(),
+                    popExitTransition = NavigationAnimations.popExitTransition()
+                ) {
+                    WidgetsScreen(navController = navController)
+                }
             }
         }
     }

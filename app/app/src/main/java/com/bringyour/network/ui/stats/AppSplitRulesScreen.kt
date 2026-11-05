@@ -37,13 +37,16 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.foundation.background
@@ -54,6 +57,7 @@ import com.bringyour.network.ui.indexedLazyListKey
 import com.bringyour.network.ui.components.SwipeToRevealRow
 import com.bringyour.network.ui.components.URDialog
 import com.bringyour.network.ui.components.URButton
+import com.bringyour.network.ui.components.URSearchInput
 import com.bringyour.network.ui.theme.Black
 import com.bringyour.network.ui.theme.BlueMedium
 import com.bringyour.network.ui.theme.Green
@@ -86,6 +90,8 @@ fun AppSplitRulesScreen(
 ) {
 
     var editorTarget by remember { mutableStateOf<AppRuleEditorTarget?>(null) }
+    var searchQuery by rememberSaveable(stateSaver = TextFieldValue.Saver) { mutableStateOf(TextFieldValue("")) }
+    val keyboardController = LocalSoftwareKeyboardController.current
     val context = LocalContext.current
 
     val appRules = blockActionsViewModel.appRules
@@ -99,10 +105,31 @@ fun AppSplitRulesScreen(
         installedAppsViewModel.installedApps.filter { it.packageName !in ruledPackages }
     }
 
+    val queryText = searchQuery.text
+    val appLabels = remember(appsByPackage) {
+        appsByPackage.mapValues { it.value.label }
+    }
+    val filteredAppRules = remember(appRules, appLabels, queryText) {
+        AppSplitFilter.filterRules(
+            rules = appRules,
+            labelsByPackage = appLabels,
+            query = queryText,
+            appIdSelector = { it.appId },
+        )
+    }
+    val filteredUnruledApps = remember(unruledApps, queryText) {
+        AppSplitFilter.filterApps(
+            apps = unruledApps,
+            query = queryText,
+            labelSelector = { it.label },
+            packageSelector = { it.packageName },
+        )
+    }
+
     // inclusions take precedence: when any app is included the tunnel runs in
     // allowlist mode and the exclude rules have no distinct effect
-    val includeMode = blockActionsViewModel.tunnelIncludedAppIds.isNotEmpty()
-    val excludeMode = !includeMode && blockActionsViewModel.tunnelExcludedAppIds.isNotEmpty()
+    val includeMode = blockActionsViewModel.isIncludeMode
+    val excludeMode = blockActionsViewModel.isExcludeMode
 
     Scaffold(
         topBar = {
@@ -115,7 +142,7 @@ fun AppSplitRulesScreen(
                 },
                 navigationIcon = {
                     IconButton(onClick = { navController.popBackStack() }) {
-                        Icon(Icons.AutoMirrored.Filled.KeyboardArrowLeft, contentDescription = "Back")
+                        Icon(Icons.AutoMirrored.Filled.KeyboardArrowLeft, contentDescription = stringResource(id = R.string.back))
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
@@ -166,9 +193,29 @@ fun AppSplitRulesScreen(
                         }
 
                         /**
+                         * Search input
+                         */
+                        item(key = "search-apps") {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    // the search field keeps 6 dp of its own above and below
+                                    .padding(horizontal = 16.dp, vertical = 2.dp)
+                            ) {
+                                URSearchInput(
+                                    value = searchQuery,
+                                    onValueChange = { searchQuery = it },
+                                    placeholder = stringResource(id = R.string.search_apps_placeholder),
+                                    keyboardController = keyboardController,
+                                    onClear = { searchQuery = TextFieldValue("") }
+                                )
+                            }
+                        }
+
+                        /**
                          * Pinned app rules
                          */
-                        if (appRules.isNotEmpty()) {
+                        if (filteredAppRules.isNotEmpty()) {
                             item(key = "rules-header") {
                                 Text(
                                     stringResource(id = R.string.rules),
@@ -179,7 +226,7 @@ fun AppSplitRulesScreen(
                             }
 
                             itemsIndexed(
-                                appRules,
+                                filteredAppRules,
                                 key = { index, rule ->
                                     indexedLazyListKey(
                                         "app-rule",
@@ -191,9 +238,9 @@ fun AppSplitRulesScreen(
                                 val app = appsByPackage[rule.appId]
                                 // an exclude rule has no effect while include
                                 // mode is active, so render it muted
-                                val ruleActive = rule.mode != AppRuleMode.EXCLUDED || !includeMode
+                                val ruleActive = blockActionsViewModel.isRuleActive(rule.mode)
                                 SwipeToRevealRow(
-                                    onDelete = { blockActionsViewModel.removeAppRule(rule.id) }
+                                    onAction = { blockActionsViewModel.removeAppRule(rule.id) }
                                 ) {
                                     AppRow(
                                         label = app?.label ?: rule.appId,
@@ -239,35 +286,54 @@ fun AppSplitRulesScreen(
                         /**
                          * All installed apps
                          */
-                        item(key = "apps-header") {
-                            Text(
-                                stringResource(id = R.string.apps),
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = TextMuted,
-                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
-                            )
+                        if (filteredUnruledApps.isNotEmpty()) {
+                            item(key = "apps-header") {
+                                Text(
+                                    stringResource(id = R.string.apps),
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = TextMuted,
+                                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
+                                )
+                            }
+
+                            itemsIndexed(
+                                filteredUnruledApps,
+                                key = { index, app ->
+                                    indexedLazyListKey("app", index, app.packageName)
+                                }
+                            ) { _, app ->
+                                AppRow(
+                                    label = app.label,
+                                    packageName = app.packageName,
+                                    icon = app.icon,
+                                    trailing = {},
+                                    onClick = {
+                                        editorTarget = AppRuleEditorTarget(
+                                            packageName = app.packageName,
+                                            label = app.label,
+                                            ruleId = null,
+                                            mode = AppRuleMode.EXCLUDED,
+                                        )
+                                    }
+                                )
+                            }
                         }
 
-                        itemsIndexed(
-                            unruledApps,
-                            key = { index, app ->
-                                indexedLazyListKey("app", index, app.packageName)
-                            }
-                        ) { _, app ->
-                            AppRow(
-                                label = app.label,
-                                packageName = app.packageName,
-                                icon = app.icon,
-                                trailing = {},
-                                onClick = {
-                                    editorTarget = AppRuleEditorTarget(
-                                        packageName = app.packageName,
-                                        label = app.label,
-                                        ruleId = null,
-                                        mode = AppRuleMode.EXCLUDED,
+                        if (queryText.isNotBlank() && filteredAppRules.isEmpty() && filteredUnruledApps.isEmpty()) {
+                            item(key = "no-apps-found") {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(32.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        text = stringResource(id = R.string.no_apps_found),
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = TextMuted
                                     )
                                 }
-                            )
+                            }
                         }
 
                     }

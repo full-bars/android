@@ -15,6 +15,16 @@
 <!--    <uses-permission android:name="android.permission.USE_BIOMETRIC" />-->
 
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- the extender share code scanner (EXTENDER.md K7, K8), requested at the
+         moment the user opens the scanner and never otherwise. The camera is
+         optional hardware: importing also reads a chosen photo and pasted
+         text, so a device without one still installs. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera"
+        android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus"
+        android:required="false" />
 <!--    This is automatically added by the billing library -->
 <!--    <uses-permission android:name="com.android.vending.BILLING" />-->
 
@@ -29,7 +39,7 @@
          app. The real gate is the MOCK_LOCATION app op set by that picker.
          Lint's MockLocation check assumes this is test-only scaffolding and
          wants it in src/debug. It has to ship in the release manifest instead:
-         the picker lists an app only if the INSTALLED build declares the
+         the picker lists an app only if the installed build declares the
          permission, and it excludes debuggable builds, so a debug-only
          declaration would make the "sync device location with oldest provider"
          feature impossible to enable for real users. -->
@@ -70,8 +80,14 @@
 
     <!--    android:logo="@drawable/logo_by"-->
     <!-- see https://developer.android.com/privacy-and-security/security-config -->
+    <!-- resizeableActivity: every window shape is supported, foldables and
+         multi-window included (apple/DUO.md). Never restrict orientation or
+         aspect ratio, and never opt out with
+         PROPERTY_COMPAT_ALLOW_RESTRICTED_RESIZABILITY: the layouts follow the
+         window size class and the fold. -->
     <application
         android:name=".MainApplication"
+        android:resizeableActivity="true"
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
@@ -100,9 +116,18 @@
             android:resource="@string/asset_statements" />
         <property android:name="android.net.PROPERTY_SELF_CERTIFIED_NETWORK_CAPABILITIES" android:resource="@xml/self_certified_network_capabilities"/>
 
+        <!-- configChanges: a fold, unfold, rotation or resize recomposes the
+             Compose screen instead of recreating the activity, so open sheets,
+             typed text and the keyboard stay (apple/DUO.md item 1). State is
+             still saved for the recreations that remain. keyboard,
+             keyboardHidden and navigation do the same when a physical keyboard
+             is connected or disconnected, so typing moves between it and the
+             on-screen keyboard without a relaunch (adaptive app quality,
+             Keyboard_Input). -->
         <activity
             android:name=".LoginActivity"
             android:exported="true"
+            android:configChanges="screenSize|smallestScreenSize|screenLayout|orientation|density|keyboard|keyboardHidden|navigation"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -131,6 +156,12 @@
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="ur" />
             </intent-filter>
+            <!-- long-pressing the Quick Settings tile opens the app; without this
+                 the system opens the app info page instead -->
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE_PREFERENCES" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
             <!-- long-press launcher shortcuts: Connect / Disconnect -->
             <meta-data
                 android:name="android.app.shortcuts"
@@ -139,6 +170,7 @@
 
         <activity
             android:name=".MainActivity"
+            android:configChanges="screenSize|smallestScreenSize|screenLayout|orientation|density|keyboard|keyboardHidden|navigation"
             android:windowSoftInputMode="adjustResize"
             android:exported="false">
         </activity>
@@ -150,7 +182,7 @@
             android:excludeFromRecents="true"
             android:noHistory="true"
             android:taskAffinity=""
-            android:theme="@android:style/Theme.NoDisplay">
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
             <intent-filter>
                 <action android:name="com.bringyour.network.action.QUICK_CONNECT" />
                 <action android:name="com.bringyour.network.action.QUICK_DISCONNECT" />
@@ -192,6 +224,34 @@
             <meta-data
                 android:name="android.appwidget.provider"
                 android:resource="@xml/widget_contracts_info" />
+        </receiver>
+        <!-- the overview: the three in one "super large" widget, on the home screen ... -->
+        <receiver
+            android:name=".widgets.OverviewWidgetReceiver"
+            android:exported="true"
+            android:label="@string/app_name">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_overview_info" />
+        </receiver>
+        <!-- ... and on the lock screen and Samsung's cover screen (Flex Window), keyguard only
+             with Samsung's sub_screen meta-data, as Samsung documents the cover's widgets -->
+        <receiver
+            android:name=".widgets.CoverWidgetReceiver"
+            android:exported="true"
+            android:label="@string/app_name">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_cover_info" />
+            <meta-data
+                android:name="com.samsung.android.appwidget.provider"
+                android:resource="@xml/widget_cover_samsung" />
         </receiver>
 
         <service

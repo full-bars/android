@@ -7,7 +7,6 @@ import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -31,20 +30,26 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.input.pointer.PointerIcon
+import androidx.compose.ui.input.pointer.pointerHoverIcon
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.ColorMatrix
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
@@ -63,6 +68,9 @@ import com.bringyour.network.ui.theme.ProGoldLight
 import com.bringyour.network.ui.theme.BlueMedium
 import com.bringyour.network.ui.theme.MainBorderBase
 import com.bringyour.network.ui.theme.URNetworkTheme
+import com.bringyour.network.ui.wallet.BittensorKeyScreenRequests
+import com.bringyour.network.ui.wallet.BittensorKeySignOut
+import com.bringyour.network.ui.wallet.BittensorKeySignOutDialog
 import com.bringyour.network.utils.isTv
 
 enum class LoginMode {
@@ -74,14 +82,27 @@ fun AccountSwitcher(
     loginMode: LoginMode,
     networkName: String?,
     isPro: Boolean = false,
-    openReferrals: () -> Unit
+    openReferrals: () -> Unit,
+    // a legacy guest adds a sign-in method to this network; never a logout
+    createAccount: () -> Unit = {},
 ) {
 
     val context = LocalContext.current
     val application = context.applicationContext as? MainApplication
 
-    var isOverlayVisible by remember { mutableStateOf(false) }
+    var isOverlayVisible by rememberSaveable { mutableStateOf(false) }
     val focusRequester = remember { FocusRequester()}
+    // the sign out waiting on the payout key's warning (the mocks' 3f)
+    var keySignOutPending by remember { mutableStateOf(false) }
+
+    val signOut: () -> Unit = {
+        application?.logout()
+
+        val intent = Intent(context, LoginActivity::class.java)
+        context.startActivity(intent)
+
+        (context as? Activity)?.finish()
+    }
 
     Box(
         modifier = Modifier.size(if (isPro) 40.dp else 32.dp),
@@ -143,9 +164,8 @@ fun AccountSwitcher(
             when(loginMode) {
                 LoginMode.Guest -> GuestPopup(
                     onDismiss = { isOverlayVisible = false },
-                    application = application,
-                    context = context,
                     openReferrals = openReferrals,
+                    createAccount = createAccount,
                     focusRequester = focusRequester
                 )
                 LoginMode.Authenticated -> AuthenticatedPopup(
@@ -154,10 +174,33 @@ fun AccountSwitcher(
                     context = context,
                     openReferrals = openReferrals,
                     networkName = networkName,
-                    focusRequester = focusRequester
+                    focusRequester = focusRequester,
+                    onSignOut = {
+                        isOverlayVisible = false
+                        // warned first while the network's payout key isn't saved
+                        if (BittensorKeySignOut.needsBackup(context)) {
+                            keySignOutPending = true
+                        } else {
+                            signOut()
+                        }
+                    }
                 )
             }
         }
+    }
+
+    if (keySignOutPending) {
+        BittensorKeySignOutDialog(
+            onBackUpFirst = {
+                keySignOutPending = false
+                BittensorKeyScreenRequests.request()
+            },
+            onSignOut = {
+                keySignOutPending = false
+                signOut()
+            },
+            onDismiss = { keySignOutPending = false },
+        )
     }
 }
 
@@ -178,8 +221,11 @@ fun AccountSwitcherPopup(
             properties = PopupProperties(focusable = true),
             offset = IntOffset(x = 0, y = 96),
         ) {
+            // the two clicks below only catch the pointer, so they never take
+            // keyboard focus; Esc closes the menu for the keyboard
             Box(
                 modifier = Modifier
+                    .focusProperties { canFocus = false }
                     .clickable(onClick = onDismiss)
                     .clip(RoundedCornerShape(6.dp))
                     .shadow(6.dp)
@@ -187,6 +233,7 @@ fun AccountSwitcherPopup(
                 Surface(
                     modifier = Modifier
                         .width(256.dp)
+                        .focusProperties { canFocus = false }
                         .clickable { /* Do nothing to prevent dismiss */ }
                 ) {
                     Column {
@@ -201,16 +248,15 @@ fun AccountSwitcherPopup(
 @Composable
 fun GuestPopup(
     onDismiss: () -> Unit,
-    context: Context?,
-    application: MainApplication?,
     openReferrals: () -> Unit,
+    createAccount: () -> Unit,
     focusRequester: FocusRequester
 ) {
 
     AccountSwitcherPopup(onDismiss = { onDismiss() }) {
         PopupActionRow(
             iconResourceId = R.drawable.main_nav_user_filled,
-            text = "Guest Mode",
+            text = stringResource(id = R.string.guest_mode),
             onClick = {},
             isSelected = true,
         )
@@ -219,14 +265,10 @@ fun GuestPopup(
 
         PopupActionRow(
             iconResourceId = R.drawable.plus,
-            text = "Create Account",
+            text = stringResource(id = R.string.create_account_2),
             onClick = {
-                application?.logout()
-
-                val intent = Intent(context, LoginActivity::class.java)
-                context?.startActivity(intent)
-                
-                (context as? Activity)?.finish()
+                createAccount()
+                onDismiss()
             },
             focusRequester = focusRequester
         )
@@ -251,7 +293,16 @@ fun AuthenticatedPopup(
     application: MainApplication?,
     openReferrals: () -> Unit,
     networkName: String?,
-    focusRequester: FocusRequester
+    focusRequester: FocusRequester,
+    // the sign out, through the payout key's warning
+    onSignOut: () -> Unit = {
+        application?.logout()
+
+        val intent = Intent(context, LoginActivity::class.java)
+        context?.startActivity(intent)
+
+        (context as? Activity)?.finish()
+    },
 ) {
 
     AccountSwitcherPopup(onDismiss = { onDismiss() }) {
@@ -264,15 +315,10 @@ fun AuthenticatedPopup(
         HorizontalDivider()
         PopupActionRow(
             iconResourceId = R.drawable.sign_out,
-            text = "Log out",
+            text = stringResource(id = R.string.sign_out),
             modifier = Modifier.testTag("acceptance.account.logout"),
             onClick = {
-                application?.logout()
-
-                val intent = Intent(context, LoginActivity::class.java)
-                context?.startActivity(intent)
-
-                (context as? Activity)?.finish()
+                onSignOut()
             },
             focusRequester = focusRequester
         )
@@ -320,16 +366,19 @@ fun PopupActionRow(
             .then(focusModifier)
             .fillMaxWidth()
             .background(bgColor.value)
-            .clickable { onClick() }
+            // the click is the row's one focus stop, and its focus lightens the row
             .onFocusChanged { isFocused = it.isFocused }
-            .focusable()
+            .pointerHoverIcon(PointerIcon.Hand)
+            .clickable { onClick() }
+            // the check mark shows the current network or guest mode; screen readers hear it
+            .semantics { if (isSelected) selected = true }
             .padding(16.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
         Row {
             Icon(
                 painterResource(id = iconResourceId),
-                contentDescription = "Connect",
+                contentDescription = null,
                 modifier = Modifier.width(16.dp)
             )
             Spacer(modifier = Modifier.width(16.dp))
@@ -339,7 +388,7 @@ fun PopupActionRow(
         if (isSelected) {
             Icon(
                 imageVector = Icons.Filled.Check,
-                contentDescription = "Connect",
+                contentDescription = null,
                 modifier = Modifier.width(16.dp),
                 tint = BlueMedium
             )
@@ -386,9 +435,8 @@ fun GuestPopupPreview() {
     URNetworkTheme {
         GuestPopup(
             onDismiss = {},
-            application =  null,
-            context = null,
             openReferrals = {},
+            createAccount = {},
             focusRequester = focusRequester
         )
     }

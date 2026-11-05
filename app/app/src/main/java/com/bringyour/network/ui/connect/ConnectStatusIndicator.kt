@@ -19,6 +19,8 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.pointer.PointerIcon
+import androidx.compose.ui.input.pointer.pointerHoverIcon
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.pluralStringResource
@@ -45,12 +47,15 @@ fun ConnectStatusIndicator(
     // when set, the provider status label opens the provider locations detail:
     // "Connected to N providers" and "Connecting to providers" alike (the detail
     // shows whatever providers are known so far while connecting)
-    onShowProviderLocations: (() -> Unit)? = null
+    onShowProviderLocations: (() -> Unit)? = null,
+    // a paying account refused at a data limit (DataLimitGate)
+    dataLimitReached: Boolean = false,
 ) {
 
     val text = when {
-        isPollingSubscriptionBalance -> "Processing subscription balance..."
-        contractStatus?.insufficientBalance == true && currentPlan != Plan.Supporter -> "Insufficient balance"
+        isPollingSubscriptionBalance -> stringResource(id = R.string.processing_subscription_balance)
+        dataLimitReached -> stringResource(id = R.string.data_limit_reached)
+        contractStatus?.insufficientBalance == true && currentPlan != Plan.Supporter -> stringResource(id = R.string.insufficient_balance)
         displayReconnectTunnel -> stringResource(id = R.string.reconnect_tunnel_status_indicator)
         status == ConnectStatus.CONNECTED -> pluralStringResource(
             id = R.plurals.connected_provider_count,
@@ -59,6 +64,8 @@ fun ConnectStatusIndicator(
         )
         status == ConnectStatus.CONNECTING || status == ConnectStatus.DESTINATION_SET ->
             stringResource(id = R.string.connecting_status_indicator)
+        // no provider could be reached; the drawer offers Retry
+        status == ConnectStatus.CONNECT_FAILED -> stringResource(id = R.string.conn_failed)
         status == ConnectStatus.DISCONNECTED -> when {
             guestMode -> stringResource(id = R.string.ready_to_connect)
             networkName != null -> stringResource(id = R.string.network_name_ready_to_connect, networkName)
@@ -68,19 +75,24 @@ fun ConnectStatusIndicator(
     }
 
     val indicatorId = when {
-        displayReconnectTunnel || isPollingSubscriptionBalance || (contractStatus?.insufficientBalance == true && currentPlan != Plan.Supporter) -> R.drawable.circle_indicator_yellow
+        displayReconnectTunnel || isPollingSubscriptionBalance || dataLimitReached || (contractStatus?.insufficientBalance == true && currentPlan != Plan.Supporter) -> R.drawable.circle_indicator_yellow
         status == ConnectStatus.CONNECTED -> R.drawable.circle_indicator_green
         status == ConnectStatus.CONNECTING || status == ConnectStatus.DESTINATION_SET -> R.drawable.circle_indicator_yellow
+        status == ConnectStatus.CONNECT_FAILED -> R.drawable.circle_indicator_red
         status == ConnectStatus.DISCONNECTED -> R.drawable.circle_indicator_blue
         else -> R.drawable.circle_indicator_blue
     }
 
-    val indicatorDescription = if (displayReconnectTunnel) "Reconnect" else when(status) {
-        ConnectStatus.CONNECTED -> "Connected"
-        ConnectStatus.CONNECTING -> "Connecting"
-        ConnectStatus.DESTINATION_SET -> "Connecting"
-        ConnectStatus.DISCONNECTED -> "Disconnected"
-    }
+    // the device tests read the connected and disconnected states from this
+    val indicatorDescription = stringResource(
+        id = if (displayReconnectTunnel) R.string.reconnect else when (status) {
+            ConnectStatus.CONNECTED -> R.string.connected
+            ConnectStatus.CONNECTING -> R.string.connecting_status_indicator
+            ConnectStatus.DESTINATION_SET -> R.string.connecting_status_indicator
+            ConnectStatus.CONNECT_FAILED -> R.string.conn_failed
+            ConnectStatus.DISCONNECTED -> R.string.disconnected
+        }
+    )
 
     // the provider status is the affordance: tapping it opens the per-provider
     // locations detail, while connecting as well as once connected. Any other
@@ -92,6 +104,7 @@ fun ConnectStatusIndicator(
         providerStatus &&
                 !displayReconnectTunnel &&
                 !isPollingSubscriptionBalance &&
+                !dataLimitReached &&
                 !(contractStatus?.insufficientBalance == true && currentPlan != Plan.Supporter)
     }
 
@@ -107,7 +120,9 @@ fun ConnectStatusIndicator(
                 .testTag("acceptance.connect.status")
                 .then(
                     if (showProviderLocations != null) {
-                        Modifier.clickable { showProviderLocations() }
+                        Modifier
+                            .pointerHoverIcon(PointerIcon.Hand)
+                            .clickable { showProviderLocations() }
                     } else {
                         Modifier
                     }
@@ -184,6 +199,23 @@ fun ConnectStatusIndicatorConnected() {
         ConnectStatusIndicator(
             status = ConnectStatus.CONNECTED,
             windowCurrentSize = 32,
+            networkName = "my_network",
+            guestMode = false,
+            displayReconnectTunnel = false,
+            contractStatus = null,
+            currentPlan = Plan.Basic,
+            isPollingSubscriptionBalance = false
+        )
+    }
+}
+
+@Preview
+@Composable
+fun ConnectStatusIndicatorConnectFailed() {
+    URNetworkTheme {
+        ConnectStatusIndicator(
+            status = ConnectStatus.CONNECT_FAILED,
+            windowCurrentSize = 0,
             networkName = "my_network",
             guestMode = false,
             displayReconnectTunnel = false,

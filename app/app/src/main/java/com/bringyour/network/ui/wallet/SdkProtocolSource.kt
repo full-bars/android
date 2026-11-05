@@ -1,9 +1,15 @@
 package com.bringyour.network.ui.wallet
 
+import com.bringyour.network.ui.leaderboard.ProtocolTopMe
+import com.bringyour.network.ui.leaderboard.protocolTopMeOf
+
 import com.bringyour.sdk.DeviceLocal
 import com.bringyour.sdk.Sdk
 import com.bringyour.sdk.SnClaimCallback
+import com.bringyour.sdk.SnClaimRelayAccountList
+import com.bringyour.sdk.SnClaimStatusResult
 import com.bringyour.sdk.SnError
+import com.bringyour.sdk.SnLedgerClaimCallback
 import com.bringyour.sdk.SnWallet
 import com.bringyour.sdk.SnWalletChangeListener
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -31,6 +37,50 @@ class SdkProtocolSource private constructor(
 
         private fun SnError?.toException(): SnProtocolException? =
             this?.let { SnProtocolException(it.code.ifBlank { null }, it.message) }
+
+        // an error leaves the balances unavailable, never zero
+        private fun snClaimStatusOf(result: SnClaimStatusResult) = SnClaimStatusState(
+            relayState = result.relayState,
+            coldkeySs58 = result.coldkeySs58,
+            action = result.action,
+            reason = result.reason,
+            claimableRao = result.claimableRao,
+            valueTaoRao = result.valueTaoRao,
+            pendingRao = result.pendingRao,
+            claimNowAvailable = result.claimNowAvailable,
+            claimNowReason = result.claimNowReason,
+            claimNowNextAtMillis = result.claimNowNextAtMillis,
+            selfClaimAvailable = result.selfClaimAvailable,
+            selfClaimNeedsGas = result.selfClaimNeedsGas,
+            automaticThresholdRao = result.automaticThresholdRao,
+            automaticThresholdTaoRao = result.automaticThresholdTaoRao,
+            transferFloorTaoRao = result.transferFloorTaoRao,
+            claimNowPeriodDays = result.claimNowPeriodDays,
+            showsTile = result.showsTile,
+            showsClaimed = result.showsClaimed,
+            claimTxHash = result.claimTxHash,
+            claimTxUrl = result.claimTxUrl,
+            claimAmountRao = result.claimAmountRao,
+            accounts = snClaimRelayAccountsOf(result.accounts),
+            unavailable = result.error != null,
+        )
+
+        private fun snClaimRelayAccountsOf(list: SnClaimRelayAccountList?): List<SnClaimRelayAccountState> {
+            if (list == null) {
+                return emptyList()
+            }
+            return (0 until list.len()).map { i ->
+                val a = list.get(i)
+                SnClaimRelayAccountState(
+                    coldkeySs58 = a.coldkeySs58,
+                    noId = a.noId,
+                    claimableRao = a.claimableRao,
+                    claimTxHash = a.claimTxHash,
+                    claimTxUrl = a.claimTxUrl,
+                    claimAmountRao = a.claimAmountRao,
+                )
+            }
+        }
     }
 
     override val available: Boolean = true
@@ -174,7 +224,16 @@ class SdkProtocolSource private constructor(
                                 txHash = c.txHash.ifBlank { null },
                             )
                         }
-                        continuation.resume(Result.success(ClaimsSnapshot(claims, result.totalClaimableRao)))
+                        val schedule = result.schedule?.let {
+                            SnEpochScheduleState(
+                                epoch = it.epoch,
+                                endMillis = it.endMillis,
+                                claimOpenMillis = it.claimOpenMillis,
+                                expiryMillis = it.expiryMillis,
+                                epochBlocks = it.epochBlocks,
+                            )
+                        }
+                        continuation.resume(Result.success(ClaimsSnapshot(claims, result.totalClaimableRao, schedule)))
                     }
                 }
             }
@@ -202,6 +261,145 @@ class SdkProtocolSource private constructor(
             }
         })
     }
+
+    override suspend fun ledgerAccounts(): Result<List<SnLedgerAccountState>> {
+        ensureChainSettings()
+        return suspendCancellableCoroutine { continuation ->
+            device.snLedgerAccounts { result, err ->
+                if (!continuation.isActive) {
+                    return@snLedgerAccounts
+                }
+                when {
+                    err != null -> continuation.resume(Result.failure(err))
+                    result == null -> continuation.resume(Result.failure(IllegalStateException("empty ledger accounts")))
+                    result.error != null -> continuation.resume(Result.failure(result.error.toException()!!))
+                    else -> {
+                        val list = result.accounts
+                        val n = list?.len() ?: 0
+                        continuation.resume(
+                            Result.success(
+                                (0 until n).map { i ->
+                                    val a = list.get(i)
+                                    SnLedgerAccountState(
+                                        noId = a.noId,
+                                        index = a.index,
+                                        finalizedRao = a.finalizedRao,
+                                        claimableRao = a.claimableRao,
+                                        paidRao = a.paidRao,
+                                        pending = a.pending,
+                                        pendingRao = a.pendingRao,
+                                    )
+                                }
+                            )
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    // "" until the release configures vault2 (before activation)
+    override fun ledgerClaimConfigured(): Boolean = !device.snChainSettings?.vault2Address.isNullOrBlank()
+
+    override fun ledgerClaim(onEvent: (SnLedgerClaimEvent) -> Unit) {
+        device.snLedgerClaim(object : SnLedgerClaimCallback {
+            override fun sent(noId: Long, index: Long, txHash: String?) {
+                onEvent(SnLedgerClaimEvent.Sent(noId, index, txHash ?: ""))
+            }
+
+            override fun confirmed(noId: Long, index: Long, txHash: String?, amountRao: Long) {
+                onEvent(SnLedgerClaimEvent.Confirmed(noId, index, txHash ?: "", amountRao))
+            }
+
+            override fun failed(noId: Long, index: Long, message: String?) {
+                onEvent(SnLedgerClaimEvent.Failed(noId, index, message ?: ""))
+            }
+
+            override fun done() {
+                onEvent(SnLedgerClaimEvent.Done)
+            }
+        })
+    }
+
+    override suspend fun consentStatus(): Result<SnConsentStatusState> =
+        suspendCancellableCoroutine { continuation ->
+            val api = device.api
+            if (api == null) {
+                continuation.resume(Result.failure(IllegalStateException("no api")))
+                return@suspendCancellableCoroutine
+            }
+            api.snNetworkConsentStatus { result, err ->
+                if (!continuation.isActive) {
+                    return@snNetworkConsentStatus
+                }
+                when {
+                    err != null -> continuation.resume(Result.failure(err))
+                    result == null -> continuation.resume(Result.failure(IllegalStateException("empty consent status")))
+                    else -> continuation.resume(Result.success(SnConsentStatusState(result.active, result.coldkeySs58, result.fromEpoch)))
+                }
+            }
+        }
+
+    // false on a device provisioned with only a client token, and once the server rejected the network's
+    override fun hasNetworkCredential(): Boolean = device.api?.hasNetworkCredential() == true
+
+    override suspend fun consentSession(walletId: String, coldkeySs58: String): Result<BittensorProofSession> {
+        val api = device.api ?: return Result.failure(IllegalStateException("no api"))
+        return startBittensorConsentSession(api, walletId, coldkeySs58)
+    }
+
+    override suspend fun consentSubmit(coldkeySs58: String, message: String, signature: String): Result<Unit> =
+        suspendCancellableCoroutine { continuation ->
+            val api = device.api
+            if (api == null) {
+                continuation.resume(Result.failure(IllegalStateException("no api")))
+                return@suspendCancellableCoroutine
+            }
+            api.snNetworkConsentSubmit(coldkeySs58, message, signature) { result, err ->
+                if (!continuation.isActive) {
+                    return@snNetworkConsentSubmit
+                }
+                when {
+                    err != null -> continuation.resume(Result.failure(err))
+                    result == null -> continuation.resume(Result.failure(IllegalStateException("empty consent submit")))
+                    // signature_mismatch: a well-formed signature that is not the coldkey's
+                    result.error != null -> continuation.resume(
+                        Result.failure(SnProtocolException(result.error.code.ifBlank { null }, result.error.message))
+                    )
+                    else -> continuation.resume(Result.success(Unit))
+                }
+            }
+        }
+
+    override suspend fun claimStatus(): SnClaimStatusState? =
+        suspendCancellableCoroutine { continuation ->
+            device.snClaimStatus { result, _ ->
+                // copied off the gomobile objects here: an exception thrown out
+                // of the callback cannot cross JNI and aborts the process
+                val status = runCatching { result?.let { snClaimStatusOf(it) } }.getOrNull()
+                if (continuation.isActive) {
+                    continuation.resume(status)
+                }
+            }
+        }
+
+    override suspend fun claimNow(coldkeySs58: String): SnClaimNowOutcome =
+        suspendCancellableCoroutine { continuation ->
+            device.snClaimNow(coldkeySs58) { result, err ->
+                val outcome = runCatching {
+                    when {
+                        err != null -> SnClaimNowOutcome.Failed(err.message ?: "")
+                        result == null -> SnClaimNowOutcome.Failed("")
+                        result.error != null -> SnClaimNowOutcome.Failed("${result.error.code}: ${result.error.message}")
+                        result.requested -> SnClaimNowOutcome.Requested
+                        else -> SnClaimNowOutcome.Refused(result.reason, result.nextAtMillis)
+                    }
+                }.getOrElse { SnClaimNowOutcome.Failed(it.message ?: "") }
+                if (continuation.isActive) {
+                    continuation.resume(outcome)
+                }
+            }
+        }
 
     override suspend fun accountEpochs(): Result<List<AccountEpoch>> =
         suspendCancellableCoroutine { continuation ->
@@ -234,38 +432,24 @@ class SdkProtocolSource private constructor(
             }
         }
 
-    override suspend fun head(): Result<SnHeadState?> =
+    override suspend fun topMe(): Result<ProtocolTopMe?> =
         suspendCancellableCoroutine { continuation ->
             val api = device.api
             if (api == null) {
                 continuation.resume(Result.failure(IllegalStateException("no api")))
                 return@suspendCancellableCoroutine
             }
-            api.snHead { result, err ->
-                if (!continuation.isActive) {
-                    return@snHead
+            api.snTopMe { result, err ->
+                // copied off the gomobile objects here: an exception thrown out of
+                // the callback cannot cross JNI and aborts the process
+                val answer: Result<ProtocolTopMe?> = runCatching {
+                    if (err != null) {
+                        throw err
+                    }
+                    result?.let(::protocolTopMeOf)
                 }
-                when {
-                    err != null -> continuation.resume(Result.failure(err))
-                    result == null -> continuation.resume(Result.success(null))
-                    result.error != null -> continuation.resume(Result.failure(result.error.toException()!!))
-                    else -> continuation.resume(
-                        Result.success(
-                            SnHeadState(
-                                eligible = result.eligible,
-                                score = result.score,
-                                floor = result.floor,
-                                rankEstimate = result.rankEstimate,
-                                cutoff = result.cutoff,
-                                bound = result.bound,
-                                hotkey = result.hotkey.ifBlank { null },
-                                uid = result.uid,
-                                rank = result.rank,
-                                epoch = result.epoch,
-                                source = result.source,
-                            )
-                        )
-                    )
+                if (continuation.isActive) {
+                    continuation.resume(answer)
                 }
             }
         }

@@ -28,7 +28,6 @@ import com.android.billingclient.api.ProductDetailsResult
 import com.android.billingclient.api.QueryProductDetailsParams
 import com.android.billingclient.api.queryProductDetails
 import com.bringyour.network.ui.MainNavHost
-import com.bringyour.network.ui.components.overlays.OverlayMode
 import com.bringyour.network.ui.settings.SettingsViewModel
 import com.bringyour.network.ui.shared.models.BundleStore
 import com.bringyour.network.ui.shared.viewmodels.OverlayViewModel
@@ -211,8 +210,9 @@ class MainActivity: AppCompatActivity() {
         if (subscriptionUpgradeSuccess) {
             subscriptionUpgradeSuccess = false
             intent.removeExtra("UPGRADE_SUBSCRIPTION_SUCCESS")
-            overlayViewModel.launch(OverlayMode.Upgrade)
-            subscriptionBalanceViewModel.pollSubscriptionBalance()
+            // a checkout returned through the login deep link: the overlay follows the
+            // server's confirmation (MainNavHost purchaseConfirmedSequence)
+            subscriptionBalanceViewModel.confirmPurchase()
         }
     }
 
@@ -334,7 +334,7 @@ class MainActivity: AppCompatActivity() {
         }
 
         // the offer for the plan the user picked (yearly by default)
-        val offer = offerForPlan(productDetails.subscriptionOfferDetails ?: emptyList(), planViewModel.selectedPlan)
+        val offer = offerForPlan(productDetails.subscriptionOfferDetails ?: emptyList(), planViewModel.selectedPlan, planViewModel.preferredOfferTag)
 
         if (offer == null) {
 
@@ -373,6 +373,15 @@ class MainActivity: AppCompatActivity() {
                 planViewModel.setChangePlanError(
                     "Billing flow error: ${billingResult?.responseCode} ${billingResult?.debugMessage}"
                 )
+                planViewModel.pendingPurchaseEvent?.let {
+                    planViewModel.pendingPurchaseEvent = null
+                    com.bringyour.network.analytics.ClientEvents.purchaseFailed(
+                        com.bringyour.sdk.Sdk.EventStorePlay,
+                        com.bringyour.network.analytics.ClientEvents.PRODUCT_PLAY_SUPPORTER,
+                        it.plan, it.trial, it.price, it.currency,
+                        "play_launch_${billingResult?.responseCode}",
+                    )
+                }
                 planViewModel.setInProgress(false)
             }
         }

@@ -3,6 +3,9 @@ package com.bringyour.network
 import android.content.Context
 import android.content.Intent
 import android.net.VpnService
+import com.bringyour.network.ui.connect.SdkConnectDevice
+import com.bringyour.network.ui.connect.connectRequested
+import com.bringyour.network.ui.connect.runOnDevice
 
 /**
  * The one connect/disconnect path behind every quick connect surface: the
@@ -15,7 +18,18 @@ import android.net.VpnService
  *
  * Everything runs in the app process next to the SDK, so there is no IPC and
  * no shared intent record to keep: the SDK local state the connect screen
- * reads is the same one these surfaces write.
+ * reads is the same one these surfaces write. The connect or disconnect runs
+ * on the connect command queue with the connect screen's, off the main thread
+ * and in tap order (ConnectCommands), and until it has run the surfaces show
+ * what it asks for.
+ *
+ * A connect goes through the same start connect gate as the connect screen
+ * (MainApplication.checkStartConnect): out of balance it does not start the
+ * tunnel and the surface opens the upgrade screen. The gate may first fetch
+ * a fresh balance, so the result is delivered to a callback (main thread),
+ * and the surfaces show connecting meanwhile (StartConnect): a tap on
+ * the connecting tile or widget button ends the wait. A connection already
+ * requested is left as is and never waits on the gate.
  */
 object QuickConnect {
 
@@ -30,37 +44,107 @@ object QuickConnect {
         NEEDS_CONSENT,
         /** Logged out, or the device is not initialized yet: only the app can help. */
         NEEDS_APP,
+        /**
+         * Out of balance: the connect was not started. The upgrade screen is
+         * requested; the surface opens the app to show it.
+         */
+        NEEDS_UPGRADE,
     }
 
     /** The app has a signed-in device to drive. */
     fun isConfigured(app: MainApplication): Boolean = app.device != null
 
-    /** The tile's notion of "on": the user asked for a connection. */
-    fun isConnected(app: MainApplication): Boolean = app.device?.connectEnabled == true
+    /**
+     * The tile's notion of "on": the user asked for a connection, also by a
+     * command the queue has not run yet.
+     */
+    fun isConnected(app: MainApplication): Boolean =
+        app.device?.let { app.connectCommands.connectRequested(SdkConnectDevice(it)) } == true
 
-    fun toggle(app: MainApplication, source: String): Result =
-        setConnected(app, connect = !isConnected(app), source = source)
+    /**
+     * What the tile's subtitle and the dashboard widget's title say about the
+     * connection: connected only once the window holds its providers and the
+     * tunnel is up, else connecting, couldn't connect or the tunnel down, as
+     * the connect screen says it (quickConnectStatus). Reads the device: any
+     * thread.
+     */
+    internal fun status(app: MainApplication): com.bringyour.network.ui.connect.QuickConnectStatus {
+        val device = app.device ?: return com.bringyour.network.ui.connect.QuickConnectStatus.NOT_SIGNED_IN
+        val pending = app.connectCommands.pending(device)
+        val windowStatus = device.windowStatus
+        return com.bringyour.network.ui.connect.quickConnectStatus(
+            configured = true,
+            requested = pending ?: device.connectEnabled,
+            startWaiting = app.startConnect.waiting,
+            connectQueued = pending == true,
+            minSatisfied = windowStatus?.minSatisfied == true,
+            failed = windowStatus?.failed == true,
+            addedProviderCount = (windowStatus?.providerStateAdded ?: 0L).coerceIn(0L, Int.MAX_VALUE.toLong()).toInt(),
+            locationProviderCount = device.connectLocation?.providerCount ?: 0,
+            tunnelStarted = device.tunnelStarted,
+        )
+    }
 
-    fun setConnected(app: MainApplication, connect: Boolean, source: String): Result {
+    /** What the surfaces show: on, connecting while a start waits on its balance, or off. */
+    internal fun shown(app: MainApplication): com.bringyour.network.ui.connect.QuickConnectShown =
+        com.bringyour.network.ui.connect.quickConnectShown(
+            connectEnabled = isConnected(app),
+            startWaiting = app.startConnect.waiting,
+        )
+
+    /** Connecting shows as on: a tap on it is the user's disconnect, which ends the wait. */
+    fun toggle(app: MainApplication, source: String, onResult: (Result) -> Unit) =
+        setConnected(
+            app,
+            connect = shown(app) == com.bringyour.network.ui.connect.QuickConnectShown.OFF,
+            source = source,
+            onResult = onResult,
+        )
+
+    fun setConnected(app: MainApplication, connect: Boolean, source: String, onResult: (Result) -> Unit) {
+        val device = app.device ?: return onResult(Result.NEEDS_APP)
+        app.startConnect.request(
+            connectEnabled = app.connectCommands.connectRequested(SdkConnectDevice(device)),
+            connect = connect,
+            apply = { blocked -> apply(app, connect, blocked, source) },
+            // the start already waiting answers for this tap
+            waiting = { Result.APPLIED },
+            // a disconnect or sign out ended this start: nothing to open
+            ended = { Result.APPLIED },
+            onResult = onResult,
+        )
+    }
+
+    private fun apply(app: MainApplication, connect: Boolean, startConnectBlocked: Boolean, source: String): Result {
         val device = app.device ?: return Result.NEEDS_APP
-        if (device.connectEnabled == connect) {
-            return if (connect && VpnService.prepare(app) != null) Result.NEEDS_CONSENT else Result.APPLIED
+        val connectDevice = SdkConnectDevice(device)
+        val step = com.bringyour.network.ui.connect.quickConnectStep(
+            connectEnabled = app.connectCommands.connectRequested(connectDevice),
+            connect = connect,
+            startConnectBlocked = startConnectBlocked,
+        )
+        if (com.bringyour.network.ui.connect.quickConnectClearsBalanceRecovery(connect, step)) {
+            // the user's own connect or disconnect replaces any wait, also a
+            // disconnect with nothing connected (a tap on the connecting tile)
+            app.clearBalanceRecovery()
         }
-        val vc = device.openConnectViewController() ?: return Result.NEEDS_APP
-        try {
-            if (connect) {
-                val location = device.connectLocation
-                if (location != null) {
-                    vc.connect(location)
-                } else {
-                    vc.connectBestAvailable()
-                }
-            } else {
-                vc.disconnect()
+        when (step) {
+            com.bringyour.network.ui.connect.QuickConnectStep.NONE ->
+                return if (connect && VpnService.prepare(app) != null) Result.NEEDS_CONSENT else Result.APPLIED
+            com.bringyour.network.ui.connect.QuickConnectStep.UPGRADE -> {
+                android.util.Log.i("QuickConnect", "connect from $source blocked: insufficient balance")
+                // the connect waits on the balance and is retried once it is back
+                app.startConnectBlocked(device.connectLocation)
+                return Result.NEEDS_UPGRADE
             }
-        } finally {
-            device.closeViewController(vc)
+            com.bringyour.network.ui.connect.QuickConnectStep.CONNECT,
+            com.bringyour.network.ui.connect.QuickConnectStep.DISCONNECT -> {}
         }
+        // to the saved location, else the best available provider, read with
+        // the command on the queue
+        // the user's own connect lifts the revoke fence
+        if (connect) app.clearVpnRevokeFence()
+        app.connectCommands.runOnDevice(connectDevice, connect)
         android.util.Log.i("QuickConnect", "${if (connect) "connect" else "disconnect"} from $source")
         if (connect && VpnService.prepare(app) != null) {
             return Result.NEEDS_CONSENT

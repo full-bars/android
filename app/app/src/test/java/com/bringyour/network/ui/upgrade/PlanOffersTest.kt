@@ -7,59 +7,83 @@ import org.junit.Test
 
 class PlanOffersTest {
 
-    private val monthly = PlanOffer(index = 0, periodDays = 30, freeDays = 0)
-    private val yearlyPlain = PlanOffer(index = 1, periodDays = 365, freeDays = 0)
-    private val yearlyTrial = PlanOffer(index = 2, periodDays = 365, freeDays = 14)
+    private val base = PlanOffer(index = 0, periodDays = 365, freeDays = 0)
+    private val trial = PlanOffer(index = 1, periodDays = 365, freeDays = 14)
+    private val welcome = PlanOffer(index = 2, periodDays = 365, freeDays = 14, tags = listOf("onboarding25"))
+    private val monthly = PlanOffer(index = 3, periodDays = 30, freeDays = 0)
+    private val monthlyBase = PlanOffer(index = 4, periodDays = 30, freeDays = 0, basePlan = true)
+    private val winback = PlanOffer(index = 5, periodDays = 30, freeDays = 0, tags = listOf("winback-monthly-50"))
 
     @Test
-    fun monthlyOnlyStoreHasNoYearlyAndNoTrial() {
-        val offers = listOf(monthly)
-        assertNull(PlanOffers.yearly(offers))
-        assertEquals(0, PlanOffers.trialDays(offers))
-        // the yearly plan cannot be bought: the purchase reports that instead of selling monthly
-        assertNull(PlanOffers.forPlan(offers, PlanType.YEARLY))
-        assertEquals(monthly, PlanOffers.forPlan(offers, PlanType.MONTHLY))
+    fun yearlyPrefersTheWelcomeOfferTagWhileTheOfferIsActive() {
+        val offers = listOf(base, trial, welcome, monthly)
+        assertEquals(welcome, PlanOffers.yearly(offers, preferTag = "onboarding25"))
+        assertEquals(welcome, PlanOffers.forPlan(offers, PlanType.YEARLY, preferTag = "onboarding25"))
     }
 
     @Test
-    fun yearlyWithoutAFreePhasePromisesNoTrial() {
-        val offers = listOf(monthly, yearlyPlain)
-        assertEquals(yearlyPlain, PlanOffers.yearly(offers))
-        assertEquals(0, PlanOffers.trialDays(offers))
-        assertEquals(yearlyPlain, PlanOffers.forPlan(offers, PlanType.YEARLY))
+    fun yearlyFallsBackToTheTrialOfferWithoutATagOrWhenPlayDoesNotListIt() {
+        assertEquals(trial, PlanOffers.yearly(listOf(base, trial, welcome, monthly)))
+        assertEquals(trial, PlanOffers.yearly(listOf(base, trial, monthly), preferTag = "onboarding25"))
+        assertEquals(trial, PlanOffers.yearly(listOf(base, trial, monthly), preferTag = ""))
     }
 
     @Test
-    fun theTrialOfferWinsOverThePlainBasePlanWhateverTheOrder() {
-        // the base plan is listed first, the trial offer after it
-        val offers = listOf(monthly, yearlyPlain, yearlyTrial)
-        assertEquals(yearlyTrial, PlanOffers.yearly(offers))
-        assertEquals(14, PlanOffers.trialDays(offers))
-        assertEquals(yearlyTrial, PlanOffers.forPlan(offers, PlanType.YEARLY))
-
-        // and the other way round
-        val reversed = listOf(yearlyTrial.copy(index = 0), yearlyPlain.copy(index = 1), monthly.copy(index = 2))
-        assertEquals(0, PlanOffers.yearly(reversed)?.index)
-        assertEquals(14, PlanOffers.trialDays(reversed))
+    fun yearlyFallsBackToTheBasePlanWithoutATrial() {
+        assertEquals(base, PlanOffers.yearly(listOf(base, monthly)))
+        assertEquals(0, PlanOffers.trialDays(listOf(base, monthly)))
     }
 
     @Test
-    fun monthlyIsNeverPromisedATrialAndIsPickedByItsPeriod() {
-        val monthlyTrial = PlanOffer(index = 3, periodDays = 30, freeDays = 7)
-        val offers = listOf(yearlyTrial, monthlyTrial)
-        assertEquals(yearlyTrial, PlanOffers.forPlan(offers, PlanType.YEARLY))
-        assertEquals(monthlyTrial, PlanOffers.forPlan(offers, PlanType.MONTHLY))
-        // the trial the picker shows is the yearly plan's, never the monthly one's
-        assertEquals(14, PlanOffers.trialDays(offers))
+    fun monthlyNeverTakesTheYearlyOffersAndTheTagNeverAppliesToIt() {
+        val offers = listOf(base, trial, welcome, monthly)
+        assertEquals(monthly, PlanOffers.forPlan(offers, PlanType.MONTHLY, preferTag = "onboarding25"))
+        assertNull(PlanOffers.monthly(listOf(base, trial, welcome)))
     }
 
     @Test
-    fun unknownPeriodsAreNeitherPlan() {
-        val unknown = PlanOffer(index = 0, periodDays = 0, freeDays = 0)
-        assertNull(PlanOffers.yearly(listOf(unknown)))
-        assertNull(PlanOffers.monthly(listOf(unknown)))
-        assertNull(PlanOffers.forPlan(listOf(unknown), PlanType.YEARLY))
-        assertEquals(0, PlanOffers.trialDays(emptyList()))
-        assertNull(PlanOffers.forPlan(emptyList(), PlanType.MONTHLY))
+    fun monthlyPrefersTheWinbackOfferTagWhileTheOfferIsActive() {
+        val offers = listOf(base, trial, welcome, winback, monthlyBase)
+        assertEquals(winback, PlanOffers.monthly(offers, preferTag = "winback-monthly-50"))
+        assertEquals(winback, PlanOffers.forPlan(offers, PlanType.MONTHLY, preferTag = "winback-monthly-50"))
+    }
+
+    @Test
+    fun monthlyNeverBuysTheWinbackOfferWithoutItsTagEvenWhenPlayListsItFirst() {
+        // Play lists a developer-determined offer to every account
+        val offers = listOf(winback, monthlyBase)
+        assertEquals(monthlyBase, PlanOffers.monthly(offers))
+        assertEquals(monthlyBase, PlanOffers.monthly(offers, preferTag = ""))
+        assertEquals(monthlyBase, PlanOffers.forPlan(offers, PlanType.MONTHLY, preferTag = "onboarding25"))
+        // the tagged offer alone is nothing to sell without its tag
+        assertNull(PlanOffers.monthly(listOf(winback)))
+    }
+
+    @Test
+    fun monthlyFallsBackToTheBasePlanWhenPlayDoesNotListTheTag() {
+        assertEquals(monthlyBase, PlanOffers.monthly(listOf(base, trial, monthlyBase), preferTag = "winback-monthly-50"))
+        assertEquals(monthlyBase, PlanOffers.forPlan(listOf(base, trial, monthlyBase), PlanType.MONTHLY, preferTag = "winback-monthly-50"))
+    }
+
+    @Test
+    fun yearlyNeverBuysTheWelcomeOfferWithoutItsTag() {
+        // an account Play lists no trial offer to (it had one before) still
+        // sees the developer-determined welcome offer, possibly first
+        assertEquals(base, PlanOffers.yearly(listOf(welcome, base)))
+        val welcomeWithoutTrial = PlanOffer(index = 2, periodDays = 365, freeDays = 0, tags = listOf("onboarding25"))
+        assertEquals(base, PlanOffers.yearly(listOf(welcomeWithoutTrial, base)))
+        assertEquals(0, PlanOffers.trialDays(listOf(welcome, base)))
+        // the win-back tag never reaches the yearly plan
+        assertEquals(trial, PlanOffers.forPlan(listOf(welcome, trial, base), PlanType.YEARLY, preferTag = "winback-monthly-50"))
+    }
+
+    @Test
+    fun aBasePlansTagsAreNotItsOffersOwn() {
+        assertEquals(listOf("winback-monthly-50"), PlanOffers.ownTags(listOf("monthly", "winback-monthly-50"), setOf("monthly")))
+        assertEquals(emptyList<String>(), PlanOffers.ownTags(listOf("monthly"), setOf("monthly")))
+        assertEquals(listOf("onboarding25"), PlanOffers.ownTags(listOf("onboarding25"), emptySet()))
+        // a tagged base plan is still the base plan
+        val taggedBase = PlanOffer(index = 0, periodDays = 30, freeDays = 0, tags = listOf("monthly"), basePlan = true)
+        assertEquals(taggedBase, PlanOffers.monthly(listOf(winback, taggedBase)))
     }
 }

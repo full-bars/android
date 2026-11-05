@@ -12,20 +12,38 @@ import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.VpnService
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
 import android.os.ext.SdkExtensions
+import android.telephony.SignalStrength
+import android.telephony.TelephonyCallback
+import android.telephony.TelephonyDisplayInfo
+import android.telephony.TelephonyManager
 import android.util.Log
+import com.bringyour.network.analytics.WHITELIST_PROBE_HTTP_TIMEOUT_MILLIS
+import com.bringyour.network.analytics.WHITELIST_PROBE_LOG_TAG
+import com.bringyour.network.analytics.WhitelistProbeStep
+import java.net.HttpURLConnection
+import java.net.URL
 import androidx.core.content.ContextCompat
+import androidx.annotation.RequiresApi
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.work.WorkManager
 import com.bringyour.network.location.MockLocationController
 import com.bringyour.network.location.MockLocationFeeder
+import com.bringyour.network.ui.login.SignInNotices
+import com.bringyour.network.ui.login.SsoProvider
+import com.bringyour.network.ui.login.ssoOAuthAttempts
+import com.bringyour.network.ui.login.toVerifySendError
 import com.bringyour.network.ui.shared.models.ProvideNetworkMode
+import com.bringyour.network.ui.shared.viewmodels.pendingSolanaPaymentStore
+import com.bringyour.network.ui.wallet.BittensorBridgeReturns
 import com.bringyour.sdk.DeviceLocal
 import com.bringyour.sdk.LocalState
 import com.bringyour.sdk.LoginViewController
@@ -37,16 +55,70 @@ import java.io.File
 import java.lang.ref.WeakReference
 import javax.inject.Inject
 import kotlin.math.min
+import com.bringyour.network.ui.connect.connectRequested
+import com.bringyour.network.ui.connect.runOnDevice
+
+@RequiresApi(Build.VERSION_CODES.S)
+private class DefaultNetworkTelephonyCallback(
+    private val tracker: DefaultCellularQualityTracker,
+    private val onChanged: () -> Unit,
+) : TelephonyCallback(),
+    TelephonyCallback.SignalStrengthsListener,
+    TelephonyCallback.DisplayInfoListener {
+    override fun onSignalStrengthsChanged(signalStrength: SignalStrength) {
+        if (tracker.onSignalLevel(signalStrength.level)) onChanged()
+    }
+
+    override fun onDisplayInfoChanged(telephonyDisplayInfo: TelephonyDisplayInfo) {
+        if (
+            tracker.onNetworkType(
+                telephonyDisplayInfo.networkType,
+                telephonyDisplayInfo.overrideNetworkType,
+            )
+        ) {
+            onChanged()
+        }
+    }
+}
 
 
 @HiltAndroidApp
 class MainApplication : Application() {
-    private companion object {
+    internal companion object {
         const val VPN_STATE_BURST_COALESCE_MILLIS = 20L
-        // Match the iOS packet-tunnel process budget so Android physical runs
-        // expose the same SDK pressure/failure boundary. DeviceManager already
-        // passes the matching iOS per-device steady target (24 MiB).
-        const val SDK_PROCESS_MEMORY_LIMIT_MIB = 32L
+        // distinct from MainService.NOTIFICATION_ID so it outlives the service notification
+        const val INSUFFICIENT_BALANCE_NOTIFICATION_ID = 102
+        // a return to the foreground after this long starts a new product-event session
+        const val CLIENT_EVENT_SESSION_GAP_MILLIS = 30L * 60L * 1000L
+        // how long logout waits for the pending product events to send
+        const val CLIENT_EVENT_LOGOUT_DRAIN_MILLIS = 1500L
+        // the device type every request of the api reports (Api.SetClientInfo)
+        const val CLIENT_INFO_DEVICE_TYPE = "android"
+        // Admission scales with the effective process allowance. The debug
+        // iOS surrogate mirrors the extension's 32/32-MiB target/soft limit;
+        // v1 remains an explicit historical 20/32-MiB comparison profile.
+        const val IOS_MEMORY_AUDIT_PROFILE = "ios-memory-audit-v2"
+        const val LEGACY_IOS_MEMORY_AUDIT_PROFILE = "ios-memory-audit-v1"
+        val MEMORY_PROFILE_NAME: String
+            get() = if (BuildConfig.DEBUG && (BuildConfig.URNETWORK_MEMORY_PROFILE == IOS_MEMORY_AUDIT_PROFILE ||
+                BuildConfig.URNETWORK_MEMORY_PROFILE == LEGACY_IOS_MEMORY_AUDIT_PROFILE)) {
+                BuildConfig.URNETWORK_MEMORY_PROFILE
+            } else {
+                "android"
+            }
+        internal fun processMemoryLimitMib(profile: String): Long =
+            if (profile == IOS_MEMORY_AUDIT_PROFILE || profile == LEGACY_IOS_MEMORY_AUDIT_PROFILE) 32L else 64L
+        internal fun effectiveProcessMemoryLimitMib(profile: String, memoryClassMib: Int?): Long {
+            val maxMemoryMib = memoryClassMib?.takeIf { it > 0 }?.toLong() ?: 32L
+            return min((3 * maxMemoryMib) / 4, processMemoryLimitMib(profile))
+        }
+        val SDK_PROCESS_MEMORY_LIMIT_MIB: Long
+            get() = processMemoryLimitMib(MEMORY_PROFILE_NAME)
+        // Published before NetworkSpace/DeviceLocal construction. Keep the
+        // fallback conservative if a consumer reads it before onCreate.
+        @Volatile
+        var SDK_EFFECTIVE_PROCESS_MEMORY_LIMIT_MIB: Long = effectiveProcessMemoryLimitMib(MEMORY_PROFILE_NAME, null)
+            private set
         // Stable platform capability id since API 30. The framework exposes it
         // to system code only, but public hasCapability(Int) reports it to VPN
         // apps as part of ordinary NetworkCapabilities callbacks.
@@ -87,13 +159,13 @@ class MainApplication : Application() {
         }
     }
 
-    // the exact os version, always NUMERIC ("17", "16.1"), never a dev
+    // the exact os version, always numeric ("17", "16.1"), never a dev
     // codename. RELEASE is major-only on modern android ("16"); older builds
     // carried the point ("8.1.0"). From android 16 (api 36) the minor os
     // revision is exposed through the full sdk version — append it so the spec
     // reads "16.1" like the ios side's point versions.
     //
-    // NOTE: use RELEASE, not RELEASE_OR_CODENAME. On a preview/beta build the
+    // use RELEASE, not RELEASE_OR_CODENAME. On a preview/beta build the
     // latter returns the dev codename (e.g. "CinnamonBun" on the Android 17
     // preview), producing nonsense like "CinnamonBun.1"; RELEASE stays numeric
     // ("17") on those builds. If RELEASE is ever non-numeric (very early dev
@@ -131,6 +203,9 @@ class MainApplication : Application() {
 
 //    var byDevice: BringYourDevice? = null
     var deviceProvideSub: Sub? = null
+    var deviceProvideModeSub: Sub? = null
+    /** True while the operator's intent says provide and no provider is up. */
+    var provideIntentWithoutProvider: Boolean = false
     var deviceProvidePausedSub: Sub? = null
 
     var deviceProvideNetworkSub: Sub? = null
@@ -144,6 +219,7 @@ class MainApplication : Application() {
     var networkCallback: ConnectivityManager.NetworkCallback? = null
     var offlineCallback: ConnectivityManager.NetworkCallback? = null
     var defaultNetworkCallback: ConnectivityManager.NetworkCallback? = null
+    private var defaultNetworkTelephonyCallback: Any? = null
     var powerSaveReceiver: BroadcastReceiver? = null
     var networkPolicyReceiver: BroadcastReceiver? = null
     private var thermalStatusRegistration: ThermalStatusRegistration? = null
@@ -155,8 +231,17 @@ class MainApplication : Application() {
     private var thermalDegraded = false
     private var dataSaverDegraded = false
     private var defaultNetworkDegraded = false
+    // the physical default's own NOT_METERED (see addDefaultNetworkCallback);
+    // null while no physical default is tracked
+    private var defaultNetworkMetered: Boolean? = null
     private var performanceDegradedDevice: DeviceLocal? = null
     private var performanceDegradedApplied: Boolean? = null
+
+    // main-looper confined; the pause sources that device.providePaused is
+    // decided from together (see updateProvidePaused)
+    private var provideNetworkAvailable = false
+    private var providePowerSave = false
+    private var provideBattery = BatteryPowerFacts.Unknown
 
     var loginVc: LoginViewController? = null
 
@@ -164,11 +249,16 @@ class MainApplication : Application() {
     val loginStartupTracker = LoginStartupTracker()
     val loginStartupState get() = loginStartupTracker.state
 
+    // Main-looper confined. An accepted login owns auth before it has a device;
+    // pending requests alone do not replace the serving session.
+    private var authSessionOwner = Any()
+    private var activeLoginRequest: LoginRequest? = null
+
     private val loginClientCoordinator by lazy(LazyThreadSafetyMode.NONE) {
         LoginClientCoordinator(
             tracker = loginStartupTracker,
             requester = AuthClientRequester { callback ->
-                val currentApi = api
+                val currentApi = activeLoginRequest?.takeIf(::isPendingLoginRequest)?.api
                 if (currentApi == null) {
                     callback(
                         AuthClientWireResult(
@@ -182,6 +272,10 @@ class MainApplication : Application() {
                     val args = com.bringyour.sdk.AuthNetworkClientArgs().apply {
                         deviceDescription = this@MainApplication.deviceDescription
                         deviceSpec = this@MainApplication.deviceSpec
+                        // the onboarding campaign sends in the user's local morning and
+                        // in their language: the zone and locale travel with every auth
+                        timeZone = java.util.TimeZone.getDefault().id
+                        locale = java.util.Locale.getDefault().toLanguageTag()
                     }
                     currentApi.authNetworkClient(args) { result, error ->
                         val resultError = result?.error
@@ -216,7 +310,8 @@ class MainApplication : Application() {
         PasswordLoginCoordinator(
             tracker = loginStartupTracker,
             requester = PasswordAuthRequester { userAuth, password, callback ->
-                val currentApi = api
+                val request = captureLoginRequest(loginStartupState.value.attemptId)
+                val currentApi = request?.api
                 if (currentApi == null) {
                     callback(
                         PasswordAuthWireResult(
@@ -237,6 +332,8 @@ class MainApplication : Application() {
                                 PasswordAuthWireResult(
                                     byJwt = it.network?.byJwt,
                                     verificationUserAuth = it.verificationRequired?.userAuth,
+                                    verificationSendError =
+                                        it.verificationRequired?.sendError?.toVerifySendError(),
                                     failure = if (resultError == null) {
                                         null
                                     } else {
@@ -263,8 +360,13 @@ class MainApplication : Application() {
                     }
                 }
             },
-            sessionAuthenticator = NetworkSessionAuthenticator { byJwt, newNetwork, completion ->
-                authenticateNetworkSession(byJwt, newNetwork, completion)
+            sessionAuthenticator = NetworkSessionAuthenticator { attemptId, byJwt, newNetwork, completion ->
+                val request = activeLoginRequest?.takeIf { it.attemptId == attemptId }
+                if (request == null) {
+                    completion(LoginClientCompletion.Failed(LoginStartupFailure.STALE_ATTEMPT))
+                } else {
+                    authenticateNetworkSession(request, byJwt, newNetwork, completion)
+                }
             },
             dispatch = ::dispatchLoginAction,
         )
@@ -274,7 +376,43 @@ class MainApplication : Application() {
         if (android.os.Looper.myLooper() == mainLooper) action() else mainHandler.post(action)
     }
 
-    internal fun dispatchLoginResult(action: () -> Unit) = dispatchLoginAction(action)
+    /** Capture before the outer API call, never when its response arrives. */
+    fun beginLoginRequest(): LoginRequest? =
+        captureLoginRequest(loginStartupTracker.begin(LoginStartupStage.NETWORK_SESSION_PERSISTENCE))
+
+    private fun captureLoginRequest(attemptId: Long?): LoginRequest? {
+        if (attemptId == null || !loginStartupTracker.isActive(attemptId)) return null
+        val space = networkSpaceManagerProvider.getNetworkSpace() ?: return null
+        if (networkSpaceManagerProvider.getNetworkSpaceManager()?.activeNetworkSpace?.same(space) != true) return null
+        activeLoginRequest?.takeIf { it.attemptId == attemptId && it.networkSpace === space }?.let { return it }
+        val requestApi = space.api ?: return null
+        val state = space.asyncLocalState?.localState ?: return null
+        return LoginRequest(attemptId, space, requestApi, state).also { activeLoginRequest = it }
+    }
+
+    fun ownsLoginRequest(request: LoginRequest): Boolean =
+        activeLoginRequest === request &&
+            networkSpaceManagerProvider.getNetworkSpace() === request.networkSpace &&
+            networkSpaceManagerProvider.getNetworkSpaceManager()?.activeNetworkSpace?.same(request.networkSpace) == true &&
+            loginStartupState.value.attemptId == request.attemptId
+
+    fun isCurrentLoginRequest(request: LoginRequest): Boolean =
+        ownsLoginRequest(request) &&
+            (loginStartupState.value is LoginStartupState.Pending || loginStartupState.value is LoginStartupState.Ready)
+
+    private fun isPendingLoginRequest(request: LoginRequest): Boolean =
+        isCurrentLoginRequest(request) && loginStartupTracker.isActive(request.attemptId)
+
+    fun dispatchLoginResult(request: LoginRequest, action: () -> Unit) {
+        dispatchLoginAction {
+            if (isPendingLoginRequest(request) && request.resultConsumed.compareAndSet(false, true)) action()
+        }
+    }
+
+    // A nested local-state parse continues an already admitted server result.
+    internal fun dispatchLoginContinuation(request: LoginRequest, action: () -> Unit) {
+        dispatchLoginAction { if (isPendingLoginRequest(request)) action() }
+    }
 
     @Inject
     lateinit var deviceManager: DeviceManager
@@ -287,6 +425,9 @@ class MainApplication : Application() {
 
     @Inject
     lateinit var mockLocationFeeder: MockLocationFeeder
+
+    @Inject
+    lateinit var providePauseState: ProvidePauseState
 
     var vpnRequestStart: Boolean = false
         private set
@@ -312,7 +453,11 @@ class MainApplication : Application() {
 //    private var connectEnabled: Boolean = false
 
     private val mainHandler by lazy(LazyThreadSafetyMode.NONE) { Handler(mainLooper) }
-    private val tunnelRecoveryPolicy = TunnelRecoveryPolicy()
+    // Timing lives on these settings, with the shipped values as defaults;
+    // nothing in the recovery or tunnel path reads a timing constant.
+    private val tunnelRecoveryPolicy = TunnelRecoveryPolicy(TunnelRecoverySettings())
+    /** Read by MainService for its TUN retries and here for the Always-on connect retry. */
+    internal val vpnTunnelTimingSettings = VpnTunnelTimingSettings()
     private var pendingTransportRecovery: Runnable? = null
     private var pendingWakeStart: Runnable? = null
     private var pendingWakeHealthAudit: Runnable? = null
@@ -322,11 +467,64 @@ class MainApplication : Application() {
     private var processLifecycleObserver: DefaultLifecycleObserver? = null
     private var userUnlockReceiver: BroadcastReceiver? = null
     private val directBootState by lazy(LazyThreadSafetyMode.NONE) { DirectBootState(this) }
+    private val revokeFence by lazy { VpnRevokeFence(this) }
+
+    /** Whether `entry` may bring the VPN back now (see [VpnReconnectEntry]). */
+    internal fun vpnReconnectPermitted(entry: VpnReconnectEntry): Boolean =
+        vpnReconnectAllowed(entry, revokeFence.raised)
+
+    internal fun vpnRevokeFenced(): Boolean = revokeFence.raised
+
+    /**
+     * The fence epoch to admit deferred automatic work under (a start intent in
+     * flight, a queued connect, a scheduled retry), null while the fence is
+     * raised. Ask [vpnFenceAdmits] with it when the work runs: a revoke since
+     * then, even one the user's connect has already lifted, fails it.
+     */
+    internal fun vpnFenceAdmission(): Long? = revokeFence.admission()
+
+    internal fun vpnFenceAdmits(admission: Long?): Boolean = revokeFence.admits(admission)
+
+    /**
+     * Set when a clear did not reach the disk. The fence stays raised then
+     * (fail closed), so the user's connect starts nothing until a later one
+     * lands; the UI can show this instead of a connect that silently does not
+     * come up.
+     */
+    val vpnRevokeFenceClearFailed = kotlinx.coroutines.flow.MutableStateFlow(false)
+
+    /**
+     * The user's explicit connect: the only thing that clears the revoke fence.
+     * False when the clear did not land: the fence is still raised.
+     */
+    fun clearVpnRevokeFence(): Boolean {
+        val cleared = revokeFence.clear()
+        vpnRevokeFenceClearFailed.value = !cleared
+        if (!cleared) {
+            Log.e(TAG, "revoke fence clear did not reach disk; the fence stays raised")
+        }
+        return cleared
+    }
+
+    /** The reconnect-tunnel action: clears the fence, then starts the service. */
+    fun userRequestedVpnConnect() {
+        clearVpnRevokeFence()
+        startVpnService()
+    }
     @Volatile
     private var applicationStateInitialized = false
     private var applicationStateInitializing = false
 
+    // Bound only by the dedicated test runner before onCreate; ordinary app
+    // instances retain api alt. Consumed before even persisted spaces load.
+    internal val networkSpaceApiAltStartup = NetworkSpaceApiAltStartup()
+
     val device get() = deviceManager.device
+
+    // Private diagnostic build: only the acceptance owner installs this on the
+    // main thread before any native loop; normal app construction stays off.
+    @Volatile
+    internal var ioLoopDiagnostics: com.bringyour.sdk.IoLoopDiagnosticSession? = null
 
     /**
      * Publishes the Home Screen widgets' snapshot (location, providers,
@@ -338,14 +536,385 @@ class MainApplication : Application() {
 
     /**
      * The screen a Home Screen widget tap asked for (see QuickConnectActivity):
-     * "connect", "provider_locations" or "contract_stats". MainNavHost observes
-     * it, navigates, and clears it -- whether the app was cold-started for the
-     * tap or was already running.
+     * "connect", "provider_locations", "contract_stats" or "upgrade" (a
+     * blocked connect). MainNavHost observes it, navigates, and clears it --
+     * whether the app was cold-started for the tap or was already running.
      */
     val widgetRoute = kotlinx.coroutines.flow.MutableStateFlow<String?>(null)
+
+    /**
+     * The plan and balance poll state the connect screen shows, mirrored by
+     * InsufficientBalanceNoticeEffect so the start connect gate outside the ui
+     * (tile, shortcuts, widget button) matches the in-app swap. Main thread.
+     */
+    @Volatile
+    internal var uiIsPro: Boolean = false
+    @Volatile
+    internal var uiPollingSubscriptionBalance: Boolean = false
+
+    /**
+     * The start connect gate shared by every connect surface (see
+     * InsufficientBalancePolicy): out of balance by the contract status or a
+     * fresh account balance, not Supporter, no balance poll. A cached balance
+     * older than START_CONNECT_BALANCE_MAX_AGE_MILLIS is fetched again first
+     * (bounded by START_CONNECT_BALANCE_FETCH_TIMEOUT_MILLIS; a failed fetch
+     * does not block), unless the plan or a poll already decides it.
+     * onResult runs on the main thread, once.
+     */
+    fun checkStartConnect(onResult: (blocked: Boolean) -> Unit) {
+        com.bringyour.network.ui.connect.checkStartConnect(
+            isProKnown = { uiIsPro || deviceManager.jwtFlow.value?.pro == true },
+            isPollingSubscriptionBalance = { uiPollingSubscriptionBalance },
+            contractInsufficientBalance = { device?.contractStatus?.insufficientBalance == true },
+            cached = com.bringyour.network.widgets.WidgetSnapshotStore.loadBalance(this),
+            nowMillis = System.currentTimeMillis(),
+            fetch = ::fetchStartConnectBalance,
+            onResult = onResult,
+        )
+    }
+
+    /**
+     * The serial queue every connect and disconnect runs on, off the main
+     * thread, in the order they were made (ConnectCommands). Alive for the
+     * life of the process.
+     */
+    internal val connectCommands = com.bringyour.network.ui.connect.ConnectCommands.create(
+        onFailure = { Log.e(TAG, "[connect]command failed: ${it.message}", it) },
+        onStalled = { connect, millis ->
+            Log.w(TAG, "[connect]${if (connect) "connect" else "disconnect"} command still running after $millis ms")
+        },
+    )
+
+    /**
+     * The quick connect surfaces' start connect (QuickConnect), through the
+     * same gate: they show connecting from the tap while it fetches the
+     * balance, and re-render on each change. Main thread.
+     */
+    internal val startConnect = com.bringyour.network.ui.connect.StartConnect(
+        check = { onResult -> checkStartConnect(onResult) },
+        render = { renderQuickConnect() },
+    )
+
+    init {
+        // a command made or run shows on the quick connect surfaces at once
+        connectCommands.addListener { renderQuickConnect() }
+    }
+
+    /** Re-renders the quick connect surfaces: the Quick Settings tile and the dashboard widget. */
+    private fun renderQuickConnect() {
+        QuickConnectTileService.requestUpdate(this)
+        widgetSnapshotWriter?.quickConnectChanged()
+    }
+
+    /** Fetches the account balance again when the cached one is too old to gate on. */
+    fun refreshStartConnectBalanceIfStale() {
+        val cached = com.bringyour.network.widgets.WidgetSnapshotStore.loadBalance(this)
+        if (!com.bringyour.network.ui.connect.startConnectBalanceFresh(cached, System.currentTimeMillis())) {
+            fetchStartConnectBalance {}
+        }
+    }
+
+    /**
+     * Fetches the subscription balance, publishes it for the widgets and the
+     * connect screen, and calls back on the main thread with it, or with null
+     * when the fetch fails or does not answer in time.
+     */
+    private fun fetchStartConnectBalance(onBalance: (com.bringyour.network.widgets.WidgetBalanceSnapshot?) -> Unit) {
+        val mainHandler = Handler(Looper.getMainLooper())
+        val first = com.bringyour.network.ui.connect.FirstBalance(onBalance)
+        val api = device?.api
+        if (api == null) {
+            mainHandler.post { first.offer(null) }
+            return
+        }
+        mainHandler.postDelayed(
+            { first.offer(null) },
+            com.bringyour.network.ui.connect.START_CONNECT_BALANCE_FETCH_TIMEOUT_MILLIS,
+        )
+        api.subscriptionBalance(com.bringyour.sdk.SubscriptionBalanceCallback { result, err ->
+            val balance = if (err == null && result != null) {
+                com.bringyour.network.widgets.WidgetBalanceSnapshot(
+                    updatedAtMillis = System.currentTimeMillis(),
+                    startBalanceByteCount = result.startBalanceByteCount,
+                    balanceByteCount = result.balanceByteCount,
+                    openTransferByteCount = result.openTransferByteCount,
+                    isPro = result.currentSubscription != null,
+                )
+            } else {
+                null
+            }
+            mainHandler.post {
+                if (balance != null) {
+                    widgetSnapshotWriter?.publishBalance(balance)
+                        ?: com.bringyour.network.widgets.WidgetSnapshotStore.save(this, balance)
+                }
+                first.offer(balance)
+            }
+        })
+    }
+
+    /** A blocked connect: show the upgrade screen when the app is next in front. */
+    fun requestUpgradeScreen() {
+        widgetRoute.value = QuickConnectActivity.ROUTE_UPGRADE
+    }
+
+    /**
+     * Self-recovery for a connect insufficient balance blocked (BalanceRecovery):
+     * the refused start or the held connection is retried once the balance is
+     * back. Fed on the main thread by InsufficientBalanceNoticeEffect, so it
+     * only ever acts while the app is in front.
+     */
+    private val balanceRecovery = com.bringyour.network.ui.connect.BalanceRecovery<com.bringyour.sdk.ConnectLocation?>()
+
+    /** What the out-of-balance notice says about the recovery. Main thread. */
+    internal val balanceRecoveryState = kotlinx.coroutines.flow.MutableStateFlow(balanceRecovery.state)
+
+    /**
+     * The start connect gate refused a connect the user asked for (to
+     * `location`, or the best available provider when null): wait for the
+     * balance to retry it, and show the upgrade screen meanwhile.
+     */
+    fun startConnectBlocked(location: com.bringyour.sdk.ConnectLocation?) {
+        balanceRecovery.startRefused(location, System.currentTimeMillis())
+        balanceRecoveryState.value = balanceRecovery.state
+        requestUpgradeScreen()
+    }
+
+    /**
+     * The user connected, disconnected, signed out or cancelled the wait:
+     * nothing they asked for is waiting on the balance any more.
+     */
+    fun clearBalanceRecovery() {
+        balanceRecovery.clear()
+        balanceRecoveryState.value = balanceRecovery.state
+    }
+
+    /**
+     * Feeds the recovery the gate, the connect request and the last account
+     * balance, and makes the retry it decides on. True when it retried, so the
+     * caller tells the user.
+     */
+    fun observeBalanceRecovery(gate: Boolean, connectRequested: Boolean): Boolean {
+        val step = balanceRecovery.observe(
+            gate = gate,
+            connectRequested = connectRequested,
+            balance = com.bringyour.network.widgets.WidgetSnapshotStore.loadBalance(this),
+            nowMillis = System.currentTimeMillis(),
+        )
+        balanceRecoveryState.value = balanceRecovery.state
+        if (step == com.bringyour.network.ui.connect.BalanceRecoveryStep.None) {
+            return false
+        }
+        val current = device ?: return false
+        if (!vpnReconnectPermitted(VpnReconnectEntry.BALANCE_RECOVERY)) return false
+        val admission = vpnFenceAdmission() ?: return false
+        // the gate is not asked again: the recovery decided on a fresh balance,
+        // and a held connection still reports insufficient balance until the
+        // rebuild replaces it. On the connect command queue, after the
+        // commands made before it; the rebuild reads the device's location
+        // there, with its command
+        Log.i(TAG, "[connect]balance is back: retrying the blocked connect")
+        return connectCommands.runOnDevice(
+            com.bringyour.network.ui.connect.SdkConnectDevice(current),
+            connect = true,
+            location = { connectDevice ->
+                when (step) {
+                    is com.bringyour.network.ui.connect.BalanceRecoveryStep.Start -> step.target
+                    else -> connectDevice.connectLocation
+                }
+            },
+            // asked again when the command runs, not only when queued
+            admit = {
+                vpnReconnectPermitted(VpnReconnectEntry.BALANCE_RECOVERY) && vpnFenceAdmits(admission)
+            },
+        )
+    }
+
+    /**
+     * A campaign email link opened the app on the feedback screen with a
+     * pre-filled rating or reason (ur.io/f/<token>?r=n|why=x): the login
+     * activity parks the link's values here and the feedback screen consumes
+     * them once.
+     */
+    val pendingFeedbackPrefill = kotlinx.coroutines.flow.MutableStateFlow<com.bringyour.network.analytics.FeedbackPrefill?>(null)
+
+    /**
+     * What the sign-in screen says about the last sign-out: the sdk's
+     * AuthLogout leaves the notice its device's cause has (another device
+     * signed this session out), LoginNavHost shows it once, and the app's own
+     * sign-out and a new sign-in drop it.
+     */
+    val signInNotices = SignInNotices()
+
+    /**
+     * The physical network's Private DNS (DoT) mode, mapped from the offline
+     * callback's LinkProperties (API 28+). In strict mode (a user-set hostname)
+     * Android sends every lookup as DoT straight to that host through the tunnel,
+     * bypassing URnetwork's DNS and failing completely when that path is down.
+     * The connect screen reads this to show a muted notice while connected, and
+     * MainService logs it on every builder.establish().
+     */
+    val privateDnsMode = kotlinx.coroutines.flow.MutableStateFlow<PrivateDnsMode>(PrivateDnsMode.Off)
+
+    /**
+     * The product-event queue for the active network space (one per process;
+     * see [com.bringyour.network.analytics.ClientEvents]). Recreated whenever
+     * the active network space changes, flushed when the app goes to the
+     * background and drained on logout.
+     */
+    @Volatile
+    var clientEventQueue: com.bringyour.sdk.ClientEventQueue? = null
+        private set
+    private var lastBackgroundedAtMillis = 0L
 //    val vcManager get() = deviceManager.vcManager
     val api get() = networkSpaceManagerProvider.getNetworkSpace()?.api
     val asyncLocalState get() = networkSpaceManagerProvider.getNetworkSpace()?.asyncLocalState
+
+    // Diagnostics that support needs from "send feedback with logs": logcat plus
+    // the sdk log, which is what feedback uploads (see AppDiagnosticLog).
+    private val diagnosticLog = AppDiagnosticLog(
+        logcat = { Log.i(TAG, it) },
+        sdkLog = { tag, line -> Sdk.logAppInfo(tag, line) },
+    )
+
+    /**
+     * The whitelist-network measurement probe (P052). Bounded, URnetwork-owned
+     * endpoints only, local logs only; see WhitelistProbe. Built lazily so its
+     * cool-down state lives for the process. ConnectViewModel calls
+     * [maybeRunWhitelistProbe] when a connect attempt fails (the sdk's
+     * CONNECT_FAILED, or no provider in the window past the time bound, while the
+     * user wants to be connected; see ConnectFailurePolicy). Only a run the probe
+     * claims gets a worker thread, and it claims one run at a time, so a failure
+     * it declines starts no thread. Its block goes to logcat and, line by line,
+     * to the sdk log that feedback uploads.
+     */
+    private val whitelistProbe by lazy {
+        com.bringyour.network.analytics.WhitelistProbe(
+            runOnWorker = { work ->
+                Thread({
+                    runCatching { work() }
+                        .onFailure { Log.w(TAG, "whitelist probe failed: ${it.message}") }
+                }, "whitelist-probe").start()
+            },
+            checkApiReachable = { probeApiReachable() },
+            log = { diagnosticLog.info(WHITELIST_PROBE_LOG_TAG, it) },
+        )
+    }
+
+    /**
+     * Runs the whitelist probe once if a connect failed on an RU cellular path.
+     * Reads the data path and the SIM/network country here. The probe claims the
+     * run on this thread, checking and setting its trigger, cool-down and run in
+     * flight in one step, and runs the bounded network step on its worker. A
+     * probe failure never fails the caller.
+     */
+    fun maybeRunWhitelistProbe(connectFailed: Boolean) {
+        if (!connectFailed) {
+            return
+        }
+        val cellular = isActiveNetworkCellular()
+        val countryIso = runCatching {
+            getSystemService(TelephonyManager::class.java)?.networkCountryIso
+        }.getOrNull()
+        runCatching { whitelistProbe.maybeRun(cellular, countryIso, connectFailed = true) }
+            .onFailure { Log.w(TAG, "whitelist probe failed: ${it.message}") }
+    }
+
+    /** Whether the active network carries cellular transport. */
+    private fun isActiveNetworkCellular(): Boolean {
+        val connectivityManager =
+            getSystemService(ConnectivityManager::class.java) ?: return false
+        val network = connectivityManager.activeNetwork ?: return false
+        val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return false
+        return capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
+    }
+
+    /**
+     * Reports the mobile network's country to the sdk (P052). The extender
+     * dials of every network space front with the spoof list of that country
+     * while the extender hint cannot be fetched, as on a whitelist-only mobile
+     * network; see NetworkCountryReporter. The value never leaves the device.
+     */
+    private val networkCountryReporter = NetworkCountryReporter(
+        readNetworkCountryIso = {
+            runCatching { getSystemService(TelephonyManager::class.java)?.networkCountryIso }.getOrNull()
+        },
+        report = { countryCode ->
+            Log.i(TAG, "network country = \"$countryCode\"")
+            Sdk.setNetworkCountryCode(countryCode)
+        },
+    )
+    private var networkCountryCallback: ConnectivityManager.NetworkCallback? = null
+
+    /**
+     * Reports the current default network's country, then follows the default
+     * network for the life of the process. It runs before the network space
+     * manager builds its spaces, whose first extender dials already need it,
+     * and it is not tied to the device: the login flow dials too.
+     */
+    private fun addNetworkCountryCallback() {
+        if (networkCountryCallback != null) return
+        val connectivityManager = getSystemService(ConnectivityManager::class.java) ?: return
+        // synchronously: the callback's first delivery is posted, and the
+        // spaces built right after this dial before it lands
+        networkCountryReporter.defaultNetworkChanged(isActiveNetworkCellular())
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onCapabilitiesChanged(
+                network: Network,
+                networkCapabilities: NetworkCapabilities,
+            ) {
+                if (networkCountryCallback !== this) return
+                networkCountryReporter.defaultNetworkChanged(
+                    networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR),
+                )
+            }
+
+            override fun onLost(network: Network) {
+                if (networkCountryCallback !== this) return
+                networkCountryReporter.defaultNetworkChanged(isCellular = false)
+            }
+        }
+        networkCountryCallback = callback
+        runCatching {
+            connectivityManager.registerDefaultNetworkCallback(callback, Handler(mainLooper))
+        }.onFailure {
+            networkCountryCallback = null
+            Log.w(TAG, "network country callback unavailable: ${it.message}")
+        }
+    }
+
+    /**
+     * Probe step (a): a bounded https GET of the api `/status` endpoint. Reaching
+     * the server with any http response means the control plane is routable; a
+     * timeout or connection error on a whitelist network is the signal we want.
+     * URnetwork-owned endpoint only; no new data destination.
+     */
+    private fun probeApiReachable(): WhitelistProbeStep {
+        val apiUrl = networkSpaceManagerProvider.getNetworkSpace()?.apiUrl?.trimEnd('/')
+        if (apiUrl.isNullOrEmpty()) {
+            return WhitelistProbeStep("api-reachable", null, "no api url")
+        }
+        val statusUrl = "$apiUrl/status"
+        val start = System.currentTimeMillis()
+        return try {
+            val connection = (URL(statusUrl).openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = WHITELIST_PROBE_HTTP_TIMEOUT_MILLIS
+                readTimeout = WHITELIST_PROBE_HTTP_TIMEOUT_MILLIS
+                instanceFollowRedirects = false
+            }
+            try {
+                val code = connection.responseCode
+                val elapsed = System.currentTimeMillis() - start
+                WhitelistProbeStep("api-reachable", true, "HTTP $code in ${elapsed}ms")
+            } finally {
+                connection.disconnect()
+            }
+        } catch (e: Exception) {
+            val elapsed = System.currentTimeMillis() - start
+            WhitelistProbeStep("api-reachable", false, "${e.javaClass.simpleName} after ${elapsed}ms")
+        }
+    }
 //    val apiUrl get() = networkSpace?.apiUrl
 //    val platformUrl get() = networkSpace?.platformUrl
 
@@ -363,20 +932,22 @@ class MainApplication : Application() {
         }
 
 
-//    override fun onTrimMemory(level: Int) {
-//        super.onTrimMemory(level)
-//
-//        if (TRIM_MEMORY_BACKGROUND <= level) {
-//            Sdk.freeMemory()
-//        }
-//    }
+    // The lambda defers touching the gomobile class until a report is relayed.
+    private val memoryTrimRelay = MemoryTrimRelay(
+        sdkReady = { applicationStateInitialized },
+        report = { level -> Sdk.reportMemoryTrimLevel(level) },
+    )
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        memoryTrimRelay.onTrimMemory(level)
+    }
 
     override fun onLowMemory() {
         super.onLowMemory()
-
         // A cold VPN-service process deliberately has not loaded gomobile yet;
         // a memory callback must not defeat the early-promotion startup path.
-        if (applicationStateInitialized) Sdk.freeMemory()
+        memoryTrimRelay.onLowMemory()
     }
 
 
@@ -523,6 +1094,13 @@ class MainApplication : Application() {
     private fun initializeApplicationState() {
         addTunnelLifecycleObservers()
 
+        // a new provide power mode in settings decides the pause again
+        providePauseState.onPowerModeChange = {
+            Handler(mainLooper).post {
+                updateProvidePaused()
+            }
+        }
+
         if (widgetSnapshotWriter == null) {
             widgetSnapshotWriter = com.bringyour.network.widgets.WidgetSnapshotWriter(
                 this,
@@ -530,8 +1108,10 @@ class MainApplication : Application() {
                 com.bringyour.network.widgets.GlanceWidgetRefresh(this),
             ).also { it.start() }
         }
-        // the Quick Settings tile is active: render it once per process start
-        QuickConnectTileService.requestUpdate(this)
+        // the Quick Settings tile is active: the system shows it again only
+        // when the app asks, so ask from this process start on, and whenever
+        // a sign in or out, the window or the tunnel changes what it says
+        QuickConnectTileService.follow(this)
 
         if (0 < BuildConfig.URNETWORK_MEMORY_PROFILE_RATE_BYTES) {
             // Diagnostic profile AARs are linked with this same startup rate;
@@ -552,7 +1132,7 @@ class MainApplication : Application() {
         // Pre-upgrade builds wrote glog files straight into filesDir. Nothing
         // ever prunes or reads that directory again once the root moves, so
         // the old files are both dead storage and unreachable evidence. Run the
-        // migration BEFORE pointing glog at the new directory: the sdk's
+        // migration before pointing glog at the new directory: the sdk's
         // retention pass then treats the migrated files as part of the app's
         // own history and keeps only the newest four of the merged set.
         val migratedLogCount = try {
@@ -568,7 +1148,7 @@ class MainApplication : Application() {
         // gomobile binds Go's `error` return as a checked java exception, and
         // kotlin does not enforce checked exceptions -- so an unguarded call
         // compiles and then propagates out of Application.onCreate as an
-        // unhandled crash on EVERY launch. The sdk's own contract is the
+        // unhandled crash on every launch. The sdk's own contract is the
         // opposite ("logging must never be what breaks a launch"), but the
         // fallback meant to make the error unreachable cannot do that here: it
         // targets os.TempDir(), which on android resolves to /data/local/tmp
@@ -586,10 +1166,11 @@ class MainApplication : Application() {
         }
 
         val activityManager = getSystemService(ACTIVITY_SERVICE) as ActivityManager?
-        val maxMemoryMib = activityManager?.memoryClass?.toLong() ?: 32
-        // Target 3/4 of the app heap, capped to the iOS packet-tunnel budget.
-        val sdkMemoryMib = min((3 * maxMemoryMib) / 4, SDK_PROCESS_MEMORY_LIMIT_MIB)
+        // Publish the applied limit so DeviceLocal uses the full allowance
+        // without exceeding the memory-class clamp on smaller devices.
+        val sdkMemoryMib = effectiveProcessMemoryLimitMib(MEMORY_PROFILE_NAME, activityManager?.memoryClass)
         Sdk.setMemoryLimit(sdkMemoryMib * 1024 * 1024)
+        SDK_EFFECTIVE_PROCESS_MEMORY_LIMIT_MIB = sdkMemoryMib
 
         // Nothing removes location test providers when a process dies — not a
         // crash, not force-stop, not uninstall. Start the controller here (not
@@ -598,39 +1179,75 @@ class MainApplication : Application() {
         mockLocationController.start()
         mockLocationFeeder.start()
 
-        networkSpaceManagerProvider.init(filesDir.absolutePath)
+        // The mobile network's country, before the network space manager
+        // builds its spaces: their extender dials front with that country's
+        // spoof list while the extender hint cannot be fetched (P052).
+        addNetworkCountryCallback()
+
+        networkSpaceApiAltStartup.construct { apiAltEnabled ->
+            networkSpaceManagerProvider.init(filesDir.absolutePath, apiAltEnabled)
+        }
 
         val networkSpaceManager = networkSpaceManagerProvider.getNetworkSpaceManager()
 
-        val key = Sdk.newNetworkSpaceKey(BuildConfig.BRINGYOUR_BUNDLE_HOST_NAME, BuildConfig.BRINGYOUR_BUNDLE_ENV_NAME)
-        val bundleNetworkSpaceExists = networkSpaceManager?.getNetworkSpace(key) != null
-        val bundleNetworkSpace = networkSpaceManager?.updateNetworkSpace(key) { values ->
-            // migrate specific bundled fields to the latest from the build
-            values.envSecret = BuildConfig.BRINGYOUR_BUNDLE_ENV_SECRET
-            values.bundled = true
-            // security settings
-            // more security can mean fewer connectivity options and slower connectivity in some regions
-            values.netExposeServerIps = BuildConfig.BRINGYOUR_BUNDLE_NET_EXPOSE_SERVER_IPS
-            values.netExposeServerHostNames = BuildConfig.BRINGYOUR_BUNDLE_NET_EXPOSE_SERVER_HOST_NAMES
-            // server settings
-            values.linkHostName = BuildConfig.BRINGYOUR_BUNDLE_LINK_HOST_NAME
-            values.migrationHostName = BuildConfig.BRINGYOUR_BUNDLE_MIGRATION_HOST_NAME
-            // third party settings
-            // TODO sso settings
-            values.store = BuildConfig.BRINGYOUR_BUNDLE_STORE
-            values.wallet = BuildConfig.BRINGYOUR_BUNDLE_WALLET
-            values.ssoGoogle = BuildConfig.BRINGYOUR_BUNDLE_SSO_GOOGLE
-        }
+        // The bundled space is keyed by the operator host. An earlier bundle
+        // keyed it under the legacy host; installBundleNetworkSpace rolls
+        // that key forward before the bundled key is read, created, or bound
+        // (the sdk's migrateNetworkSpace contract), so the credentials and
+        // local state saved under the old key move with it.
+        val bundleIdentity = BundleNetworkSpaceIdentity.fromBuildConfig()
+        val bundleInstall = installBundleNetworkSpace(
+            bundleIdentity,
+            object : BundleNetworkSpaceStore<NetworkSpace> {
+                override fun migrate(fromHostName: String, toHostName: String, envName: String): Boolean {
+                    return networkSpaceManager?.migrateNetworkSpace(
+                        Sdk.newNetworkSpaceKey(fromHostName, envName),
+                        Sdk.newNetworkSpaceKey(toHostName, envName),
+                    ) ?: false
+                }
 
-        if (!bundleNetworkSpaceExists || networkSpaceManager?.activeNetworkSpace == null) {
-            // switch to the bundled network space when first created
-            // this is important when migrating from an older bundle to a newer bundle
-            networkSpaceManager?.activeNetworkSpace = bundleNetworkSpace
+                override fun exists(hostName: String, envName: String): Boolean {
+                    return networkSpaceManager?.getNetworkSpace(Sdk.newNetworkSpaceKey(hostName, envName)) != null
+                }
+
+                override fun update(hostName: String, envName: String): NetworkSpace? {
+                    return networkSpaceManager?.updateNetworkSpace(Sdk.newNetworkSpaceKey(hostName, envName)) { values ->
+                        // migrate specific bundled fields to the latest from the build
+                        values.envSecret = BuildConfig.BRINGYOUR_BUNDLE_ENV_SECRET
+                        values.bundled = true
+                        // security settings
+                        // more security can mean fewer connectivity options and slower connectivity in some regions
+                        values.netExposeServerIps = BuildConfig.BRINGYOUR_BUNDLE_NET_EXPOSE_SERVER_IPS
+                        values.netExposeServerHostNames = BuildConfig.BRINGYOUR_BUNDLE_NET_EXPOSE_SERVER_HOST_NAMES
+                        // server settings
+                        values.linkHostName = BuildConfig.BRINGYOUR_BUNDLE_LINK_HOST_NAME
+                        values.migrationHostName = BuildConfig.BRINGYOUR_BUNDLE_MIGRATION_HOST_NAME
+                        // third party settings
+                        // TODO sso settings
+                        values.store = BuildConfig.BRINGYOUR_BUNDLE_STORE
+                        values.wallet = BuildConfig.BRINGYOUR_BUNDLE_WALLET
+                        values.ssoGoogle = BuildConfig.BRINGYOUR_BUNDLE_SSO_GOOGLE
+                    }
+                }
+
+                override var active: NetworkSpace?
+                    get() = networkSpaceManager?.activeNetworkSpace
+                    set(value) {
+                        networkSpaceManager?.activeNetworkSpace = value
+                    }
+            },
+        )
+        if (bundleInstall.migratedFromLegacyHost) {
+            Log.i(
+                TAG,
+                "migrated bundled network space ${bundleIdentity.legacyHostName}/${bundleIdentity.envName}" +
+                    " -> ${bundleIdentity.hostName}/${bundleIdentity.envName}",
+            )
         }
 
         networkSpaceSub = networkSpaceManager?.addActiveNetworkSpaceChangeListener { networkSpace ->
             Handler(mainLooper).post {
-                updateActiveNetworkSpace(networkSpace)
+                if (!applySelectedNetworkSpace(networkSpace)) return@post
 
                 val intent = Intent(applicationContext, LoginActivity::class.java)
                 intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK.or(Intent.FLAG_ACTIVITY_TASK_ON_HOME))
@@ -638,7 +1255,7 @@ class MainApplication : Application() {
             }
         }
 
-        networkSpaceManager?.activeNetworkSpace?.let { updateActiveNetworkSpace(it) }
+        networkSpaceManager?.activeNetworkSpace?.let { applySelectedNetworkSpace(it) }
 
         Handler(mainLooper).post {
             // Older builds installed a 15-minute periodic worker whose body
@@ -707,6 +1324,18 @@ class MainApplication : Application() {
         processLifecycleObserver = object : DefaultLifecycleObserver {
             override fun onStart(owner: LifecycleOwner) {
                 requestWakeHealthAudit("process-foreground")
+                // a return after a long pause is a new app session for the
+                // product events (the queue stamps the session on each event)
+                val backgroundedAt = lastBackgroundedAtMillis
+                if (0L < backgroundedAt && CLIENT_EVENT_SESSION_GAP_MILLIS < System.currentTimeMillis() - backgroundedAt) {
+                    clientEventQueue?.newSession()
+                }
+            }
+
+            override fun onStop(owner: LifecycleOwner) {
+                lastBackgroundedAtMillis = System.currentTimeMillis()
+                // send what is pending before the process may be frozen
+                clientEventQueue?.flush()
             }
         }.also { ProcessLifecycleOwner.get().lifecycle.addObserver(it) }
     }
@@ -841,40 +1470,60 @@ class MainApplication : Application() {
     }
 
 
+    private fun applySelectedNetworkSpace(networkSpace: NetworkSpace): Boolean {
+        val selected = networkSpaceManagerProvider.getNetworkSpaceManager()?.activeNetworkSpace ?: return false
+        if (!networkSpace.same(selected)) return false
+        val current = networkSpaceManagerProvider.getNetworkSpace()
+        if (current != null && networkSpace.same(current)) return false
+        updateActiveNetworkSpace(networkSpace)
+        return true
+    }
+
     private fun updateActiveNetworkSpace(networkSpace: NetworkSpace) {
+        // Retire held password/client replies before teardown can deliver one.
+        loginStartupTracker.loggedOut()
+        activeLoginRequest = null
         stop()
 
         networkSpaceManagerProvider.setNetworkSpace(networkSpace)
 
+        // the space's api is the api this app's requests go out on: before any
+        // of them, it reports the device type and this build's version, which
+        // the server keeps for each sign-in (Account -> Sessions)
+        networkSpace.api?.setClientInfo(Sdk.newClientInfo(CLIENT_INFO_DEVICE_TYPE, BuildConfig.VERSION_NAME))
+
+        // the product-event queue follows the active network space: its api sends
+        // and its local state dir persists the pending batch across process death
+        clientEventQueue?.close()
+        clientEventQueue = Sdk.newClientEventQueue(
+            networkSpace,
+            Sdk.EventPlatformAndroid,
+            BuildConfig.VERSION_NAME,
+            java.util.Locale.getDefault().toLanguageTag(),
+        )
+        com.bringyour.network.analytics.ClientEvents.install(this) { clientEventQueue }
+
         loginVc = Sdk.newLoginViewController(api)
 
         asyncLocalState?.localState?.let { localState ->
-            val byClientJwt = localState.byClientJwt
-            val hasByJwt = !localState.byJwt.isNullOrEmpty()
+            // Legacy getters hide read failures as empty credentials. Observe
+            // one checked generation before deciding whether startup can proceed.
+            val auth = runCatching { localState.authStateSnapshot }.getOrNull() ?: return@let
+            val byClientJwt = auth.byClientJwt
+            if (byClientJwt.isNullOrEmpty() || runCatching { auth.parseByJwt() }.getOrNull() == null) {
+                return@let
+            }
 
-            if (byClientJwt.isNullOrEmpty()) {
-                if (hasByJwt) {
-                    // missing client jwt after saving byJwt; clean up partial auth state
-                    logoutStaleLocalState(localState)
-                    api?.byJwt = null
-                }
-            } else {
-                val hasValidByJwt = runCatching {
-                    localState.parseByJwt()
-                }.getOrNull() != null
-
-                if (!hasValidByJwt) {
-                    // missing one or both of jwt or client jwt
-                    // clean up the local state
-                    logoutStaleLocalState(localState)
-                    api?.byJwt = null
-                } else {
-                    // the device wraps the api and sets the jwt
-                    if (initDevice(byClientJwt) !is DeviceInitResult.Ready) {
-                        logoutStaleLocalState(localState)
-                        api?.byJwt = null
-                    }
-                }
+            val deviceInitResult = try {
+                initDevice(byClientJwt)
+            } catch (_: Throwable) {
+                runCatching { deviceManager.clearDevice() }
+                DeviceInitResult.Failed(DeviceInitFailure.DEVICE_LOCAL_CONFIGURATION_FAILED)
+            }
+            if (deviceInitResult !is DeviceInitResult.Ready) {
+                // Storage, construction and configuration failures do not revoke
+                // a saved session. Explicit logout and SDK rejection own cleanup.
+                Log.w(TAG, "Saved session device initialization did not complete")
             }
         }
 
@@ -922,50 +1571,59 @@ class MainApplication : Application() {
             capabilities.hasCapability(NET_CAPABILITY_PARTIAL_CONNECTIVITY_COMPAT)
     }
 
-    private fun addOfflineCallback() {
+    /**
+     * The membership of every physical internet network: it drives the device's
+     * offline state, Private DNS, and the capability-restored wake audits. It
+     * re-dials the transports only when a path returns after there was none
+     * (PhysicalPathRecovery); a network joining or leaving while another one
+     * carries the default leaves every socket where it was.
+     */
+    private fun addOfflineCallback(pathRecovery: PhysicalPathRecovery<Network>) {
         removeOfflineCallback()
 
         val callbackDevice = device
-        val availableNetworks = AvailableNetworkTracker<Network>()
+        val connectivityManager =
+            getSystemService(ConnectivityManager::class.java) as ConnectivityManager
+        // Asked before registering, so a path appearing in between errs toward
+        // one extra re-dial rather than a missed one. With no physical path
+        // now, the transports' dials fail and back off until a network arrives,
+        // and only a re-dial signal resets that backoff. device.offline is left
+        // to the callbacks: a wrong snapshot must not escape the tunnel.
+        if (!hasPhysicalInternetNetwork(connectivityManager)) {
+            Log.i(TAG, "network callbacks registered with no physical network")
+            pathRecovery.startedWithoutNetwork()
+        }
         offlineCallback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 if (offlineCallback !== this || device !== callbackDevice) {
                     return
                 }
-                val change = availableNetworks.onAvailable(network)
-                Log.i(TAG, "network available device = $network count=${availableNetworks.size}")
-                physicalNetworkAvailable = change.available
+                val update = pathRecovery.onMemberAvailable(network)
+                Log.i(TAG, "network available device = $network count=${pathRecovery.memberCount}")
+                physicalNetworkAvailable = update.available
                 callbackDevice?.offline = false
-                if (change.recoveryRequired) {
-                    // Existing sockets may be bound to the previous physical path:
-                    // re-dial platform transports and re-warm tunnel DoH now instead
-                    // of waiting for ping timeouts.
-                    requestTransportRecovery("physical-network-available")
-                }
+                // A path returned after there was none: re-dial platform
+                // transports and re-warm tunnel DoH now instead of waiting out
+                // the failed-dial backoff.
+                update.recoveryReason?.let { requestTransportRecovery(it) }
             }
 
             override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
                 if (offlineCallback !== this || device !== callbackDevice) {
                     return
                 }
-                // Same network, new addressing (DHCP renew, IPv6 renumbering,
-                // AP roam, DNS or route update): old sockets may be stale too.
-                val fingerprint = listOf(
-                    linkProperties.interfaceName.orEmpty(),
-                    linkProperties.linkAddresses.map { it.toString() }.sorted().joinToString(","),
-                    linkProperties.routes.map { it.toString() }.sorted().joinToString(","),
-                    linkProperties.dnsServers.map { it.toString() }.sorted().joinToString(","),
-                    linkProperties.domains.orEmpty(),
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                        linkProperties.mtu.toString()
-                    } else {
-                        "0"
-                    },
-                ).joinToString("|")
-                if (availableNetworks.onLinkPropertiesChanged(network, fingerprint)) {
-                    Log.i(TAG, "network link changed device = $network")
-                    requestTransportRecovery("link-properties-changed")
+                // Private DNS is a system-wide setting Android reports per
+                // network on LinkProperties (API 28+). Reading it from whichever
+                // physical path updates keeps the mode current.
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    privateDnsMode.value = privateDnsModeOf(
+                        Build.VERSION.SDK_INT,
+                        linkProperties.isPrivateDnsActive,
+                        linkProperties.privateDnsServerName,
+                    )
                 }
+                // Addressing changes re-dial only on the physical default (see
+                // addDefaultNetworkCallback): no transport socket uses another path.
             }
 
             override fun onCapabilitiesChanged(
@@ -973,7 +1631,7 @@ class MainApplication : Application() {
                 networkCapabilities: NetworkCapabilities,
             ) {
                 if (offlineCallback !== this || device !== callbackDevice) return
-                val change = availableNetworks.onCapabilitiesChanged(
+                val change = pathRecovery.onMemberCapabilitiesChanged(
                     network,
                     physicalNetworkCapabilitiesSnapshot(networkCapabilities),
                 )
@@ -983,9 +1641,6 @@ class MainApplication : Application() {
                     "network capabilities changed device=$network transports=${change.transportChanged} " +
                         "recovered=${change.recovered} degraded=${change.degraded}",
                 )
-                if (change.transportChanged) {
-                    requestTransportRecovery("network-transport-changed")
-                }
                 if (change.recovered) {
                     requestWakeHealthAudit("network-capability-restored")
                 }
@@ -993,7 +1648,7 @@ class MainApplication : Application() {
 
             override fun onBlockedStatusChanged(network: Network, blocked: Boolean) {
                 if (offlineCallback !== this || device !== callbackDevice) return
-                val change = availableNetworks.onBlockedStatusChanged(network, blocked)
+                val change = pathRecovery.onMemberBlockedStatusChanged(network, blocked)
                 if (!change.changed) return
                 Log.i(TAG, "network blocked changed device=$network blocked=$blocked")
                 if (change.recovered) {
@@ -1005,18 +1660,14 @@ class MainApplication : Application() {
                 if (offlineCallback !== this || device !== callbackDevice) {
                     return
                 }
-                val change = availableNetworks.onLost(network)
-                if (!change.topologyChanged) {
+                val update = pathRecovery.onMemberLost(network)
+                if (!update.topologyChanged) {
                     return
                 }
-                Log.i(TAG, "network lost device = $network count=${availableNetworks.size}")
-                physicalNetworkAvailable = change.available
-                callbackDevice?.offline = !change.available
-                if (change.recoveryRequired) {
-                    // Another physical path remains. It may now become the route
-                    // for transport sockets even though the device stayed online.
-                    requestTransportRecovery("physical-network-lost")
-                }
+                Log.i(TAG, "network lost device = $network count=${pathRecovery.memberCount}")
+                physicalNetworkAvailable = update.available
+                callbackDevice?.offline = !update.available
+                update.recoveryReason?.let { requestTransportRecovery(it) }
             }
         }
 
@@ -1025,8 +1676,6 @@ class MainApplication : Application() {
         // Explicit NOT_VPN prevents the tunnel satisfying its own observer.
         val networkRequest = physicalInternetNetworkRequestBuilder().build()
 
-        val connectivityManager =
-            getSystemService(ConnectivityManager::class.java) as ConnectivityManager
         connectivityManager.registerNetworkCallback(
             networkRequest,
             offlineCallback!!,
@@ -1047,17 +1696,6 @@ class MainApplication : Application() {
         physicalNetworkAvailable = false
     }
 
-    /**
-     * The membership callback above tracks the SET of physical networks, so it
-     * cannot see a default-preference flip between two still-attached networks
-     * (bad-wifi avoidance moving the default to cell while wifi stays
-     * associated, or the reverse). Existing transport sockets do not migrate on
-     * such a flip; they linger on the old path until a ping timeout. Track the
-     * per-app default network's identity and kick the transports the moment it
-     * changes. This app never routes through its own tunnel (see MainService
-     * updatePfd's app rules for every mode), so the per-app default here is
-     * always a physical network, never the tunnel itself.
-     */
     @SuppressLint("WrongConstant")
     private fun defaultNetworkPressure(
         capabilities: NetworkCapabilities,
@@ -1095,12 +1733,53 @@ class MainApplication : Application() {
         updatePerformanceDegraded()
     }
 
-    private fun addDefaultNetworkCallback() {
+    private fun defaultNetworkQuality(
+        capabilities: NetworkCapabilities,
+    ): DefaultNetworkQuality {
+        val wifiSignalStrength = if (
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+        ) {
+            capabilities.signalStrength
+        } else {
+            Int.MIN_VALUE
+        }
+        return DefaultNetworkQuality(
+            wifiSignalLevel = defaultNetworkSignalLevel(wifiSignalStrength),
+            downstreamBandwidthKbps = defaultNetworkBandwidthBucket(
+                capabilities.linkDownstreamBandwidthKbps,
+            ),
+            upstreamBandwidthKbps = defaultNetworkBandwidthBucket(
+                capabilities.linkUpstreamBandwidthKbps,
+            ),
+        )
+    }
+
+    /**
+     * Tracks the physical default network: the path this app's unbound
+     * transport sockets leave on. The membership callback above cannot see a
+     * default-preference flip between two still-attached networks (bad-wifi
+     * avoidance moving the default to cell while wifi stays associated, or a
+     * wifi join that only takes the default once it validates). Existing
+     * sockets do not migrate on such a flip; they linger on the old path until
+     * a ping timeout. Kick the transports the moment the identity changes, or
+     * when the same network loses what open sockets use.
+     *
+     * From API 31 registerDefaultNetworkCallback reports the per-app default,
+     * which is this app's own VPN while the ESCAPE tunnel (no app rules) covers
+     * it, and that network keeps its identity across wifi<->cell. The best
+     * match for the physical request is the system default in every tunnel
+     * mode. Before API 31 the default callback already follows the system
+     * default, which is never a VPN.
+     */
+    private fun addDefaultNetworkCallback(pathRecovery: PhysicalPathRecovery<Network>) {
         removeDefaultNetworkCallback()
 
         val callbackDevice = device
-        val tracker = DefaultNetworkTracker<Network>()
         val pressureTracker = DefaultNetworkPressureTracker<Network>()
+        val qualityTracker = DefaultNetworkQualityTracker<Network>()
+        val cellularQualityTracker = DefaultCellularQualityTracker()
+        var defaultNetworkIsCellular = false
         defaultNetworkCallback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 if (defaultNetworkCallback !== this || device !== callbackDevice) {
@@ -1109,11 +1788,29 @@ class MainApplication : Application() {
                 if (pressureTracker.onAvailable(network)) {
                     setDefaultNetworkDegraded(pressureTracker.degraded)
                 }
-                if (tracker.onAvailable(network)) {
+                if (qualityTracker.onAvailable(network)) {
+                    defaultNetworkIsCellular = false
+                }
+                pathRecovery.onDefaultAvailable(network)?.let { reason ->
                     Log.i(TAG, "network default changed to $network")
-                    requestTransportRecovery("default-network-changed")
+                    requestTransportRecovery(reason)
                 }
                 updateDataSaverDegraded()
+            }
+
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+                if (defaultNetworkCallback !== this || device !== callbackDevice) return
+                // Same network, new addressing (DHCP lease change, IPv6
+                // renumbering, interface replaced): sockets bound to a removed
+                // address are stranded. Added addresses, DNS and routes are not.
+                val link = physicalLinkSnapshot(
+                    linkProperties.interfaceName,
+                    linkProperties.linkAddresses.map { it.address },
+                )
+                pathRecovery.onDefaultLinkPropertiesChanged(network, link)?.let { reason ->
+                    Log.i(TAG, "network default link changed $network")
+                    requestTransportRecovery(reason)
+                }
             }
 
             override fun onCapabilitiesChanged(
@@ -1129,6 +1826,21 @@ class MainApplication : Application() {
                 ) {
                     setDefaultNetworkDegraded(pressureTracker.degraded)
                 }
+                if (
+                    qualityTracker.onCapabilitiesChanged(
+                        network,
+                        defaultNetworkQuality(networkCapabilities),
+                        networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR),
+                    )
+                ) {
+                    notifyNetworkQualityChanged(callbackDevice, "Wi-Fi or link estimate")
+                }
+                defaultNetworkIsCellular = qualityTracker.currentIsCellular()
+                if (pathRecovery.isPhysicalDefault(network)) {
+                    defaultNetworkMetered = !networkCapabilities.hasCapability(
+                        NetworkCapabilities.NET_CAPABILITY_NOT_METERED,
+                    )
+                }
                 // Meteredness can change with capabilities without a Data Saver
                 // preference broadcast (for example Wi-Fi policy changes).
                 updateDataSaverDegraded()
@@ -1138,9 +1850,15 @@ class MainApplication : Application() {
                 if (defaultNetworkCallback !== this || device !== callbackDevice) {
                     return
                 }
+                if (pathRecovery.isPhysicalDefault(network)) {
+                    defaultNetworkMetered = null
+                }
                 // A loss->replacement with the same Network identity is still
                 // a dead-path crossing and is detected by the tracker.
-                tracker.onLost(network)
+                pathRecovery.onDefaultLost(network)
+                if (qualityTracker.onLost(network)) {
+                    defaultNetworkIsCellular = false
+                }
                 if (pressureTracker.onLost(network)) {
                     setDefaultNetworkDegraded(pressureTracker.degraded)
                 }
@@ -1150,10 +1868,65 @@ class MainApplication : Application() {
 
         val connectivityManager =
             getSystemService(ConnectivityManager::class.java) as ConnectivityManager
-        connectivityManager.registerDefaultNetworkCallback(
-            defaultNetworkCallback!!,
-            Handler(mainLooper),
-        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            connectivityManager.registerBestMatchingNetworkCallback(
+                physicalDefaultNetworkRequestBuilder().build(),
+                defaultNetworkCallback!!,
+                Handler(mainLooper),
+            )
+        } else {
+            connectivityManager.registerDefaultNetworkCallback(
+                defaultNetworkCallback!!,
+                Handler(mainLooper),
+            )
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            defaultNetworkTelephonyCallback = addDefaultNetworkTelephonyCallback(
+                cellularQualityTracker,
+            ) {
+                if (
+                    defaultNetworkIsCellular &&
+                    defaultNetworkCallback != null &&
+                    device === callbackDevice
+                ) {
+                    notifyNetworkQualityChanged(callbackDevice, "cell bar or type")
+                }
+            }
+        }
+    }
+
+    private fun notifyNetworkQualityChanged(callbackDevice: DeviceLocal?, source: String) {
+        Log.i(TAG, "default network $source changed")
+        runCatching { callbackDevice?.networkQualityChanged() }
+            .onFailure { Log.e(TAG, "network quality update failed: ${it.message}", it) }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.S)
+    private fun addDefaultNetworkTelephonyCallback(
+        tracker: DefaultCellularQualityTracker,
+        onChanged: () -> Unit,
+    ): Any? {
+        val callback = DefaultNetworkTelephonyCallback(tracker, onChanged)
+        return runCatching {
+            getSystemService(TelephonyManager::class.java).registerTelephonyCallback(
+                ContextCompat.getMainExecutor(this),
+                callback,
+            )
+            callback
+        }.onFailure {
+            Log.w(TAG, "cell quality callbacks unavailable: ${it.message}")
+        }.getOrNull()
+    }
+
+    @RequiresApi(Build.VERSION_CODES.S)
+    private fun removeDefaultNetworkTelephonyCallback(callback: Any) {
+        runCatching {
+            getSystemService(TelephonyManager::class.java).unregisterTelephonyCallback(
+                callback as DefaultNetworkTelephonyCallback,
+            )
+        }.onFailure {
+            Log.w(TAG, "cell quality callback removal failed: ${it.message}")
+        }
     }
 
     fun removeDefaultNetworkCallback() {
@@ -1166,6 +1939,13 @@ class MainApplication : Application() {
             }
         }
         defaultNetworkCallback = null
+        defaultNetworkMetered = null
+        defaultNetworkTelephonyCallback?.let {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                removeDefaultNetworkTelephonyCallback(it)
+            }
+        }
+        defaultNetworkTelephonyCallback = null
         setDefaultNetworkDegraded(false)
     }
 
@@ -1218,7 +1998,13 @@ class MainApplication : Application() {
                 else -> BackgroundDataRestriction.DISABLED
             }
             dataSaverDegradesPerformance(
-                activeNetworkMetered = connectivityManager.isActiveNetworkMetered,
+                // The physical default's own capabilities: this app's active
+                // network is its VPN while the ESCAPE tunnel covers it, and the
+                // VPN declares itself unmetered. With no tracked physical
+                // default (offline, or before its first callback) ask the
+                // platform as before.
+                activeNetworkMetered = defaultNetworkMetered
+                    ?: connectivityManager.isActiveNetworkMetered,
                 restriction = restriction,
             )
         }.onFailure {
@@ -1269,21 +2055,31 @@ class MainApplication : Application() {
 
         powerSaveReceiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
+                val action = intent?.action
                 Handler(mainLooper).post {
-                    updatePerformanceDegraded()
+                    if (action == PowerManager.ACTION_POWER_SAVE_MODE_CHANGED) {
+                        updatePerformanceDegraded()
+                    }
+                    updateProvidePower(action)
                 }
             }
         }
         ContextCompat.registerReceiver(
             this,
             powerSaveReceiver,
-            IntentFilter(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED),
-            // This is a protected system broadcast. Exported context
+            IntentFilter().apply {
+                addAction(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED)
+                // the provide pause also follows the charger
+                addAction(Intent.ACTION_POWER_CONNECTED)
+                addAction(Intent.ACTION_POWER_DISCONNECTED)
+            },
+            // These are protected system broadcasts. Exported context
             // receivers reliably accept privileged framework senders across
             // OEM builds while still rejecting non-system spoofing.
             ContextCompat.RECEIVER_EXPORTED,
         )
         updatePerformanceDegraded()
+        updateProvidePower(null)
     }
 
     fun removePowerSaveReceiver() {
@@ -1294,6 +2090,68 @@ class MainApplication : Application() {
             }
         }
         powerSaveReceiver = null
+    }
+
+    /**
+     * Reads Battery Saver and the charger for the provide pause. The plug
+     * state comes from the sticky ACTION_BATTERY_CHANGED, which a null
+     * receiver reads without registering; a power connected or disconnected
+     * broadcast is the newest word on the plug.
+     */
+    private fun updateProvidePower(action: String?) {
+        providePowerSave = runCatching {
+            getSystemService(PowerManager::class.java)?.isPowerSaveMode == true
+        }.getOrDefault(false)
+        val battery = runCatching {
+            ContextCompat.registerReceiver(
+                this,
+                null,
+                IntentFilter(Intent.ACTION_BATTERY_CHANGED),
+                ContextCompat.RECEIVER_EXPORTED,
+            )
+        }.getOrNull()
+        val batteryFacts = battery?.let {
+            batteryPowerFacts(
+                plugged = it.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0),
+                present = it.getBooleanExtra(BatteryManager.EXTRA_PRESENT, true),
+                level = it.getIntExtra(BatteryManager.EXTRA_LEVEL, -1),
+                scale = it.getIntExtra(BatteryManager.EXTRA_SCALE, -1),
+            )
+        } ?: BatteryPowerFacts.Unknown
+        provideBattery = when (action) {
+            Intent.ACTION_POWER_CONNECTED -> batteryFacts.copy(charging = true)
+            Intent.ACTION_POWER_DISCONNECTED -> batteryFacts.copy(charging = false)
+            else -> batteryFacts
+        }
+        updateProvidePaused()
+    }
+
+    /**
+     * Sets device.providePaused from every pause source at once: the matching
+     * network, Battery Saver and the charger, with the provide power mode
+     * (providePauseDecision). Setting it from one source alone would let that
+     * source clear another's pause, as the network callback used to clear any
+     * pause when a network appeared. The decision is published for the
+     * provider card's idle reason.
+     */
+    private fun updateProvidePaused() {
+        val decision = providePauseDecision(
+            ProvidePauseFacts(
+                networkAvailable = provideNetworkAvailable,
+                powerSave = providePowerSave,
+                charging = provideBattery.charging,
+                batteryPct = provideBattery.batteryPct,
+                mode = providePauseState.powerMode.value,
+            )
+        )
+        if (providePauseState.decision.value != decision) {
+            Log.i(
+                TAG,
+                "provide pause paused=${decision.paused} reason=${decision.reason} network=$provideNetworkAvailable powerSave=$providePowerSave charging=${provideBattery.charging} battery=${provideBattery.batteryPct} mode=${providePauseState.powerMode.value}",
+            )
+        }
+        providePauseState.publishDecision(decision)
+        device?.providePaused = decision.paused
     }
 
     private fun addThermalStatusListener() {
@@ -1332,7 +2190,8 @@ class MainApplication : Application() {
                 }
                 availableNetworks.onAvailable(network)
                 Log.i(TAG, "network available provider = $network count=${availableNetworks.size}")
-                callbackDevice?.providePaused = false
+                provideNetworkAvailable = true
+                updateProvidePaused()
             }
 
             override fun onLost(network: Network) {
@@ -1342,7 +2201,8 @@ class MainApplication : Application() {
                 val change = availableNetworks.onLost(network)
                 if (change.topologyChanged) {
                     Log.i(TAG, "network lost provider = $network count=${availableNetworks.size}")
-                    callbackDevice?.providePaused = !change.available
+                    provideNetworkAvailable = change.available
+                    updateProvidePaused()
                 }
             }
         }
@@ -1371,7 +2231,8 @@ class MainApplication : Application() {
             getSystemService(ConnectivityManager::class.java) as ConnectivityManager
         // Until the passive callback reports a matching path, do not expose the
         // device as a provider on a stale path from the previous configuration.
-        callbackDevice?.providePaused = true
+        provideNetworkAvailable = false
+        updateProvidePaused()
         connectivityManager.registerNetworkCallback(
             networkRequest,
             networkCallback!!,
@@ -1401,41 +2262,61 @@ class MainApplication : Application() {
     internal fun authenticateWithPassword(
         userAuth: String,
         password: String,
-        completion: (PasswordLoginCompletion) -> Unit,
-    ): Long = passwordLoginCoordinator.authenticate(userAuth, password, completion)
+        completion: (LoginRequest, PasswordLoginCompletion) -> Unit,
+    ): Long? {
+        val request = captureLoginRequest(loginStartupTracker.begin(LoginStartupStage.PASSWORD_AUTH)) ?: return null
+        return passwordLoginCoordinator.authenticate(userAuth, password, request.attemptId) {
+            completion(request, it)
+        }
+    }
 
     internal fun authenticateNetworkSession(
+        request: LoginRequest,
         byJwt: String,
         newNetwork: Boolean,
         completion: (LoginClientCompletion) -> Unit,
     ) {
         dispatchLoginAction {
-            if (!login(byJwt, newNetwork)) {
+            if (!isPendingLoginRequest(request)) {
+                completion(LoginClientCompletion.Failed(LoginStartupFailure.STALE_ATTEMPT))
+                return@dispatchLoginAction
+            }
+            if (!request.sessionStarted.compareAndSet(false, true)) return@dispatchLoginAction
+            if (!login(request, byJwt, newNetwork)) {
                 val state = loginStartupState.value
                 val failure = (state as? LoginStartupState.Failed)?.failure
                     ?: LoginStartupFailure.NETWORK_SESSION_PERSISTENCE_FAILED
                 completion(LoginClientCompletion.Failed(failure))
                 return@dispatchLoginAction
             }
-            authenticateLoginClient(completion)
+            authenticateLoginClient(request, completion)
         }
     }
 
     internal fun persistNetworkSession(
+        request: LoginRequest,
         byJwt: String,
         newNetwork: Boolean,
         completion: (Boolean) -> Unit,
     ) {
-        dispatchLoginAction { completion(login(byJwt, newNetwork)) }
+        dispatchLoginAction {
+            if (!isPendingLoginRequest(request)) { completion(false); return@dispatchLoginAction }
+            if (!request.sessionStarted.compareAndSet(false, true)) return@dispatchLoginAction
+            completion(login(request, byJwt, newNetwork))
+        }
     }
 
     fun login(byJwt: String, newNetwork: Boolean = false): Boolean {
-        val attemptId = loginStartupTracker.ensureAttempt(LoginStartupStage.NETWORK_SESSION_PERSISTENCE)
-        val localState = asyncLocalState?.localState
-        val currentApi = api
-        if (localState == null || currentApi == null || byJwt.isEmpty()) {
-            localState?.let(::logoutStaleLocalState)
-            runCatching { currentApi?.byJwt = null }
+        val request = beginLoginRequest() ?: return false
+        return login(request, byJwt, newNetwork)
+    }
+
+    private fun login(request: LoginRequest, byJwt: String, newNetwork: Boolean): Boolean {
+        if (!isPendingLoginRequest(request)) return false
+        val attemptId = request.attemptId
+        val localState = request.localState
+        val currentApi = request.api
+        if (byJwt.isEmpty()) {
             loginStartupTracker.fail(
                 attemptId,
                 LoginStartupStage.NETWORK_SESSION_PERSISTENCE,
@@ -1445,12 +2326,15 @@ class MainApplication : Application() {
         }
         val persisted = runCatching {
             localState.byJwt = byJwt
+            // Credential acceptance supersedes the old device even when a
+            // subsequent settings/API update fails. A rejected write does not.
+            authSessionOwner = Any()
             localState.canPromptIntroFunnel = newNetwork
             currentApi.byJwt = byJwt
         }.isSuccess
         if (!persisted) {
-            logoutStaleLocalState(localState)
-            runCatching { currentApi.byJwt = null }
+            // An operational write failure is not proof that the saved session
+            // is stale. Preserve its keys, settings and any accepted credential.
             loginStartupTracker.fail(
                 attemptId,
                 LoginStartupStage.NETWORK_SESSION_PERSISTENCE,
@@ -1462,6 +2346,7 @@ class MainApplication : Application() {
 
     fun loginClient(byClientJwt: String): Boolean {
         val attemptId = loginStartupTracker.ensureAttempt(LoginStartupStage.CLIENT_JWT_VALIDATION)
+        if (activeLoginRequest?.attemptId != attemptId && captureLoginRequest(attemptId) == null) return false
         val identity = ClientJwtIdentity.decode(byClientJwt) as? ClientJwtIdentity.Valid
         if (identity == null) {
             loginStartupTracker.fail(
@@ -1486,7 +2371,11 @@ class MainApplication : Application() {
         }
     }
 
-    internal fun authenticateLoginClient(callback: (LoginClientCompletion) -> Unit) {
+    internal fun authenticateLoginClient(request: LoginRequest, callback: (LoginClientCompletion) -> Unit) {
+        if (!isPendingLoginRequest(request)) {
+            callback(LoginClientCompletion.Failed(LoginStartupFailure.STALE_ATTEMPT))
+            return
+        }
         val current = loginStartupState.value
         if (current !is LoginStartupState.Pending) {
             val failure = (current as? LoginStartupState.Failed)?.failure
@@ -1507,15 +2396,15 @@ class MainApplication : Application() {
         if (!loginStartupTracker.pending(attemptId, LoginStartupStage.CLIENT_JWT_PERSISTENCE)) {
             return ClientSessionStartResult.Failed(LoginStartupFailure.STALE_ATTEMPT)
         }
-        val localState = asyncLocalState?.localState
-            ?: return ClientSessionStartResult.Failed(
-                LoginStartupFailure.CLIENT_JWT_PERSISTENCE_FAILED,
-            )
+        val request = activeLoginRequest?.takeIf { it.attemptId == attemptId && isPendingLoginRequest(it) }
+            ?: return ClientSessionStartResult.Failed(LoginStartupFailure.STALE_ATTEMPT)
+        val localState = request.localState
         if (runCatching { localState.byClientJwt = byClientJwt }.isFailure) {
             return ClientSessionStartResult.Failed(
                 LoginStartupFailure.CLIENT_JWT_PERSISTENCE_FAILED,
             )
         }
+        authSessionOwner = Any()
         loginStartupTracker.pending(attemptId, LoginStartupStage.DEVICE_LOCAL_INITIALIZATION)
         val deviceInitResult = try {
             initDevice(byClientJwt)
@@ -1526,36 +2415,61 @@ class MainApplication : Application() {
         return when (val result = deviceInitResult) {
             DeviceInitResult.Ready -> ClientSessionStartResult.Ready
             is DeviceInitResult.Failed -> {
-                logoutStaleLocalState(localState)
-                api?.byJwt = null
                 ClientSessionStartResult.Failed(result.failure.asLoginStartupFailure())
             }
         }
     }
 
-    // Clear a stale or partial auth state WITHOUT rotating the device
-    // identity. The identity key material is device-scoped, not
-    // session-scoped: auth staleness (token rotation, partial auth state,
-    // re-login) must not change the key peers use to verify this device, so
-    // re-persist the material across the localState.logout() wipe (which
-    // clears the whole local storage dir). Only an explicit user logout()
-    // deliberately severs and rotates the identity.
-    private fun logoutStaleLocalState(localState: LocalState) {
-        val keyMaterial = runCatching { localState.deviceLocalKeyMaterial }.getOrNull()
-        runCatching { localState.logout() }
-        keyMaterial?.let {
-            runCatching { localState.deviceLocalKeyMaterial = it }
+    /**
+     * The sign out of `signedOutDevice`'s account, the one signed in when the
+     * user asked for it, only while it is still the signed-in device
+     * ([signOutApplies]): the account deletion signs out once the server
+     * answers, when the server may already have signed that account out and
+     * the next account signed in. True when it signed out.
+     */
+    fun logout(signedOutDevice: com.bringyour.sdk.DeviceLocal): Boolean {
+        if (!signOutApplies(signedOutDevice, device)) {
+            return false
         }
+        logout()
+        return true
     }
 
     fun logout() {
+        // the user signed out: the sign-in screen has nothing to explain
+        signInNotices.clear()
         loginStartupTracker.loggedOut()
+        activeLoginRequest = null
         logoutInternal()
     }
 
     private fun logoutInternal() {
+        // from here no connect is admitted on the signed-out device, and its
+        // connects still queued never run; its disconnects still do
+        device?.let { connectCommands.signOutStarted(it) }
         stop()
         widgetSnapshotWriter?.clear()
+        // a connect the signed-out account asked for must not start later
+        clearBalanceRecovery()
+        // nor a quick connect start still waiting on its balance: the gate
+        // could decide it once the next account's device is up. Its surface
+        // is answered, so a shortcut's trampoline finishes
+        startConnect.cancel()
+        // nor may its plan decide the next account's start connect gate, which
+        // reads this until the next connect screen sets its own
+        uiIsPro = false
+        uiPollingSubscriptionBalance = false
+        // what the account left outside the sdk's local state: each network
+        // starts fresh (owner decision 2026-10-05)
+        clearSignedOutNetworkState(
+            ssoAttempts = SsoProvider.entries.map { ssoOAuthAttempts(this, it) },
+            pendingSolanaPayment = pendingSolanaPaymentStore(this),
+            bittensorBridgeReturns = BittensorBridgeReturns.shared,
+        )
+
+        // the pending product events can only be sent while the jwt is still
+        // set; give the queue a bounded moment to drain before it is cleared
+        clientEventQueue?.flushAndWait(CLIENT_EVENT_LOGOUT_DRAIN_MILLIS)
 
         // note this clears the clientJwt also
         asyncLocalState?.localState?.logout()
@@ -1567,12 +2481,18 @@ class MainApplication : Application() {
      * callbacks, and resets transient connection and contract state.
      */
     fun stop() {
+        // Closing a subscription cannot retract work already on the main queue.
+        authSessionOwner = Any()
         // Invalidate a reconcile already queued by a listener before tearing
         // down the device; it must not restart the service after logout.
         vpnServiceUpdateGeneration += 1
         vpnServiceUpdatePosted = false
+        // a new session starts without a remembered provide edge: a stale true
+        // here would either write a false "provider restored" or swallow the
+        // next session's "without provider" edge
+        provideIntentWithoutProvider = false
         resetTunnelRecoveryState()
-        stopVpnService()
+        stopVpnService("logout")
 
         removeNetworkCallback()
         removeOfflineCallback()
@@ -1585,6 +2505,8 @@ class MainApplication : Application() {
 //        router = null
         deviceProvideSub?.close()
         deviceProvideSub = null
+        deviceProvideModeSub?.close()
+        deviceProvideModeSub = null
         deviceProvidePausedSub?.close()
         deviceProvidePausedSub = null
         deviceProvideNetworkSub?.close()
@@ -1617,11 +2539,24 @@ class MainApplication : Application() {
         // the sdk fires this when the jwt refresh finds the client no longer
         // exists on the server (e.g. the client was removed): the sdk has
         // already cleared its local auth state; log the user out and return
-        // to the login flow
-        deviceManager.onAuthLogout = {
+        // to the login flow. The device's cause, read in its listener, says
+        // whether the sign-in screen tells the user that another device
+        // signed this session out; any other cause says nothing new
+        // the sdk's logout begins: no connect of the signed-out device is
+        // admitted from here, before the logout below is posted
+        deviceManager.onLogoutStarted = { signedOutDevice ->
+            connectCommands.signOutStarted(signedOutDevice)
+        }
+        val logoutOwner = authSessionOwner
+        deviceManager.onAuthLogout = { signedOutDevice, cause ->
             Handler(mainLooper).post {
+                if (authSessionOwner !== logoutOwner || device !== signedOutDevice) {
+                    return@post
+                }
                 loginStartupTracker.authLoggedOut()
+                activeLoginRequest = null
                 logoutInternal()
+                signInNotices.authLoggedOut(cause)
                 val intent = Intent(applicationContext, LoginActivity::class.java)
                 intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK.or(Intent.FLAG_ACTIVITY_TASK_ON_HOME))
                 startActivity(intent)
@@ -1636,6 +2571,8 @@ class MainApplication : Application() {
         if (deviceInitResult !is DeviceInitResult.Ready) {
             return deviceInitResult
         }
+        // signed in: an earlier sign-out's notice no longer applies
+        signInNotices.clear()
 
         // A callback queued for a former DeviceLocal must never reset the new
         // device's transports or judge its initial provider window unhealthy.
@@ -1664,6 +2601,14 @@ class MainApplication : Application() {
             }
         }
         deviceProvideSub = device?.addProvideChangeListener {
+            Handler(mainLooper).post {
+                updateVpnService()
+            }
+        }
+        // the SDK does fire provideChanged on a mode change (applyProvideModeWithLock
+        // publishes both events), so this subscription is a safeguard rather than
+        // the only trigger: it keeps the reconcile independent of that detail
+        deviceProvideModeSub = device?.addProvideModeChangeListener {
             Handler(mainLooper).post {
                 updateVpnService()
             }
@@ -1713,8 +2658,11 @@ class MainApplication : Application() {
             }
         }
 
-        addOfflineCallback()
-        addDefaultNetworkCallback()
+        // one path state per device: membership and the physical default
+        // decide together when the transports re-dial
+        val pathRecovery = PhysicalPathRecovery<Network>()
+        addOfflineCallback(pathRecovery)
+        addDefaultNetworkCallback(pathRecovery)
         addNetworkCallback()
         addPowerSaveReceiver()
         addNetworkPolicyReceiver()
@@ -1803,21 +2751,48 @@ class MainApplication : Application() {
     private fun reconcileVpnService() {
         val device = device ?: return
 
+        if (!vpnReconnectPermitted(VpnReconnectEntry.RECONCILE)) {
+            // revoke leaves provide enabled; do not let it restart the service
+            stopVpnService("revoke fence", ignoreAlwaysOn = true)
+            return
+        }
         if (systemAlwaysOnVpn) {
             ensureAlwaysOnConnected()
         }
 
         // the vpn service is the packet router: it must run whenever the device
         // is connected, providing (any mode — including Network, which relays
-        // for same-network peers), or routing remotely
-        val provideEnabled = device.provideEnabled
-        val connectEnabled = device.connectEnabled
-        val routeLocal = device.routeLocal
-
-        if (systemAlwaysOnVpn || vpnServiceRequired(provideEnabled, connectEnabled, routeLocal)) {
+        // for same-network peers), or routing remotely.
+        //
+        // The requirement follows the provide MODE, not the provider pointer:
+        // a provider rotation or a memory-budget wait briefly detaches the
+        // remote-user NAT while the operator's intent is unchanged, and reading
+        // the pointer there stopped a VPN nobody asked to turn off.
+        val inputs = vpnRequirementInputs(device)
+        // when the intent says provide and nothing is providing, the VPN is still
+        // required but the operator should be able to see why: one ring entry per
+        // edge, so the next capture separates a rotation from a permanent refusal
+        val edge = provideEdge(
+            previous = provideIntentWithoutProvider,
+            provideMode = inputs.provideMode,
+            provideModeNone = inputs.provideModeNone,
+            provideEnabled = inputs.provideEnabled,
+        )
+        if (edge.event != null) {
+            provideIntentWithoutProvider = edge.intentWithoutProvider
+            VpnLifecycleLog.record(
+                { createDeviceProtectedStorageContext().filesDir },
+                edge.event,
+                "inputs=$inputs",
+            )
+        } else {
+            provideIntentWithoutProvider = edge.intentWithoutProvider
+        }
+        if (systemAlwaysOnVpn || inputs.required()) {
             startVpnService()
         } else {
-            stopVpnService()
+            Log.i(TAG, "[service] app no longer requires VPN: $inputs")
+            stopVpnService("not required: $inputs")
         }
     }
 
@@ -1829,6 +2804,13 @@ class MainApplication : Application() {
             return
         }
         if (device == null) return
+        // taken here, carried by the start intent, asked again by the service
+        val admission = vpnFenceAdmission()
+        if (!vpnReconnectPermitted(VpnReconnectEntry.START_SERVICE) || admission == null) {
+            cancelVpnStartRetry()
+            vpnRequestStart = false
+            return
+        }
 
         try {
             val alreadyStartingOrRunning = serviceActive || vpnStartPending
@@ -1861,6 +2843,9 @@ class MainApplication : Application() {
                         putExtra("command_version", VPN_SERVICE_COMMAND_VERSION)
                         putExtra("stop", false)
                         putExtra("start", true)
+                        // a revoke after this point makes the service refuse
+                        // the intent even if the user has connected again
+                        putExtra(VPN_START_FENCE_EPOCH_EXTRA, admission)
                         // Retained for redelivery compatibility with older APKs.
                         putExtra("foreground", true)
                     }
@@ -1926,6 +2911,13 @@ class MainApplication : Application() {
      */
     private fun scheduleVpnStartRetry() {
         vpnStartRetryRunnable?.let(mainHandler::removeCallbacks)
+        // admitted now; a revoke before the retry runs fails it for good
+        val admission = vpnFenceAdmission()
+        if (admission == null) {
+            vpnStartRetryRunnable = null
+            vpnRequestStart = false
+            return
+        }
         val delayMillis = vpnServiceStartRetryDelayMillis(vpnStartFailureCount)
         if (vpnStartFailureCount < Int.MAX_VALUE) vpnStartFailureCount += 1
         lateinit var retry: Runnable
@@ -1933,15 +2925,22 @@ class MainApplication : Application() {
             if (vpnStartRetryRunnable !== retry) return@Runnable
             vpnStartRetryRunnable = null
             val retryListener = vpnRequestStartListener
+            val vpnRequired = systemAlwaysOnVpn || restoredVpnServiceRequired()
             if (
                 !vpnServiceStartRetryEligible(
                     retryRequested = vpnRequestStart,
-                    vpnRequired = systemAlwaysOnVpn || restoredVpnServiceRequired(),
+                    vpnRequired = vpnRequired,
                     serviceActive = serviceActive,
                     startPending = vpnStartPending,
                     foregroundActivityAvailable = retryListener != null,
+                    revokeFenced = !vpnReconnectPermitted(VpnReconnectEntry.FOREGROUND_RETRY) ||
+                        !vpnFenceAdmits(admission),
                 )
             ) {
+                VpnLifecycleLog.record(
+                    { createDeviceProtectedStorageContext().filesDir }, "retry refused",
+                    "kind=foreground requested=$vpnRequestStart required=$vpnRequired active=$serviceActive pending=$vpnStartPending activity=${retryListener != null}",
+                )
                 return@Runnable
             }
             Log.i(
@@ -1956,6 +2955,7 @@ class MainApplication : Application() {
                 }
         }
         vpnStartRetryRunnable = retry
+        VpnLifecycleLog.record({ createDeviceProtectedStorageContext().filesDir }, "retry scheduled", "kind=foreground delayMillis=$delayMillis")
         mainHandler.postDelayed(retry, delayMillis)
     }
 
@@ -2051,27 +3051,172 @@ class MainApplication : Application() {
             return
         }
         val current = device ?: return
-        if (!current.connectEnabled) return
+        val connectDevice = com.bringyour.network.ui.connect.SdkConnectDevice(current)
+        if (!connectCommands.connectRequested(connectDevice)) return
+        // the user's disconnect: a held connection is not reconnected
+        clearBalanceRecovery()
 
-        val vc = current.openConnectViewController() ?: run {
-            Log.i(TAG, "Unable to open connect controller for VPN disconnect from $source")
+        // on the connect command queue, after the commands made before it;
+        // a failure is logged there (connectCommands)
+        VpnLifecycleLog.record({ createDeviceProtectedStorageContext().filesDir }, "disconnect requested", "source=$source")
+        Log.i(TAG, "Disconnecting VPN connection from $source")
+        connectCommands.runOnDevice(connectDevice, connect = false)
+        updateVpnService()
+    }
+
+    /**
+     * Android revoked the VPN (MainService.onRevoke): the user disconnected it
+     * in the system settings, or another VPN took its place. The connection is
+     * disconnected as the user's disconnect, so the service stop does not
+     * restart the tunnel (support inbox 8018). Unlike [disconnectVpnConnection]
+     * this also runs while system Always-on is active: the system stopped the
+     * VPN itself. Provide is not changed.
+     */
+    fun vpnServiceRevoked() {
+        if (android.os.Looper.myLooper() != mainLooper) {
+            // raise on this thread first: durable before the posted work runs
+            revokeFence.raise()
+            mainHandler.post { vpnServiceRevoked() }
             return
         }
-        try {
-            Log.i(TAG, "Disconnecting VPN connection from $source")
-            vc.disconnect()
-        } catch (e: Exception) {
-            Log.e(TAG, "VPN disconnect from $source failed: ${e.message}", e)
-        } finally {
-            runCatching { current.closeViewController(vc) }
-                .onFailure { Log.i(TAG, "Connect controller close failed: ${it.message}") }
-        }
+        // before any early return: the revoke can arrive with no device yet
+        // or with nothing connected, and still must hold off every restart
+        revokeFence.raise()
+        // a blocked balance recovery is waiting on no connection at all, so
+        // drop it before any early return; a recovery connect already queued
+        // is denied by the fence when it runs
+        clearBalanceRecovery()
+        invalidatePendingVpnStarts()
+        val current = device ?: return
+        val connectDevice = com.bringyour.network.ui.connect.SdkConnectDevice(current)
+        if (!connectCommands.connectRequested(connectDevice)) return
+
+        Log.i(TAG, "Disconnecting VPN connection after the system revoked the VPN")
+        connectCommands.runOnDevice(connectDevice, connect = false)
         updateVpnService()
+    }
+
+    /**
+     * The raise moved the fence epoch, which already fails every start intent,
+     * queued connect and scheduled retry admitted before it (each asks
+     * [vpnFenceAdmits] when it runs). This drops the state that waits on them,
+     * so none of it survives to look like a start in progress: the foreground
+     * retry timer, the adoption watchdog, the "start pending" flags, and the
+     * Always-on connect dedupe (its queued connect is gone, so a later one must
+     * not be suppressed by it). Main thread.
+     */
+    private fun invalidatePendingVpnStarts() {
+        cancelVpnStartRetry()
+        cancelVpnStartAdoptionWatchdog()
+        vpnRequestStart = false
+        vpnStartPending = false
+        alwaysOnConnectRequestedDevice = null
+    }
+
+    /**
+     * Process-wide so the notice is posted once per out of balance episode even
+     * across activity recreation. Fed on the main thread by
+     * InsufficientBalanceNoticeEffect.
+     */
+    internal val dataLimitGate by lazy(LazyThreadSafetyMode.NONE) {
+        com.bringyour.network.ui.connect.DataLimitGate()
+    }
+
+    internal val insufficientBalanceMonitor by lazy(LazyThreadSafetyMode.NONE) {
+        com.bringyour.network.ui.connect.InsufficientBalanceMonitor(
+            object : com.bringyour.network.ui.connect.InsufficientBalanceSession {
+                override fun disconnect() {
+                    disconnectVpnConnection("insufficient_balance")
+                }
+
+                override fun postNotice(
+                    dataLimit: Boolean,
+                    traffic: com.bringyour.network.ui.connect.RefusedTraffic,
+                ) {
+                    postInsufficientBalanceNotice(dataLimit, traffic)
+                }
+
+                override fun cancelNotice() {
+                    runCatching {
+                        (getSystemService(NOTIFICATION_SERVICE) as android.app.NotificationManager)
+                            .cancel(INSUFFICIENT_BALANCE_NOTIFICATION_ID)
+                    }
+                }
+            }
+        )
+    }
+
+    /**
+     * Tells the user the account is out of balance or at a data limit, and what
+     * the traffic is doing, with a disconnect action. Without notification permission the
+     * in-app alert still explains it.
+     */
+    @android.annotation.SuppressLint("NotificationPermission")
+    private fun postInsufficientBalanceNotice(
+        dataLimit: Boolean,
+        traffic: com.bringyour.network.ui.connect.RefusedTraffic,
+    ) {
+        runCatching {
+            val notificationManager =
+                getSystemService(NOTIFICATION_SERVICE) as android.app.NotificationManager
+            // same channel as the service notification; creating it again is a no-op
+            notificationManager.createNotificationChannel(
+                android.app.NotificationChannel(
+                    MainService.NOTIFICATION_CHANNEL_ID,
+                    getString(R.string.app_name),
+                    android.app.NotificationManager.IMPORTANCE_LOW,
+                ).apply {
+                    setShowBadge(false)
+                }
+            )
+            val contentIntent = android.app.PendingIntent.getActivity(
+                this,
+                0,
+                android.content.Intent(this, MainActivity::class.java),
+                android.app.PendingIntent.FLAG_IMMUTABLE or android.app.PendingIntent.FLAG_UPDATE_CURRENT,
+            )
+            // the service notification's disconnect target
+            val disconnectIntent = android.app.PendingIntent.getBroadcast(
+                this,
+                1,
+                android.content.Intent(this, NotificationDisconnectReceiver::class.java)
+                    .setAction(NotificationDisconnectReceiver.ACTION_DISCONNECT),
+                android.app.PendingIntent.FLAG_IMMUTABLE or android.app.PendingIntent.FLAG_UPDATE_CURRENT,
+            )
+            val message = com.bringyour.network.ui.connect
+                .refusedTrafficTextId(dataLimit, traffic)
+                ?.let { getString(it) }
+                .orEmpty()
+            val builder = androidx.core.app.NotificationCompat.Builder(
+                this,
+                MainService.NOTIFICATION_CHANNEL_ID,
+            )
+                .setSmallIcon(R.drawable.ic_status)
+                .setContentTitle(
+                    getString(if (dataLimit) R.string.data_limit_reached else R.string.insufficient_balance)
+                )
+                .setContentText(message)
+                .setStyle(androidx.core.app.NotificationCompat.BigTextStyle().bigText(message))
+                .setContentIntent(contentIntent)
+                .setAutoCancel(true)
+                // a correction goes into the notice in place, without alerting again
+                .setOnlyAlertOnce(true)
+            if (!systemAlwaysOnVpn) {
+                builder.addAction(R.drawable.ic_close, getString(R.string.disconnect), disconnectIntent)
+            }
+            notificationManager.notify(INSUFFICIENT_BALANCE_NOTIFICATION_ID, builder.build())
+        }.onFailure {
+            Log.i(TAG, "Insufficient balance notice failed: ${it.message}")
+        }
     }
 
     /**
      * System Always-on owns the disconnect policy. Keep the user's selected
      * location when there is one, otherwise reconnect to the best provider.
+     * Not gated on balance: Always-on is a connection the user set up in
+     * system settings and cannot disconnect here, so it counts as already
+     * connected; refusing it would leave the system tunnel up with traffic
+     * escaping it. Out of balance it holds traffic like any connection.
      * A bounded-delay retry covers a transient SDK restore/network race while
      * avoiding multiple simultaneous controllers for the same device.
      */
@@ -2081,40 +3226,51 @@ class MainApplication : Application() {
             return
         }
         val current = device ?: return
+        if (!vpnReconnectPermitted(VpnReconnectEntry.ALWAYS_ON_CONNECT)) return
+        val admission = vpnFenceAdmission() ?: return
         if (current.connectEnabled) {
             alwaysOnConnectRequestedDevice = null
             return
         }
         if (alwaysOnConnectRequestedDevice === current) return
         alwaysOnConnectRequestedDevice = current
-        val vc = current.openConnectViewController() ?: run {
-            alwaysOnConnectRequestedDevice = null
-            return
-        }
-        try {
-            current.connectLocation?.let(vc::connect) ?: vc.connectBestAvailable()
-        } catch (e: Exception) {
-            Log.i(TAG, "Always-on reconnect request failed: ${e.message}")
-            alwaysOnConnectRequestedDevice = null
-        } finally {
-            runCatching { current.closeViewController(vc) }
-                .onFailure { Log.i(TAG, "Always-on controller close failed: ${it.message}") }
-        }
+        // on the connect command queue, to the saved location (read there),
+        // else the best available provider; a failure is logged there, and
+        // the retry below asks again while the device is not connected
+        connectCommands.runOnDevice(
+            com.bringyour.network.ui.connect.SdkConnectDevice(current),
+            connect = true,
+            admit = {
+                vpnReconnectPermitted(VpnReconnectEntry.ALWAYS_ON_CONNECT) && vpnFenceAdmits(admission)
+            },
+        )
         Handler(mainLooper).postDelayed({
             if (systemAlwaysOnVpn && device === current && !current.connectEnabled) {
                 alwaysOnConnectRequestedDevice = null
                 ensureAlwaysOnConnected()
             }
-        }, 30_000L)
+        }, vpnTunnelTimingSettings.alwaysOnConnectRetryMillis.also { delay ->
+            VpnLifecycleLog.record(
+                { createDeviceProtectedStorageContext().filesDir }, "retry scheduled",
+                "kind=always-on-connect delayMillis=$delay",
+            )
+        })
     }
+
+    internal fun vpnRequirementInputs(current: DeviceLocal): VpnRequirementInputs = VpnRequirementInputs(
+        provideMode = current.provideMode,
+        provideModeNone = Sdk.ProvideModeNone,
+        provideEnabled = current.provideEnabled,
+        connectRequested = connectCommands.connectRequested(
+            com.bringyour.network.ui.connect.SdkConnectDevice(current),
+        ),
+        connectEnabled = current.connectEnabled,
+        routeLocal = current.routeLocal,
+    )
 
     fun restoredVpnServiceRequired(): Boolean {
         val current = device ?: return false
-        return vpnServiceRequired(
-            provideEnabled = current.provideEnabled,
-            connectEnabled = current.connectEnabled,
-            routeLocal = current.routeLocal,
-        )
+        return vpnRequirementInputs(current).required()
     }
 
     fun restoreVpnServiceFromSystemEvent(source: String?) {
@@ -2128,7 +3284,7 @@ class MainApplication : Application() {
         }
         ensureApplicationStateInitialized()
         directBootState.markCredentialRestoreComplete()
-        if (restoredVpnServiceRequired()) {
+        if (restoredVpnServiceRequired() && vpnReconnectPermitted(VpnReconnectEntry.RESTORE)) {
             Log.i(TAG, "restoring VPN service after system event=$source")
             startVpnService()
         } else {
@@ -2136,13 +3292,13 @@ class MainApplication : Application() {
         }
     }
 
-    private fun stopVpnService() {
+    private fun stopVpnService(reason: String = "app no longer requires VPN", ignoreAlwaysOn: Boolean = false) {
         cancelVpnStartAdoptionWatchdog()
         cancelVpnStartRetry()
         vpnRequestStart = false
         vpnStartPending = false
 
-        if (serviceActive && systemAlwaysOnVpn) {
+        if (!ignoreAlwaysOn && serviceActive && systemAlwaysOnVpn) {
             val activeService = service?.get()
             if (activeService != null && activeService.retainAlwaysOnWithoutDevice()) {
                 serviceActive = true
@@ -2162,7 +3318,7 @@ class MainApplication : Application() {
 
         if (serviceActive) {
             serviceActive = false
-            service?.get()?.stop()
+            service?.get()?.stop(reason)
             synchronized(serviceActiveMonitor) {
                 serviceActiveMonitor.notifyAll()
             }
@@ -2182,7 +3338,8 @@ class MainApplication : Application() {
         // OEM can destroy an adopted service before a PacketFlow ever flips
         // tunnelStarted, so relying only on that SDK listener leaves no event
         // to recover the foreground service while the activity stays open.
-        val restartRequired = restoredVpnServiceRequired()
+        val restartRequired = restoredVpnServiceRequired() &&
+            vpnReconnectPermitted(VpnReconnectEntry.FOREGROUND_RETRY)
         service = null
         cancelVpnStartAdoptionWatchdog()
         serviceActive = false
@@ -2206,6 +3363,6 @@ class MainApplication : Application() {
         vpnIntent.putExtra("start", false)
         stopService(vpnIntent)
 
-        stopVpnService()
+        stopVpnService("force stop")
     }
 }

@@ -3,6 +3,7 @@ package com.bringyour.network.widgets
 import android.content.Context
 import com.bringyour.network.MainApplication
 import com.bringyour.network.QuickConnect
+import com.bringyour.network.TransportDelayUi
 import kotlin.math.exp
 import kotlin.math.roundToLong
 
@@ -20,9 +21,36 @@ class WidgetEntry(
     val isOn: Boolean,
     /** A signed-in device exists to drive. */
     val isConfigured: Boolean,
+    /** A quick connect start waits on its balance: the dashboard shows connecting. */
+    val isConnecting: Boolean = false,
+    /**
+     * What the dashboard's title says about the connection
+     * (QuickConnect.status): connected only once the window holds its
+     * providers and the tunnel is up. The sample is connected.
+     */
+    val status: com.bringyour.network.ui.connect.QuickConnectStatus = when {
+        !isConfigured -> com.bringyour.network.ui.connect.QuickConnectStatus.NOT_SIGNED_IN
+        isConnecting -> com.bringyour.network.ui.connect.QuickConnectStatus.CONNECTING
+        isOn -> com.bringyour.network.ui.connect.QuickConnectStatus.CONNECTED
+        else -> com.bringyour.network.ui.connect.QuickConnectStatus.DISCONNECTED
+    },
+    /**
+     * The reading the VPN notification's slow content shows, null while it
+     * shows none (WidgetSnapshotStore.slowInternet): the dashboard's pill
+     * (dashboardSlowInternet). The sample shows none.
+     */
+    val slowInternet: TransportDelayUi? = null,
 ) {
     /** The tunnel snapshot is meaningful only while the tunnel that wrote it is up. */
     val showsTunnelData: Boolean get() = isOn && tunnel.tunnelActive
+
+    /**
+     * The dashboard's quick connect button shows on (tinted, "Disconnect"):
+     * a connection requested or a start waiting on its balance, for a
+     * signed-in device only. Signed out, the button opens sign-in and shows
+     * off, whatever the quick connect start reports.
+     */
+    val quickConnectOn: Boolean get() = isConfigured && (isOn || isConnecting)
 
     companion object {
         /** Debug builds only: a flag file that switches the widgets to the sample entry. */
@@ -40,6 +68,12 @@ class WidgetEntry(
                 balance = WidgetSnapshotStore.loadBalance(context),
                 isOn = app?.let { QuickConnect.isConnected(it) } ?: false,
                 isConfigured = app?.let { QuickConnect.isConfigured(it) } ?: false,
+                isConnecting = app?.let {
+                    QuickConnect.shown(it) == com.bringyour.network.ui.connect.QuickConnectShown.CONNECTING
+                } ?: false,
+                status = app?.let { QuickConnect.status(it) }
+                    ?: com.bringyour.network.ui.connect.QuickConnectStatus.NOT_SIGNED_IN,
+                slowInternet = WidgetSnapshotStore.slowInternet,
             )
         }
 

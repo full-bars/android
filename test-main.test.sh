@@ -72,8 +72,11 @@ rm -rf "$workflow_dir"
 grep -Fq 'gradle_worker_args=(--max-workers "$android_parallelism")' "$here/test-main.sh" || \
   fail "positive GOMAXPROCS is not mapped to Gradle workers"
 # shellcheck disable=SC2016
-[ "$(grep -Fc '"${gradle_worker_args[@]}"' "$here/test-main.sh")" -eq 2 ] || \
-  fail "both Android Gradle invocations do not consume the worker override"
+[ "$(grep -Fc '${gradle_worker_args[@]+"${gradle_worker_args[@]}"}' "$here/test-main.sh")" -eq 3 ] || \
+  fail "the SDK, cell and tabletop Gradle invocations do not all safely consume the optional worker override"
+# Exercise the exact production vectors on /bin/bash (macOS Bash 3.2) as well
+# as the selected Bash, including absent overrides and unrelated shell errors.
+go -C "$here" test test-main-gradle-workers_test.go -count=1
 # shellcheck disable=SC2016
 if grep -Eq 'emulator_core_args|(^|[[:space:]])-cores([=[:space:]]|$)' \
     "$here/test-main.sh"; then
@@ -98,16 +101,90 @@ grep -Fq 'throwLoginStartupTimeout(' <<<"$physical_timeout_source" || \
 grep -Fq 'Sdk.writeGoroutineStacks(startupGoroutinesFile.absolutePath)' \
   <<<"$physical_timeout_source" || \
   fail "physical login timeout does not synchronously request Go stacks"
+# All shipping initial forms must expose the same error-presence contract. The
+# physical login driver records only its presence, never server/user text.
+for login_flavor in google ungoogle solana_dapp ethos_dapp; do
+  grep -Fq 'URInlineErrorText(loginError, Modifier.testTag("acceptance.password.discovery-error"))' \
+    "$here/app/app/src/$login_flavor/java/com/bringyour/network/ui/login/LoginInitial.kt" || \
+    fail "$login_flavor does not expose terminal password-discovery errors"
+done
+physical_failure_source="$(sed -n \
+  '/private fun failureStatus(/,/private fun stopClient/p' \
+  "$here/app/app/src/androidTest/java/com/bringyour/network/acceptance/PhysicalLowbarSessionTest.kt")"
+# Failure publication consumes the first immutable snapshot, not post-cleanup login state.
+for expected in 'failure: PhysicalFailureSnapshot' 'JSONObject(failure.statusFields())' \
+  'status(id, "error", application, startElapsedMs, extra, failure.phase)'; do
+  grep -Fq "$expected" <<<"$physical_failure_source" || \
+    fail "physical failure publication lost its retained snapshot"
+done
+physical_failure_evidence="$(<"$here/app/app/src/acceptanceShared/java/com/bringyour/network/acceptance/PhysicalFailureEvidence.kt")"
+if grep -Eq 'loginStartupState|startupState|error\.(message|cause|toString)' \
+  <<<"$physical_failure_source
+$physical_failure_evidence"; then
+  fail "physical failure evidence rereads ambient state or exposes free-form error data"
+fi
+for expected in \
+  'if (retainedError === error) return checkNotNull(retainedSnapshot)' \
+  'when (error)' \
+  'is PhysicalWaitTimeout ->' 'is CleanupLedgerFailureException ->' \
+  'is PasswordLoginFailureException ->' 'is LoginStartupFailureException ->' \
+  'is PhysicalLoginStartupTimeout ->' 'is PhysicalLoginLoggedOutException ->' \
+  'else -> if (operation == PhysicalFailureOperation.EGRESS_PROBE)' \
+  'val phase: String' 'val loginUiBeforeTeardown: PasswordLoginDiscoveryEvidence?'; do
+  grep -Fq "$expected" <<<"$physical_failure_evidence" || \
+    fail "physical failure evidence lost typed first-error ownership"
+done
+physical_discovery_failure="$(sed -n \
+  '/is PasswordLoginFailureException -> {/,/^[[:space:]]*}/p' <<<"$physical_failure_evidence")"
+for expected in 'stage = error.stage.wireValue' 'failure = error.failure.wireValue' \
+  'loginUi = error.evidence?.copy()'; do
+  grep -Fq "$expected" <<<"$physical_discovery_failure" || \
+    fail "physical password failure lost finite pre-cleanup evidence"
+done
+for expected in 'put("failurePhase", phase)' 'put("failureTimeUnixMs", timeUnixMs)' \
+  'put("failureElapsedRealtimeMs", elapsedRealtimeMs)' \
+  'put("loginUiBeforeTeardown", mapOf(' \
+  '"userFormVisible" to it.userFormVisible' \
+  '"passwordFormVisible" to it.passwordFormVisible' \
+  '"discoveryErrorVisible" to it.errorVisible'; do
+  grep -Fq "$expected" <<<"$physical_failure_evidence" || \
+    fail "physical failure snapshot lost finite publication fields"
+done
+physical_owned_failure="$(sed -n \
+  '/private fun runOwnedDeviceSession(/,/private class MemoryTeardownState/p' \
+  "$here/app/app/src/androidTest/java/com/bringyour/network/acceptance/PhysicalLowbarSessionTest.kt")"
+awk '
+  !caught && /\} catch \(error: Throwable\) \{/ { caught = NR }
+  caught && !captured && /captureFailure\(error\)/ { captured = NR }
+  caught && !rethrown && /throw error/ { rethrown = NR }
+  caught && !final && /\} finally \{/ { final = NR }
+  final && !closed && /closeOwnedDeviceScope\(/ { closed = NR }
+  END { exit !(caught && captured > caught && rethrown > captured &&
+    final > rethrown && closed > final) }
+' <<<"$physical_owned_failure" || \
+  fail "physical owned failure is not captured and rethrown before cleanup"
+physical_outer_failure="$(sed -n \
+  '/fun physicalLowbarSession()/,/private fun runOwnedDeviceSession(/p' \
+  "$here/app/app/src/androidTest/java/com/bringyour/network/acceptance/PhysicalLowbarSessionTest.kt")"
+for expected in \
+  'failureStatus(activeCommandId, application, startElapsedMs, captureFailure(error))' \
+  '.onFailure(error::addSuppressed)' 'throw error' \
+  'sessionFailure.addSuppressed(finalError)'; do
+  grep -Fq "$expected" <<<"$physical_outer_failure" || \
+    fail "physical outer owner lost original failure or separate cleanup errors"
+done
 grep -Fq 'main-startup-goroutines.txt' "$here/test-main.sh" || \
   fail "main acceptance collection does not retain optional Pending startup evidence"
 main_timeout_source="$(sed -n \
-  '/private fun waitForMain()/,/private fun createInstantAccount()/p' \
+  '/private fun waitForMain(/,/private fun createInstantAccount()/p' \
   "$here/app/app/src/androidTest/java/com/bringyour/network/acceptance/MainAcceptanceTest.kt")"
 grep -Fq 'throwLoginStartupTimeout(' <<<"$main_timeout_source" || \
   fail "main login does not route its Pending timeout through the evidence boundary"
 grep -Fq 'Sdk.writeGoroutineStacks(startupGoroutinesFile.absolutePath)' \
   <<<"$main_timeout_source" || \
   fail "main login timeout does not synchronously request Go stacks"
+
+go -C "$here" test test-main-failure-evidence_test.go -count=1
 
 startup_evidence_dir="$(mktemp -d "${TMPDIR:-/tmp}/urnetwork-android-startup-evidence.test.XXXXXX")"
 startup_status="$startup_evidence_dir/status.json"
@@ -158,6 +235,23 @@ grep -Fq 'android_acceptance_session_running "$session_pid"' "$here/test-main.sh
 # shellcheck disable=SC2016
 grep -Fq 'release_active_clients "$artifacts"' "$here/test-main.sh" || \
   fail "EXIT cleanup does not retry every retained P2P ownership ledger"
+release_cleanup_source="$(sed -n \
+  '/^release_active_clients()/,/^# Invoked through the EXIT/p' \
+  "$here/test-main.sh")"
+grep -Fq -- "-name 'active-client-id-*' -o -name 'physical-active-client-id'" \
+  <<<"$release_cleanup_source" || \
+  fail "Android cleanup does not collect both ledger and physical marker aliases"
+# All collected paths must cross one CLI boundary so duplicate IDs are grouped
+# by build/all/acceptance/client-cleanup.mjs before any destructive API call.
+# shellcheck disable=SC2016
+grep -Fq '"${active_clients[@]}"' <<<"$release_cleanup_source" || \
+  fail "Android cleanup still invokes the client cleanup CLI once per marker"
+[ "$(grep -Fc 'client-cleanup.mjs' <<<"$release_cleanup_source")" -eq 1 ] || \
+  fail "Android cleanup has more than one client-cleanup CLI boundary"
+physical_cleanup_source="$(sed -n \
+  '/^cleanup()/,/^record_smoke_result()/p' "$here/test-main.sh")"
+[ "$(grep -Fc 'client-cleanup.mjs' <<<"$physical_cleanup_source")" -eq 0 ] || \
+  fail "EXIT cleanup separately releases physical aliases after the batch"
 grep -Fq 'p2p_cleanup_failed=1' "$here/test-main.sh" || \
   fail "P2P cleanup failures are not retained as an unsafe-stop condition"
 # shellcheck disable=SC2016
@@ -182,19 +276,239 @@ printf '%s\n' \
   '* daemon not running; starting now at tcp:5037' \
   '* daemon started successfully' \
   'List of devices attached' \
-  $'R5CX21FY6ND\toffline product:e3q model:SM_S928U device:e3q' \
+  $'RESERVEDPHONEB\toffline product:e3q model:SM_S928U device:e3q' \
   $'emulator-5554\tdevice product:sdk model:Pixel_7 device:emu transport_id:2' \
-  $'3B161FDJG001KT\tdevice product:husky model:Pixel_8_Pro device:husky' \
+  $'3RESERVEDPHONEA\tdevice product:husky model:Pixel_8_Pro device:husky' \
   $'partner-serial\tdevice product:partner model:Partner_Device device:partner' \
+  $'0DIAGPHONE001\tunauthorized usb:1-1' \
+  $'unrelated-offline\toffline' \
+  $'emulator-5556\tdevice product:sdk model:Pixel_7' \
   >"$fleet_raw"
 android_acceptance_select_adb_devices \
-  "$fleet_raw" "$fleet_selected" "$fleet_excluded" \
-  3B161FDJG001KT R5CX21FY6ND || fail "valid attached fleet was rejected"
-[ "$(cat "$fleet_selected")" = "emulator-5554
-partner-serial" ] || fail "eligible devices were not selected and sorted exactly"
-expected_excluded=$'3B161FDJG001KT\tdevice\treserved-for-performance\nR5CX21FY6ND\toffline\treserved-for-performance'
+  "$fleet_raw" "$fleet_selected" "$fleet_excluded" emulator-5554 \
+  3RESERVEDPHONEA RESERVEDPHONEB || fail "owned AVD was rejected because of unrelated devices"
+[ "$(cat "$fleet_selected")" = emulator-5554 ] || \
+  fail "acceptance selected a serial other than its explicitly owned AVD"
+expected_excluded=$'0DIAGPHONE001\tunauthorized\toutside-acceptance-selection\n3RESERVEDPHONEA\tdevice\treserved-for-performance\nRESERVEDPHONEB\toffline\treserved-for-performance\nemulator-5556\tdevice\toutside-acceptance-selection\npartner-serial\tdevice\toutside-acceptance-selection\nunrelated-offline\toffline\toutside-acceptance-selection'
 [ "$(cat "$fleet_excluded")" = "$expected_excluded" ] || \
-  fail "reserved performance devices were not excluded exactly"
+  fail "reserved and unrelated devices were not recorded as exclusions exactly"
+
+# Inventory visibility never grants mutation authority. Before the owned AVD
+# starts, even a ready foreign emulator or physical phone selects no target.
+android_acceptance_select_adb_devices \
+  "$fleet_raw" "$fleet_selected" "$fleet_excluded" '' \
+  3RESERVEDPHONEA RESERVEDPHONEB || fail "unrelated devices prevented owned AVD startup"
+[ ! -s "$fleet_selected" ] || fail "initial inventory selected an unowned device"
+for required_state in offline unauthorized unknown; do
+  printf '%s\n' 'List of devices attached' "emulator-5554 $required_state" >"$fleet_raw"
+  if android_acceptance_select_adb_devices \
+      "$fleet_raw" "$fleet_selected" "$fleet_excluded" emulator-5554 \
+      3RESERVEDPHONEA RESERVEDPHONEB >/dev/null 2>&1; then
+    fail "required owned AVD in $required_state state was accepted"
+  fi
+done
+printf '%s\n' 'List of devices attached' $'foreign\tdevice' >"$fleet_raw"
+if android_acceptance_select_adb_devices \
+    "$fleet_raw" "$fleet_selected" "$fleet_excluded" emulator-5554 \
+    3RESERVEDPHONEA RESERVEDPHONEB >/dev/null 2>&1; then
+  fail "missing required owned AVD was replaced by a foreign device"
+fi
+printf '%s\n' 'List of devices attached' $'3RESERVEDPHONEA\tdevice' >"$fleet_raw"
+if android_acceptance_select_adb_devices \
+    "$fleet_raw" "$fleet_selected" "$fleet_excluded" 3RESERVEDPHONEA \
+    3RESERVEDPHONEA RESERVEDPHONEB >/dev/null 2>&1; then
+  fail "an explicit selection bypassed the reserved performance-device exclusion"
+fi
+printf '%s\n' 'List of devices attached' $'diagnostic-ready\tdevice' \
+  $'unrelated\tunauthorized' >"$fleet_raw"
+android_acceptance_select_adb_devices \
+  "$fleet_raw" "$fleet_selected" "$fleet_excluded" diagnostic-ready \
+  3RESERVEDPHONEA RESERVEDPHONEB || fail "explicit diagnostic target was blocked by an unrelated device"
+[ "$(cat "$fleet_selected")" = diagnostic-ready ] || \
+  fail "diagnostic inventory broadened beyond the explicit serial"
+capture_selection_source="$(sed -n '/^capture_device_fleet()/,/^}/p' "$here/test-main.sh")"
+# Pin the production selector to launch ownership, not broad ADB visibility.
+# shellcheck disable=SC2016
+grep -Fq 'local required_serials="$started_emulator_serial"' <<<"$capture_selection_source" || \
+  fail "canonical inventory is not bound to the owned emulator serial"
+# shellcheck disable=SC2016
+grep -Fq 'required_serials="$diagnostic_device"' <<<"$capture_selection_source" || \
+  fail "diagnostic inventory lost its explicit requested serial"
+# shellcheck disable=SC2016
+grep -Fq '"$raw" "$selected_output" "$excluded_devices" "$required_serials"' <<<"$capture_selection_source" || \
+  fail "the inventory parser is not given the explicitly scoped serial"
+
+# Canonical physical authorization is exact and additive: it must not prevent
+# the owned AVD from starting, broaden diagnostics, or select a similar phone.
+canonical_solana="$(android_acceptance_canonical_solana_serial)"
+[ "$canonical_solana" = O1N1XT172304047 ] || fail "canonical Solana authorization changed"
+printf '%s\n' 'List of devices attached' \
+  "$canonical_solana device model:Saga" \
+  'emulator-5554 device model:Pixel' \
+  'foreign-seeker device model:Seeker' \
+  'unrelated unauthorized' \
+  '3RESERVEDPHONEA device' 'RESERVEDPHONEB offline' >"$fleet_raw"
+canonical_required="emulator-5554"$'\n'"$canonical_solana"
+android_acceptance_select_adb_devices \
+  "$fleet_raw" "$fleet_selected" "$fleet_excluded" "$canonical_required" \
+  3RESERVEDPHONEA RESERVEDPHONEB || fail "canonical AVD and authorized Saga were not selected"
+[ "$(cat "$fleet_selected")" = "$canonical_solana"$'\n''emulator-5554' ] || \
+  fail "canonical selection did not retain exactly the owned AVD and authorized Saga"
+for bad_required in "$canonical_required"$'\n'"$canonical_solana" \
+    "$canonical_required"$'\n''3RESERVEDPHONEA' 'bad serial'; do
+  if android_acceptance_select_adb_devices \
+      "$fleet_raw" "$fleet_selected" "$fleet_excluded" "$bad_required" \
+      3RESERVEDPHONEA RESERVEDPHONEB >/dev/null 2>&1; then
+    fail "duplicate, reserved, or malformed canonical selection was accepted"
+  fi
+done
+for bad_state in absent offline unauthorized duplicate; do
+  printf '%s\n' 'List of devices attached' 'emulator-5554 device' \
+    'foreign-seeker device model:Seeker' >"$fleet_dir/bad-physical-raw"
+  case "$bad_state" in
+    absent) ;;
+    duplicate) printf '%s\n' "$canonical_solana device" "$canonical_solana device" >>"$fleet_dir/bad-physical-raw" ;;
+    *) printf '%s\n' "$canonical_solana $bad_state" >>"$fleet_dir/bad-physical-raw" ;;
+  esac
+  if android_acceptance_select_adb_devices \
+      "$fleet_dir/bad-physical-raw" "$fleet_selected" "$fleet_excluded" "$canonical_required" \
+      3RESERVEDPHONEA RESERVEDPHONEB >/dev/null 2>&1; then
+    fail "required physical Saga in $bad_state state was silently replaced"
+  fi
+done
+(
+  # Execute the production capture function against a read-only fake ADB.
+  timeout() { shift; "$@"; }
+  fake_fleet_adb() { [ "$*" = 'devices -l' ] || return 99; cat "$fleet_raw"; }
+  # shellcheck disable=SC2294
+  eval "$capture_selection_source"
+  run_dir="$fleet_dir/capture"
+  mkdir -p "$run_dir"
+  adb=fake_fleet_adb
+  device_serials="$run_dir/selected"
+  captured_device_serials="$run_dir/diagnostic"
+  excluded_devices="$run_dir/excluded"
+  reserved_device_serials=(3RESERVEDPHONEA RESERVEDPHONEB)
+  execution_mode=canonical
+  canonical_solana_serial="$canonical_solana"
+  started_emulator_serial=''
+  capture_device_fleet || fail "canonical prelaunch physical inventory failed"
+  [ "$(cat "$device_serials")" = "$canonical_solana" ] || fail "prelaunch selected an unowned AVD"
+  started_emulator_serial=emulator-5554
+  capture_device_fleet || fail "canonical postlaunch inventory failed"
+  [ "$(wc -l <"$device_serials" | tr -d ' ')" = 2 ] || fail "physical presence displaced the owned AVD"
+  canonical_solana_serial=''
+  capture_device_fleet || fail "general-only profile required the Solana phone"
+  [ "$(cat "$device_serials")" = emulator-5554 ] || fail "general-only profile selected physical hardware"
+  execution_mode=diagnostic
+  diagnostic_device=foreign-seeker
+  capture_device_fleet || fail "diagnostic exact-serial capture changed"
+  [ "$(cat "$captured_device_serials")" = foreign-seeker ] || fail "diagnostic selected canonical devices"
+) || fail "production fleet-capture regression"
+# A ready physical target must not suppress canonical AVD creation.
+if grep -Fq 'elif [ ! -s "$device_serials" ]; then' "$here/test-main.sh"; then
+  fail "physical Solana presence still suppresses the required owned AVD"
+fi
+(
+  timeout() { shift; "$@"; }
+  fake_solana_failure=''
+  fake_solana_adb() {
+    [ "$1" = -s ] && [ "$2" = "$canonical_solana" ] || return 90
+    shift 2
+    printf '%s\n' "$*" >>"$fleet_dir/identity-reads"
+    case "$*" in
+      get-state) [ "$fake_solana_failure" != offline ] || return 1; printf 'device\n' ;;
+      get-serialno)
+        if [ "$fake_solana_failure" = serial ]; then printf 'other-device\n'; else printf '%s\n' "$canonical_solana"; fi ;;
+      'shell getprop ro.kernel.qemu'|'shell getprop ro.boot.qemu')
+        if [ "$fake_solana_failure" = emulator ]; then printf '1\n'; else printf '0\n'; fi ;;
+      'shell getprop ro.product.manufacturer') printf 'Solana Mobile\n' ;;
+      'shell getprop ro.product.brand') printf 'OSOM\n' ;;
+      'shell getprop ro.product.model')
+        if [ "$fake_solana_failure" = model ]; then printf 'Generic\n'; else printf 'Saga\n'; fi ;;
+      'shell getprop ro.product.name'|'shell getprop ro.product.device') printf 'ingot\n' ;;
+      'shell getprop ro.build.version.sdk')
+        if [ "$fake_solana_failure" = api ]; then printf '25\n'; else printf '34\n'; fi ;;
+      'shell getprop ro.product.cpu.abilist')
+        if [ "$fake_solana_failure" = abi ]; then printf 'x86_64\n'; else printf 'arm64-v8a,armeabi-v7a\n'; fi ;;
+      *) fail "identity proof attempted a mutation: $*" ;;
+    esac
+  }
+  android_acceptance_validate_canonical_solana_device fake_solana_adb "$canonical_solana" || \
+    fail "authorized ARM API34 Saga failed read-only identity validation"
+  for fake_solana_failure in offline serial emulator model api abi; do
+    if android_acceptance_validate_canonical_solana_device \
+        fake_solana_adb "$canonical_solana" >/dev/null 2>&1; then
+      fail "invalid physical identity/capability $fake_solana_failure was accepted"
+    fi
+  done
+  fake_solana_failure=''
+  for unauthorized_serial in foreign-seeker 3RESERVEDPHONEA RESERVEDPHONEB emulator-5554; do
+    : >"$fleet_dir/identity-reads"
+    if android_acceptance_validate_canonical_solana_device \
+        fake_solana_adb "$unauthorized_serial" >/dev/null 2>&1; then
+      fail "unapproved serial passed canonical physical identity gate"
+    fi
+    [ ! -s "$fleet_dir/identity-reads" ] || fail "identity gate contacted an unapproved serial"
+  done
+
+  # Execute the actual removal wrapper with fake mutation endpoints. Failed
+  # authorization must not reach even the first uninstall operation.
+  # shellcheck disable=SC2294
+  eval "$(sed -n '/^authorize_selected_device()/,/^}/p' "$here/test-main.sh")"
+  # shellcheck disable=SC2294
+  eval "$(sed -n '/^uninstall_acceptance_packages()/,/^}/p' "$here/test-main.sh")"
+  execution_mode=canonical
+  canonical_solana_serial="$canonical_solana"
+  reserved_device_serials=(3RESERVEDPHONEA RESERVEDPHONEB)
+  started_emulator_serial=emulator-5554
+  peer_serial=emulator-5556
+  emulator_pid=123
+  emulator_owner_token=test-owned
+  avd_name=urnetwork-acceptance
+  diagnostic_device=''
+  adb=fake_solana_adb
+  android_acceptance_timeout_executable=fake-timeout
+  android_acceptance_runner_owns_emulator() { [ "${fake_lost_avd:-0}" = 0 ]; }
+  runner_owns_peer_emulator() { [ "${fake_lost_peer:-0}" = 0 ]; }
+  android_acceptance_uninstall_package() { printf '%s\n' "$3 $4" >>"$fleet_dir/fake-uninstalls"; }
+  for rejected_serial in foreign-seeker 3RESERVEDPHONEA RESERVEDPHONEB; do
+    if uninstall_acceptance_packages "$rejected_serial" "$fleet_dir/cleanup-test"; then
+      fail "cleanup accepted an unselected/reserved target"
+    fi
+  done
+  fake_solana_failure=model
+  if uninstall_acceptance_packages "$canonical_solana" "$fleet_dir/cleanup-test" >/dev/null 2>&1; then
+    fail "cleanup accepted lost Saga identity"
+  fi
+  fake_solana_failure=''
+  fake_lost_avd=1
+  fake_lost_peer=1
+  for rejected_serial in emulator-5554 emulator-5556; do
+    if uninstall_acceptance_packages "$rejected_serial" "$fleet_dir/cleanup-test"; then
+      fail "cleanup accepted lost emulator ownership"
+    fi
+  done
+  [ ! -e "$fleet_dir/fake-uninstalls" ] || fail "rejected identity caused package mutation"
+  uninstall_acceptance_packages "$canonical_solana" "$fleet_dir/cleanup-test" || \
+    fail "authorized physical cleanup failed"
+  [ "$(wc -l <"$fleet_dir/fake-uninstalls" | tr -d ' ')" = 2 ] || \
+    fail "authorized cleanup did not remove exactly the app/test pair"
+) || fail "canonical physical identity/mutation regression"
+# Read-only failure is not mutation ownership. EXIT visits only the list
+# enrolled after identity proof and before physical readiness mutation.
+# shellcheck disable=SC2016
+grep -Fq 'done 3<"$device_cleanup_records"' "$here/test-main.sh" || \
+  fail "EXIT cleanup still visits every merely selected phone"
+# shellcheck disable=SC2016
+enrollment_source="$(sed -n '/selected device \$serial lost mutation authorization/,+6p' "$here/test-main.sh")"
+# shellcheck disable=SC2016
+grep -Fq '>>"$device_cleanup_records"' <<<"$enrollment_source" || \
+  fail "mutation enrollment does not immediately follow identity proof"
+
+# The capability planner is independently tested with a synthetic, explicitly
+# declared multi-device fixture, not with whatever ADB happens to enumerate.
+printf '%s\n' emulator-5554 partner-serial >"$fleet_selected"
 
 fleet_records="$fleet_dir/records"
 fleet_capabilities="$fleet_dir/capabilities"
@@ -236,6 +550,33 @@ android_acceptance_require_target_coverage \
 if android_acceptance_require_target_coverage "$fleet_plan" missing >/dev/null 2>&1; then
   fail "a requested flavor with no compatible device was accepted"
 fi
+printf '%s\n' \
+  $'owned-avd\temulator-5554\t1\t0\t34' \
+  "physical-saga"$'\t'"$canonical_solana"$'\t1\t1\t34' \
+  >"$fleet_dir/canonical-capabilities"
+android_acceptance_write_device_flavor_plan \
+  "$fleet_dir/canonical-capabilities" "$fleet_dir/canonical-plan" "$fleet_dir/canonical-skips" \
+  --canonical-devices emulator-5554 "$canonical_solana" github play solana_dapp fdroid || \
+  fail "canonical role-scoped shipping matrix failed"
+expected_canonical_plan=$'owned-avd\temulator-5554\tgithub\nowned-avd\temulator-5554\tplay\nphysical-saga\t'"$canonical_solana"$'\tsolana_dapp\nowned-avd\temulator-5554\tfdroid'
+[ "$(cat "$fleet_dir/canonical-plan")" = "$expected_canonical_plan" ] || \
+  fail "canonical role scope installed a general flavor on Saga or Solana on AVD"
+android_acceptance_require_target_coverage "$fleet_dir/canonical-plan" github play solana_dapp fdroid || \
+  fail "canonical physical lane did not satisfy complete shipping-flavor coverage"
+[ "$(wc -l <"$fleet_dir/canonical-skips" | tr -d ' ')" = 4 ] || \
+  fail "canonical role omissions were not retained"
+for invalid_inventory in missing duplicate foreign; do
+  case "$invalid_inventory" in
+    missing) sed -n '1p' "$fleet_dir/canonical-capabilities" >"$fleet_dir/canonical-bad" ;;
+    duplicate) { cat "$fleet_dir/canonical-capabilities"; sed -n '2p' "$fleet_dir/canonical-capabilities"; } >"$fleet_dir/canonical-bad" ;;
+    foreign) sed "s/$canonical_solana/foreign-seeker/" "$fleet_dir/canonical-capabilities" >"$fleet_dir/canonical-bad" ;;
+  esac
+  if android_acceptance_write_device_flavor_plan \
+      "$fleet_dir/canonical-bad" "$fleet_dir/canonical-bad-plan" "$fleet_dir/canonical-bad-skips" \
+      --canonical-devices emulator-5554 "$canonical_solana" github play solana_dapp fdroid; then
+    fail "canonical planner accepted $invalid_inventory physical identity"
+  fi
+done
 printf '%s\n' $'device-bad\tbad-serial\t1\t0\tnot-an-api' >"$fleet_dir/bad-capabilities"
 if android_acceptance_write_device_flavor_plan \
     "$fleet_dir/bad-capabilities" "$fleet_dir/bad-plan" "$fleet_dir/bad-skips" github; then
@@ -248,12 +589,12 @@ if android_acceptance_write_device_flavor_plan \
   fail "a removed Android acceptance target was still planned"
 fi
 if android_acceptance_validate_diagnostic_request \
-    0B111JEC200229 peer-to-peer 1 "$dropped_target" 1 0 0 0 0 '' \
-    3B161FDJG001KT R5CX21FY6ND >/dev/null 2>&1; then
+    0DIAGPHONE001 peer-to-peer 1 "$dropped_target" 1 0 0 0 0 '' \
+    3RESERVEDPHONEA RESERVEDPHONEB >/dev/null 2>&1; then
   fail "a removed Android acceptance target was accepted for diagnostics"
 fi
 while IFS=$'\t' read -r device_id device_serial flavor; do
-  for result_case in email phone instant password data-plane peer-to-peer; do
+  for result_case in email phone instant password data-plane peer-to-peer usdc-quote; do
     printf '%s\t%s\t%s\t%s\tPASS\tcovered\n' \
       "$device_id" "$device_serial" "$flavor" "$result_case" >>"$fleet_results"
   done
@@ -285,15 +626,14 @@ if android_acceptance_verify_device_flavor_smoke_results \
 fi
 
 printf '%s\n' 'List of devices attached' $'unreserved\tunauthorized usb:1-1' >"$fleet_raw"
-if android_acceptance_select_adb_devices \
-    "$fleet_raw" "$fleet_selected" "$fleet_excluded" \
-    3B161FDJG001KT R5CX21FY6ND >/dev/null 2>&1; then
-  fail "an unavailable non-reserved attached device was silently skipped"
-fi
+android_acceptance_select_adb_devices \
+  "$fleet_raw" "$fleet_selected" "$fleet_excluded" '' \
+  3RESERVEDPHONEA RESERVEDPHONEB || fail "an unrelated unauthorized device aborted enumeration"
+[ ! -s "$fleet_selected" ] || fail "an unrelated unauthorized device was selected"
 printf '%s\n' 'List of devices attached' $'same\tdevice' $'same\tdevice' >"$fleet_raw"
 if android_acceptance_select_adb_devices \
-    "$fleet_raw" "$fleet_selected" "$fleet_excluded" \
-    3B161FDJG001KT R5CX21FY6ND >/dev/null 2>&1; then
+    "$fleet_raw" "$fleet_selected" "$fleet_excluded" same \
+    3RESERVEDPHONEA RESERVEDPHONEB >/dev/null 2>&1; then
   fail "duplicate attached device serials were accepted"
 fi
 
@@ -307,94 +647,94 @@ if android_acceptance_execution_mode 1 0 >/dev/null 2>&1 || \
 fi
 
 android_acceptance_validate_diagnostic_request \
-  0B111JEC200229 peer-to-peer 1 github 1 0 0 0 0 '' \
-  3B161FDJG001KT R5CX21FY6ND || \
+  0DIAGPHONE001 peer-to-peer 1 github 1 0 0 0 0 '' \
+  3RESERVEDPHONEA RESERVEDPHONEB || \
   fail "the exact bounded GitHub P2P diagnostic request was rejected"
 if android_acceptance_validate_diagnostic_request \
-    3B161FDJG001KT peer-to-peer 1 github 1 0 0 0 0 '' \
-    3B161FDJG001KT R5CX21FY6ND >/dev/null 2>&1; then
+    3RESERVEDPHONEA peer-to-peer 1 github 1 0 0 0 0 '' \
+    3RESERVEDPHONEA RESERVEDPHONEB >/dev/null 2>&1; then
   fail "a reserved performance device was accepted for diagnostic execution"
 fi
 if android_acceptance_validate_diagnostic_request \
     emulator-5554 peer-to-peer 1 github 1 0 0 0 0 '' \
-    3B161FDJG001KT R5CX21FY6ND >/dev/null 2>&1; then
+    3RESERVEDPHONEA RESERVEDPHONEB >/dev/null 2>&1; then
   fail "a peer emulator was accepted as the diagnostic physical device"
 fi
 if android_acceptance_validate_diagnostic_request \
     'unsafe serial' peer-to-peer 1 github 1 0 0 0 0 '' \
-    3B161FDJG001KT R5CX21FY6ND >/dev/null 2>&1; then
+    3RESERVEDPHONEA RESERVEDPHONEB >/dev/null 2>&1; then
   fail "an unsafe diagnostic adb serial was accepted"
 fi
 if android_acceptance_validate_diagnostic_request \
-    0B111JEC200229 password 1 github 1 0 0 0 0 '' \
-    3B161FDJG001KT R5CX21FY6ND >/dev/null 2>&1; then
+    0DIAGPHONE001 password 1 github 1 0 0 0 0 '' \
+    3RESERVEDPHONEA RESERVEDPHONEB >/dev/null 2>&1; then
   fail "a non-P2P diagnostic case was accepted"
 fi
 if android_acceptance_validate_diagnostic_request \
-    0B111JEC200229 peer-to-peer 2 github 1 0 0 0 0 '' \
-    3B161FDJG001KT R5CX21FY6ND >/dev/null 2>&1 || \
+    0DIAGPHONE001 peer-to-peer 2 github 1 0 0 0 0 '' \
+    3RESERVEDPHONEA RESERVEDPHONEB >/dev/null 2>&1 || \
    android_acceptance_validate_diagnostic_request \
-    0B111JEC200229 peer-to-peer 1 github,play 1 0 0 0 0 '' \
-    3B161FDJG001KT R5CX21FY6ND >/dev/null 2>&1; then
+    0DIAGPHONE001 peer-to-peer 1 github,play 1 0 0 0 0 '' \
+    3RESERVEDPHONEA RESERVEDPHONEB >/dev/null 2>&1; then
   fail "a diagnostic request with more than one flavor was accepted"
 fi
 if android_acceptance_validate_diagnostic_request \
-    0B111JEC200229 peer-to-peer 1 github 3 0 0 0 0 '' \
-    3B161FDJG001KT R5CX21FY6ND >/dev/null 2>&1; then
+    0DIAGPHONE001 peer-to-peer 1 github 3 0 0 0 0 '' \
+    3RESERVEDPHONEA RESERVEDPHONEB >/dev/null 2>&1; then
   fail "in-process diagnostic repetition was accepted instead of independent runs"
 fi
 if android_acceptance_validate_diagnostic_request \
-    0B111JEC200229 peer-to-peer 1 github 1 1 0 0 0 '' \
-    3B161FDJG001KT R5CX21FY6ND >/dev/null 2>&1; then
+    0DIAGPHONE001 peer-to-peer 1 github 1 1 0 0 0 '' \
+    3RESERVEDPHONEA RESERVEDPHONEB >/dev/null 2>&1; then
   fail "a diagnostic request was allowed to reuse stale APKs"
 fi
 if android_acceptance_validate_diagnostic_request \
-    0B111JEC200229 peer-to-peer 1 github 1 0 1 0 0 '' \
-    3B161FDJG001KT R5CX21FY6ND >/dev/null 2>&1 || \
+    0DIAGPHONE001 peer-to-peer 1 github 1 0 1 0 0 '' \
+    3RESERVEDPHONEA RESERVEDPHONEB >/dev/null 2>&1 || \
    android_acceptance_validate_diagnostic_request \
-    0B111JEC200229 peer-to-peer 1 github 1 0 0 1 0 '' \
-    3B161FDJG001KT R5CX21FY6ND >/dev/null 2>&1 || \
+    0DIAGPHONE001 peer-to-peer 1 github 1 0 0 1 0 '' \
+    3RESERVEDPHONEA RESERVEDPHONEB >/dev/null 2>&1 || \
    android_acceptance_validate_diagnostic_request \
-    0B111JEC200229 peer-to-peer 1 github 1 0 0 0 1 '' \
-    3B161FDJG001KT R5CX21FY6ND >/dev/null 2>&1; then
+    0DIAGPHONE001 peer-to-peer 1 github 1 0 0 0 1 '' \
+    3RESERVEDPHONEA RESERVEDPHONEB >/dev/null 2>&1; then
   fail "a diagnostic request weakened smoke, emulator, or fixture cleanup"
 fi
 if android_acceptance_validate_diagnostic_request \
-    0B111JEC200229 peer-to-peer 1 github 1 0 0 0 0 proof.tsv \
-    3B161FDJG001KT R5CX21FY6ND >/dev/null 2>&1; then
+    0DIAGPHONE001 peer-to-peer 1 github 1 0 0 0 0 proof.tsv \
+    3RESERVEDPHONEA RESERVEDPHONEB >/dev/null 2>&1; then
   fail "diagnostic selectors were accepted for a canonical result file"
 fi
 
 diagnostic_captured="$fleet_dir/diagnostic-captured"
 diagnostic_selected="$fleet_dir/diagnostic-selected"
-printf '%s\n' 0B111JEC200229 partner-serial >"$diagnostic_captured"
+printf '%s\n' 0DIAGPHONE001 partner-serial >"$diagnostic_captured"
 android_acceptance_select_diagnostic_device \
-  "$diagnostic_captured" "$diagnostic_selected" 0B111JEC200229 \
-  3B161FDJG001KT R5CX21FY6ND || \
+  "$diagnostic_captured" "$diagnostic_selected" 0DIAGPHONE001 \
+  3RESERVEDPHONEA RESERVEDPHONEB || \
   fail "the requested physical serial was not selected from the immutable fleet"
-[ "$(cat "$diagnostic_selected")" = 0B111JEC200229 ] || \
+[ "$(cat "$diagnostic_selected")" = 0DIAGPHONE001 ] || \
   fail "diagnostic selection changed the exact requested serial"
 if android_acceptance_select_diagnostic_device \
     "$diagnostic_captured" "$diagnostic_selected" missing-serial \
-    3B161FDJG001KT R5CX21FY6ND >/dev/null 2>&1; then
+    3RESERVEDPHONEA RESERVEDPHONEB >/dev/null 2>&1; then
   fail "a serial absent from the captured fleet was accepted"
 fi
 if android_acceptance_select_diagnostic_device \
-    "$diagnostic_captured" "$diagnostic_selected" 3B161FDJG001KT \
-    3B161FDJG001KT R5CX21FY6ND >/dev/null 2>&1; then
+    "$diagnostic_captured" "$diagnostic_selected" 3RESERVEDPHONEA \
+    3RESERVEDPHONEA RESERVEDPHONEB >/dev/null 2>&1; then
   fail "the immutable-fleet selector bypassed reserved-device exclusion"
 fi
-printf '%s\n' 0B111JEC200229 0B111JEC200229 >"$diagnostic_captured"
+printf '%s\n' 0DIAGPHONE001 0DIAGPHONE001 >"$diagnostic_captured"
 if android_acceptance_select_diagnostic_device \
-    "$diagnostic_captured" "$diagnostic_selected" 0B111JEC200229 \
-    3B161FDJG001KT R5CX21FY6ND >/dev/null 2>&1; then
+    "$diagnostic_captured" "$diagnostic_selected" 0DIAGPHONE001 \
+    3RESERVEDPHONEA RESERVEDPHONEB >/dev/null 2>&1; then
   fail "a duplicated diagnostic serial was accepted"
 fi
 
 diagnostic_plan="$fleet_dir/diagnostic-plan"
 diagnostic_results="$fleet_dir/diagnostic-results"
-printf '%s\n' $'device-001-0B111JEC200229\t0B111JEC200229\tgithub' >"$diagnostic_plan"
-printf '%s\n' $'device-001-0B111JEC200229\t0B111JEC200229\tgithub\tpeer-to-peer\tPASS\tcovered' \
+printf '%s\n' $'device-001-0DIAGPHONE001\t0DIAGPHONE001\tgithub' >"$diagnostic_plan"
+printf '%s\n' $'device-001-0DIAGPHONE001\t0DIAGPHONE001\tgithub\tpeer-to-peer\tPASS\tcovered' \
   >"$diagnostic_results"
 android_acceptance_verify_diagnostic_result \
   "$diagnostic_plan" "$diagnostic_results" peer-to-peer || \
@@ -528,10 +868,25 @@ env -u URNETWORK_NETWORK_TEST_LOCK_HELD \
   URNETWORK_NETWORK_TESTING=1 \
   URNETWORK_NETWORK_TEST_LOCK_PATH="$network_gate_lock" \
   "$here/test-main.sh" --headless --flavor=github \
-    --diagnostic-device=0B111JEC200229 --diagnostic-case=peer-to-peer \
+    --diagnostic-device=0DIAGPHONE001 --diagnostic-case=peer-to-peer \
     >"$network_gate_dir/diagnostic.log" 2>&1 || android_gate_diagnostic_status=$?
 [ "$android_gate_diagnostic_status" -eq 75 ] || \
   fail "a direct Android diagnostic did not reject live shared ownership with status 75"
+
+android_gate_owned_diagnostic_status=0
+env -u URNETWORK_NETWORK_TEST_LOCK_HELD \
+  -u URNETWORK_NETWORK_TEST_LOCK_ROLE \
+  -u URNETWORK_NETWORK_TEST_LOCK_SCOPE \
+  PATH="$network_gate_fake_bin:$PATH" \
+  ANDROID_GATE_NODE_MARKER="$network_gate_node_marker" \
+  URNETWORK_ROOT="$here/.." \
+  URNETWORK_NETWORK_TESTING=1 \
+  URNETWORK_NETWORK_TEST_LOCK_PATH="$network_gate_lock" \
+  "$here/test-main.sh" --headless --flavor=play \
+    --diagnostic-owned-avd --diagnostic-case=peer-to-peer \
+    >"$network_gate_dir/owned-diagnostic.log" 2>&1 || android_gate_owned_diagnostic_status=$?
+[ "$android_gate_owned_diagnostic_status" -eq 75 ] || \
+  fail "an owned-AVD diagnostic did not reject live shared ownership before startup"
 
 android_gate_full_status=0
 env -u URNETWORK_NETWORK_TEST_LOCK_HELD \
@@ -587,15 +942,52 @@ env -u URNETWORK_NETWORK_TEST_LOCK_HELD \
 [ "$(cat "$network_gate_node_marker")" = android-p2p-diagnostic ] || \
   fail "Android replaced the explicit outer diagnostic ownership role"
 rm -f "$network_gate_node_marker"
+
+sdk_lock_markers=(
+  URNETWORK_ANDROID_SDK_OUTPUT_LOCK_HELD
+  URNETWORK_ANDROID_SDK_OUTPUT_LOCK_DIR
+  URNETWORK_ANDROID_SDK_OUTPUT_LOCK_PATH
+  URNETWORK_ANDROID_SDK_OUTPUT_LOCK_FD
+  URNETWORK_ANDROID_SDK_OUTPUT_LOCK_TOKEN
+  URNETWORK_ANDROID_SDK_OUTPUT_LOCK_ROLE
+)
+for sdk_lock_marker in "${sdk_lock_markers[@]}"; do
+  android_sdk_marker_status=0
+  env -u URNETWORK_ANDROID_SDK_OUTPUT_LOCK_HELD \
+    -u URNETWORK_ANDROID_SDK_OUTPUT_LOCK_DIR \
+    -u URNETWORK_ANDROID_SDK_OUTPUT_LOCK_PATH \
+    -u URNETWORK_ANDROID_SDK_OUTPUT_LOCK_FD \
+    -u URNETWORK_ANDROID_SDK_OUTPUT_LOCK_TOKEN \
+    -u URNETWORK_ANDROID_SDK_OUTPUT_LOCK_ROLE \
+    PATH="$network_gate_fake_bin:$PATH" \
+    ANDROID_GATE_NODE_MARKER="$network_gate_node_marker" \
+    URNETWORK_ROOT="$here/.." \
+    URNETWORK_NETWORK_TESTING=1 \
+    URNETWORK_NETWORK_TEST_LOCK_PATH="$network_gate_lock" \
+    "$network_gate" main-acceptance android-sdk-marker-test -- \
+      env "$sdk_lock_marker=synthetic" "$here/test-main.sh" --headless \
+      >"$network_gate_dir/$sdk_lock_marker.log" 2>&1 || \
+    android_sdk_marker_status=$?
+  [ "$android_sdk_marker_status" -eq 70 ] || \
+    fail "Android accepted inherited SDK-output marker $sdk_lock_marker"
+  [ ! -e "$network_gate_node_marker" ] || \
+    fail "inherited SDK-output marker $sdk_lock_marker reached Node preflight"
+  grep -Fq \
+    'must not inherit URNETWORK_ANDROID_SDK_OUTPUT_LOCK_*' \
+    "$network_gate_dir/$sdk_lock_marker.log" || \
+    fail "inherited SDK-output marker $sdk_lock_marker lacked the self-gating error"
+done
 trap - EXIT
 
-grep -Fq 'reserved_device_serials=(3B161FDJG001KT R5CX21FY6ND)' "$here/test-main.sh" || \
-  fail "the two performance devices are not mandatory runner exclusions"
+# shellcheck disable=SC2016
+grep -Fq 'android_acceptance_reserved_device_serials "$config_reader" "$vault"' "$here/test-main.sh" || \
+  fail "the performance devices are not mandatory runner exclusions"
+grep -Fq 'get android.performance_device_serials' "$here/test-main-lib.sh" || \
+  fail "the performance devices are not read from tests.yml"
 grep -Fq 'targets="github play solana_dapp fdroid"' "$here/test-main.sh" || \
   fail "the canonical no-selector flavor matrix changed"
 if grep -Fq "$dropped_target" \
-    "$here/test-main.sh" "$here/test-main-lib.sh" "$here/build.sh" \
-    "$here/.github/workflows/build-and-test.yml"; then
+    "$here/test-main.sh" "$here/test-main-lib.sh" "$here/build.sh"; then
   fail "the removed Android target remains in acceptance or aggregate build dispatch"
 fi
 for aggregate_build_task in \
@@ -637,6 +1029,9 @@ network_gate_line="$(grep -n -m1 \
 # shellcheck disable=SC2016
 network_verify_line="$(grep -n -m1 '"$network_test_gate" --verify-held main-acceptance' \
   "$here/test-main.sh" | cut -d: -f1)"
+sdk_marker_reject_line="$(grep -n -m1 \
+  'must not inherit URNETWORK_ANDROID_SDK_OUTPUT_LOCK_' \
+  "$here/test-main.sh" | cut -d: -f1)"
 # shellcheck disable=SC2016
 preflight_line="$(grep -n -m1 'node "$root/build/all/acceptance/preflight-main.mjs"' \
   "$here/test-main.sh" | cut -d: -f1)"
@@ -651,9 +1046,12 @@ sdk_owner_line="$(grep -n -m1 'android_acceptance_verify_sdk_build_owner' \
 fleet_capture_line="$(grep -n -m1 '^capture_device_fleet ||' \
   "$here/test-main.sh" | cut -d: -f1)"
 if [ -z "$network_gate_line" ] || [ -z "$network_verify_line" ] ||
+   [ -z "$sdk_marker_reject_line" ] ||
    [ -z "$preflight_line" ] || [ -z "$artifact_mutation_line" ] ||
    [ "$network_gate_line" -ge "$preflight_line" ] ||
    [ "$network_verify_line" -ge "$preflight_line" ] ||
+   [ "$network_verify_line" -ge "$sdk_marker_reject_line" ] ||
+   [ "$sdk_marker_reject_line" -ge "$preflight_line" ] ||
    [ "$network_gate_line" -ge "$artifact_mutation_line" ] ||
    [ "$network_verify_line" -ge "$artifact_mutation_line" ] ||
    [ "$network_gate_line" -ge "$sdk_build_line" ] ||
@@ -729,28 +1127,78 @@ system_timeout_executable="$(type -P timeout)"
 [ -x "$system_timeout_executable" ] || fail "test requires an external GNU timeout"
 
 emulator_log="$(mktemp "${TMPDIR:-/tmp}/urnetwork-android-emulator.test.XXXXXX")"
+printf -v oversized_emulator_owner '%093d' 0
 if (run_android_acceptance_shared_avd_emulator \
-    /usr/bin/true "$emulator_log" -avd urnetwork-acceptance -gpu host) >/dev/null 2>&1; then
+    /usr/bin/true "$emulator_log" "$oversized_emulator_owner" \
+    -avd urnetwork-acceptance -read-only -gpu host -port 5610) \
+    >/dev/null 2>&1; then
+  fail "shared AVD launcher accepted an oversized instance ID"
+fi
+if (run_android_acceptance_shared_avd_emulator \
+    /usr/bin/true "$emulator_log" test-owner \
+    -avd urnetwork-acceptance -gpu host) >/dev/null 2>&1; then
   fail "shared AVD launcher accepted a writable emulator"
 fi
 (run_android_acceptance_shared_avd_emulator \
-  /usr/bin/true "$emulator_log" -avd urnetwork-acceptance -read-only -gpu host) || \
+  /usr/bin/true "$emulator_log" test-owner \
+  -avd urnetwork-acceptance -read-only -gpu host -port 5610) || \
   fail "shared AVD launcher rejected a read-only host-rendered emulator"
 if (run_android_acceptance_shared_avd_emulator \
-    /usr/bin/true "$emulator_log" -avd urnetwork-acceptance -read-only) \
+    /usr/bin/true "$emulator_log" test-owner \
+    -avd urnetwork-acceptance -read-only) \
     >/dev/null 2>&1; then
   fail "shared AVD launcher accepted an implicit renderer"
 fi
 if (run_android_acceptance_shared_avd_emulator \
-    /usr/bin/true "$emulator_log" -avd urnetwork-acceptance -read-only -gpu auto) \
+    /usr/bin/true "$emulator_log" test-owner \
+    -avd urnetwork-acceptance -read-only -gpu auto) \
     >/dev/null 2>&1; then
   fail "shared AVD launcher accepted a renderer that can select software"
 fi
 if (run_android_acceptance_shared_avd_emulator \
-    /usr/bin/true "$emulator_log" -avd urnetwork-acceptance -read-only -gpu host -cores 1) \
+    /usr/bin/true "$emulator_log" test-owner \
+    -avd urnetwork-acceptance -read-only -gpu host -cores 1) \
     >/dev/null 2>&1; then
   fail "shared AVD launcher accepted a guest CPU override"
 fi
+
+# The launcher stamps a per-launch ownership value into its exact guest. This
+# is what binds the captured child PID to the guest and distinguishes it from
+# an older same-name AVD at the same adb serial; a live PID or matching AVD name
+# alone does not establish that relationship.
+emulator_launch_dir="$(mktemp -d "${TMPDIR:-/tmp}/urnetwork-android-emulator-owner.test.XXXXXX")"
+fake_emulator="$emulator_launch_dir/emulator"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf "%s\n" "$@"' \
+  >"$fake_emulator"
+chmod 700 "$fake_emulator"
+owned_emulator_log="$emulator_launch_dir/owned.log"
+run_android_acceptance_shared_avd_emulator \
+  "$fake_emulator" "$owned_emulator_log" synthetic-owner \
+  -avd synthetic-acceptance -read-only -gpu host -port 5610 &
+owned_emulator_pid=$!
+wait "$owned_emulator_pid" || fail "fake owned emulator launch failed"
+grep -Fxq -- '-id' "$owned_emulator_log" || \
+  fail "shared AVD launcher omitted its guest instance ID"
+grep -Fxq -- 'synthetic-owner' "$owned_emulator_log" || \
+  fail "shared AVD launcher instance ID did not identify its exact child"
+if grep -Fxq -- '-prop' "$owned_emulator_log"; then
+  fail "shared AVD launcher still injects an unreadable custom boot property"
+fi
+if (run_android_acceptance_shared_avd_emulator \
+    /usr/bin/true "$emulator_log" test-owner \
+    -avd synthetic-acceptance -read-only -gpu host -port 5610 \
+    -id foreign) >/dev/null 2>&1; then
+  fail "shared AVD launcher accepted a caller-supplied instance ID"
+fi
+if (run_android_acceptance_shared_avd_emulator \
+    /usr/bin/true "$emulator_log" test-owner \
+    -avd synthetic-acceptance -read-only -gpu host -port 5610 \
+    -prop qemu.unrelated=value) >/dev/null 2>&1; then
+  fail "shared AVD launcher accepted an unsupported boot property"
+fi
+rm -rf "$emulator_launch_dir"
 rm -f "$emulator_log"
 
 preflight_fixture_dir="$here/tests/fixtures/android-preflight"
@@ -785,6 +1233,27 @@ assert_preflight_classification \
 assert_preflight_classification \
   android_acceptance_classify_focused_window clear \
   "$preflight_fixture_dir/equivalent-window-syntax.txt"
+assert_preflight_classification \
+  android_acceptance_classify_focused_window clear \
+  "$preflight_fixture_dir/transient-empty-window.txt"
+assert_preflight_classification \
+  android_acceptance_classify_focused_window error-dialog \
+  "$preflight_fixture_dir/transient-empty-error-window.txt"
+assert_preflight_classification \
+  android_acceptance_classify_focused_window error-dialog \
+  "$preflight_fixture_dir/transient-empty-current-error-window.txt"
+assert_preflight_classification \
+  android_acceptance_classify_focused_window malformed \
+  "$preflight_fixture_dir/only-empty-window.txt"
+assert_preflight_classification \
+  android_acceptance_classify_focused_window malformed \
+  "$preflight_fixture_dir/only-empty-current-window.txt"
+assert_preflight_classification \
+  android_acceptance_classify_focused_window malformed \
+  "$preflight_fixture_dir/empty-null-window.txt"
+assert_preflight_classification \
+  android_acceptance_classify_focused_window ambiguous \
+  "$preflight_fixture_dir/empty-conflicting-window.txt"
 for fixture_kind in cpu renderer window; do
   classifier="android_acceptance_classify_${fixture_kind}_evidence"
   [ "$fixture_kind" != window ] || classifier=android_acceptance_classify_focused_window
@@ -805,6 +1274,15 @@ done
 [ "$(android_acceptance_focused_error_subject \
   "$(cat "$preflight_fixture_dir/captured-window.txt")")" = com.android.systemui ] || \
   fail "captured SystemUI ANR subject was not retained"
+[ "$(android_acceptance_focused_error_subject \
+  "$(cat "$preflight_fixture_dir/transient-empty-error-window.txt")")" = com.android.systemui ] || \
+  fail "SystemUI ANR subject after a transient empty window was not retained"
+[ "$(android_acceptance_focused_error_subject \
+  "$(cat "$preflight_fixture_dir/transient-empty-current-error-window.txt")")" = com.android.systemui ] || \
+  fail "SystemUI ANR subject after a transient empty current focus was not retained"
+[ "$(android_acceptance_focused_error_subject \
+  "$(cat "$preflight_fixture_dir/only-empty-current-window.txt")")" = unknown ] || \
+  fail "an empty-only current focus produced a trustworthy error subject"
 [ "$(android_acceptance_classify_renderer_evidence \
   'GLES: Google (Apple), Android Emulator OpenGL ES Translator (Apple M1 Max), OpenGL ES 3.0')" = host ] || \
   fail "a live host-rendered SurfaceFlinger identity was rejected"
@@ -820,6 +1298,486 @@ timeout() {
   shift
   "$@"
 }
+
+# Ownership is a live guest-to-child proof, not an inference from a matching
+# adb serial, matching AVD name, or independently live process. Force each
+# predicate so the historical same-name stale-AVD substitution is exact.
+FAKE_EMULATOR_OWNER_TOKEN=test-owner
+FAKE_EMULATOR_OWNER_AVD=synthetic-acceptance
+FAKE_EMULATOR_OWNER_STATE=device
+FAKE_EMULATOR_INVENTORY=none
+fake_emulator_owner_adb() {
+  if [ "$1" = devices ]; then
+    if [ "$FAKE_EMULATOR_INVENTORY" = malformed ]; then
+      printf 'not an adb inventory\n'
+      return 0
+    fi
+    printf 'List of devices attached\n'
+    case "$FAKE_EMULATOR_INVENTORY" in
+      none) ;;
+      expected|unrelated) printf 'emulator-5610\tdevice\n' ;;
+      offline) printf 'emulator-5610\toffline\n' ;;
+      *) return 90 ;;
+    esac
+    return 0
+  fi
+  [ "$1" = -s ] && [ "$2" = emulator-5610 ] || return 91
+  shift 2
+  case "$*" in
+    get-state) printf '%s\n' "$FAKE_EMULATOR_OWNER_STATE" ;;
+    'shell getprop qemu.urnetwork.acceptance_owner') printf '\n' ;;
+    'emu avd id') printf '%s\nOK\n' "$FAKE_EMULATOR_OWNER_TOKEN" ;;
+    'emu avd name')
+      if [ "$FAKE_EMULATOR_INVENTORY" = unrelated ]; then
+        printf 'other-avd\nOK\n'
+      else
+        printf '%s\nOK\n' "$FAKE_EMULATOR_OWNER_AVD"
+      fi
+      ;;
+    *) return 92 ;;
+  esac
+}
+
+# The live emulator accepts the custom -prop argument but exposes no value in
+# Android. This fake keeps that property empty while its supported console ID
+# is exact, so the successful proof regresses the observed API/emulator failure.
+android_acceptance_runner_owns_emulator \
+  fake_emulator_owner_adb emulator-5610 synthetic-acceptance "$$" test-owner || \
+  fail "an exact live guest/child ownership proof was rejected"
+FAKE_EMULATOR_OWNER_TOKEN=foreign
+if android_acceptance_runner_owns_emulator \
+    fake_emulator_owner_adb emulator-5610 synthetic-acceptance "$$" test-owner; then
+  fail "a stale same-name AVD was accepted using only an unrelated live PID"
+else
+  [ "$?" -eq 3 ] || fail "a nonempty instance-ID mismatch was not conclusive"
+fi
+FAKE_EMULATOR_OWNER_TOKEN=test-owner
+FAKE_EMULATOR_OWNER_AVD=other-avd
+if android_acceptance_runner_owns_emulator \
+    fake_emulator_owner_adb emulator-5610 synthetic-acceptance "$$" test-owner; then
+  fail "a guest with a different AVD identity was accepted as owned"
+else
+  [ "$?" -eq 3 ] || fail "a nonempty AVD mismatch was not conclusive"
+fi
+FAKE_EMULATOR_OWNER_AVD=synthetic-acceptance
+
+# wait-for-device can finish before a new guest's emulator instance ID or AVD
+# identity is queryable. The ownership barrier retries only missing evidence
+# while the exact child lives; definitive mismatches and dead children must
+# fail without consuming the full bound or touching another transport.
+ownership_barrier_calls="$(mktemp "${TMPDIR:-/tmp}/urnetwork-android-owner-barrier.test.XXXXXX")"
+ownership_barrier_adb_calls="$(mktemp "${TMPDIR:-/tmp}/urnetwork-android-adb-count.test.XXXXXX")"
+ownership_barrier_owner_calls="$(mktemp "${TMPDIR:-/tmp}/urnetwork-android-owner-count.test.XXXXXX")"
+ownership_barrier_avd_calls="$(mktemp "${TMPDIR:-/tmp}/urnetwork-android-avd-count.test.XXXXXX")"
+FAKE_OWNERSHIP_BARRIER_ADB_DELAY=0
+FAKE_OWNERSHIP_BARRIER_OWNER_DELAY=0
+FAKE_OWNERSHIP_BARRIER_AVD_DELAY=0
+FAKE_OWNERSHIP_BARRIER_OWNER=test-owner
+FAKE_OWNERSHIP_BARRIER_AVD=synthetic-acceptance
+ownership_barrier_kill_on_sleep=''
+reset_ownership_barrier() {
+  : >"$ownership_barrier_calls"
+  printf '0\n' >"$ownership_barrier_adb_calls"
+  printf '0\n' >"$ownership_barrier_owner_calls"
+  printf '0\n' >"$ownership_barrier_avd_calls"
+}
+fake_ownership_barrier_adb() {
+  local call_count
+
+  printf '%s\n' "$*" >>"$ownership_barrier_calls"
+  [ "$1" = -s ] && [ "$2" = emulator-5614 ] || return 90
+  shift 2
+  case "$*" in
+    get-state)
+      call_count="$(cat "$ownership_barrier_adb_calls")"
+      call_count=$((call_count + 1))
+      printf '%s\n' "$call_count" >"$ownership_barrier_adb_calls"
+      [ "$call_count" -gt "$FAKE_OWNERSHIP_BARRIER_ADB_DELAY" ] || return 1
+      printf 'device\n'
+      ;;
+    'shell getprop qemu.urnetwork.acceptance_owner') printf '\n' ;;
+    'emu avd id')
+      call_count="$(cat "$ownership_barrier_owner_calls")"
+      call_count=$((call_count + 1))
+      printf '%s\n' "$call_count" >"$ownership_barrier_owner_calls"
+      if [ "$call_count" -le "$FAKE_OWNERSHIP_BARRIER_OWNER_DELAY" ]; then
+        printf '\nOK\n'
+      else
+        printf '%s\nOK\n' "$FAKE_OWNERSHIP_BARRIER_OWNER"
+      fi
+      ;;
+    'emu avd name')
+      call_count="$(cat "$ownership_barrier_avd_calls")"
+      call_count=$((call_count + 1))
+      printf '%s\n' "$call_count" >"$ownership_barrier_avd_calls"
+      if [ "$call_count" -le "$FAKE_OWNERSHIP_BARRIER_AVD_DELAY" ]; then
+        printf '\nOK\n'
+      else
+        printf '%s\nOK\n' "$FAKE_OWNERSHIP_BARRIER_AVD"
+      fi
+      ;;
+    *) return 91 ;;
+  esac
+}
+android_acceptance_emulator_ownership_poll_sleep() {
+  if [ -n "$ownership_barrier_kill_on_sleep" ]; then
+    kill -TERM "$ownership_barrier_kill_on_sleep"
+    wait "$ownership_barrier_kill_on_sleep" 2>/dev/null || true
+    ownership_barrier_kill_on_sleep=''
+  fi
+}
+sleep 300 &
+ownership_barrier_pid=$!
+
+reset_ownership_barrier
+FAKE_OWNERSHIP_BARRIER_ADB_DELAY=1
+FAKE_OWNERSHIP_BARRIER_OWNER_DELAY=2
+FAKE_OWNERSHIP_BARRIER_AVD_DELAY=1
+android_acceptance_wait_for_runner_owned_emulator \
+  fake_ownership_barrier_adb emulator-5614 synthetic-acceptance \
+  "$ownership_barrier_pid" test-owner 5 || \
+  fail "delayed guest ownership evidence did not become ready within its bound"
+[ "$(cat "$ownership_barrier_adb_calls")" -eq 5 ] || \
+  fail "ownership barrier did not retry the delayed adb transport"
+[ "$(cat "$ownership_barrier_owner_calls")" -eq 4 ] || \
+  fail "ownership barrier did not retry the delayed instance ID"
+[ "$(cat "$ownership_barrier_avd_calls")" -eq 2 ] || \
+  fail "ownership barrier did not retry the delayed AVD identity"
+grep -Fq -- 'emu avd id' "$ownership_barrier_calls" || \
+  fail "ownership barrier did not query the emulator's supported instance ID"
+if grep -Fq 'qemu.urnetwork.acceptance_owner' "$ownership_barrier_calls"; then
+  fail "ownership barrier still queries the ignored custom boot property"
+fi
+
+sleep 300 &
+dying_ownership_barrier_pid=$!
+reset_ownership_barrier
+FAKE_OWNERSHIP_BARRIER_OWNER_DELAY=5
+ownership_barrier_kill_on_sleep="$dying_ownership_barrier_pid"
+if android_acceptance_wait_for_runner_owned_emulator \
+    fake_ownership_barrier_adb emulator-5614 synthetic-acceptance \
+    "$dying_ownership_barrier_pid" test-owner 5; then
+  fail "ownership barrier accepted a child that died while evidence was pending"
+fi
+[ "$(cat "$ownership_barrier_adb_calls")" -eq 1 ] || \
+  fail "ownership barrier kept polling adb after its exact child died"
+
+reset_ownership_barrier
+FAKE_OWNERSHIP_BARRIER_ADB_DELAY=0
+FAKE_OWNERSHIP_BARRIER_OWNER_DELAY=0
+FAKE_OWNERSHIP_BARRIER_AVD_DELAY=0
+FAKE_OWNERSHIP_BARRIER_OWNER=foreign
+if android_acceptance_wait_for_runner_owned_emulator \
+    fake_ownership_barrier_adb emulator-5614 synthetic-acceptance \
+    "$ownership_barrier_pid" test-owner 5; then
+  fail "ownership barrier accepted a mismatched nonempty guest token"
+fi
+[ "$(cat "$ownership_barrier_owner_calls")" -eq 1 ] || \
+  fail "ownership barrier retried a conclusive guest-token mismatch"
+[ "$(cat "$ownership_barrier_avd_calls")" -eq 0 ] || \
+  fail "ownership barrier queried AVD identity after a token mismatch"
+
+reset_ownership_barrier
+FAKE_OWNERSHIP_BARRIER_OWNER=test-owner
+FAKE_OWNERSHIP_BARRIER_AVD=other-avd
+if android_acceptance_wait_for_runner_owned_emulator \
+    fake_ownership_barrier_adb emulator-5614 synthetic-acceptance \
+    "$ownership_barrier_pid" test-owner 5; then
+  fail "ownership barrier accepted a mismatched nonempty AVD identity"
+fi
+[ "$(cat "$ownership_barrier_avd_calls")" -eq 1 ] || \
+  fail "ownership barrier retried a conclusive AVD mismatch"
+
+(exit 0) & completed_emulator_pid=$!
+wait "$completed_emulator_pid"
+reset_ownership_barrier
+if android_acceptance_wait_for_runner_owned_emulator \
+    fake_ownership_barrier_adb emulator-5614 synthetic-acceptance \
+    "$completed_emulator_pid" test-owner 5; then
+  fail "ownership barrier accepted an already-dead exact child"
+fi
+[ ! -s "$ownership_barrier_calls" ] || \
+  fail "ownership barrier reached adb after its exact child had died"
+
+kill -TERM "$ownership_barrier_pid"
+wait "$ownership_barrier_pid" 2>/dev/null || true
+android_acceptance_emulator_ownership_poll_sleep() { sleep 0.5; }
+rm -f \
+  "$ownership_barrier_calls" \
+  "$ownership_barrier_adb_calls" \
+  "$ownership_barrier_owner_calls" \
+  "$ownership_barrier_avd_calls"
+
+emulator_signal_dir="$(mktemp -d "${TMPDIR:-/tmp}/urnetwork-android-emulator-signal.test.XXXXXX")"
+(
+  trap 'printf "term\n" >"$emulator_signal_dir/term"; exit 0' TERM
+  printf 'ready\n' >"$emulator_signal_dir/term-ready"
+  while :; do sleep 1; done
+) &
+term_emulator_pid=$!
+for _ in $(seq 1 1000); do
+  [ -s "$emulator_signal_dir/term-ready" ] && break
+  sleep 0.01
+done
+[ -s "$emulator_signal_dir/term-ready" ] || fail "TERM test child did not reach its barrier"
+android_acceptance_emulator_cleanup_poll_sleep() { sleep 0.01; }
+android_acceptance_stop_emulator_child "$term_emulator_pid" 0 100 || \
+  fail "TERM-responsive emulator child required forced cleanup"
+[ "$(cat "$emulator_signal_dir/term" 2>/dev/null || true)" = term ] || \
+  fail "emulator cleanup did not deliver TERM to the exact child"
+(
+  trap '' TERM
+  printf 'ready\n' >"$emulator_signal_dir/stuck-ready"
+  while :; do sleep 1; done
+) &
+stuck_emulator_pid=$!
+for _ in $(seq 1 1000); do
+  [ -s "$emulator_signal_dir/stuck-ready" ] && break
+  sleep 0.01
+done
+[ -s "$emulator_signal_dir/stuck-ready" ] || fail "stuck test child did not reach its barrier"
+if android_acceptance_stop_emulator_child "$stuck_emulator_pid" 0 2; then
+  fail "an emulator child that ignored TERM was not reported as forced cleanup"
+fi
+if kill -0 "$stuck_emulator_pid" 2>/dev/null; then
+  fail "forced emulator cleanup left its exact child alive"
+fi
+android_acceptance_emulator_cleanup_poll_sleep() { sleep 0.2; }
+rm -rf "$emulator_signal_dir"
+
+android_acceptance_no_running_avd \
+  fake_emulator_owner_adb synthetic-acceptance || \
+  fail "an empty emulator inventory was rejected"
+FAKE_EMULATOR_INVENTORY=unrelated
+android_acceptance_no_running_avd \
+  fake_emulator_owner_adb synthetic-acceptance || \
+  fail "an unrelated running AVD was rejected"
+FAKE_EMULATOR_INVENTORY=expected
+if android_acceptance_no_running_avd \
+    fake_emulator_owner_adb synthetic-acceptance; then
+  fail "a pre-existing same-name AVD was available for implicit reuse"
+else
+  [ "$?" -eq 1 ] || fail "a same-name AVD conflict returned the wrong status"
+fi
+FAKE_EMULATOR_INVENTORY=offline
+if android_acceptance_no_running_avd \
+    fake_emulator_owner_adb synthetic-acceptance; then
+  fail "an unclassifiable emulator inventory was treated as ownership-safe"
+else
+  [ "$?" -eq 2 ] || fail "an unclassifiable emulator returned the wrong status"
+fi
+FAKE_EMULATOR_INVENTORY=malformed
+if android_acceptance_no_running_avd \
+    fake_emulator_owner_adb synthetic-acceptance; then
+  fail "a malformed emulator inventory was treated as an empty inventory"
+else
+  [ "$?" -eq 2 ] || fail "a malformed emulator inventory returned the wrong status"
+fi
+FAKE_EMULATOR_INVENTORY=none
+
+# The exact default AVD is a reserved harness resource, so a legacy guest whose
+# instance ID defaulted to its AVD name may be retired once. A per-launch-ID or
+# unrelated guest must remain untouched, and completion requires observed
+# inventory absence rather than a successful intermediate adb command status.
+legacy_retirement_calls="$(mktemp "${TMPDIR:-/tmp}/urnetwork-android-legacy-avd.test.XXXXXX")"
+legacy_retirement_state="$(mktemp "${TMPDIR:-/tmp}/urnetwork-android-legacy-state.test.XXXXXX")"
+FAKE_LEGACY_AVD=urnetwork-acceptance
+FAKE_LEGACY_OWNER=urnetwork-acceptance
+FAKE_LEGACY_ID_AVAILABLE=1
+FAKE_LEGACY_AFTER_KILL=absent
+FAKE_LEGACY_KILL_STATUS=0
+legacy_set_state() {
+  printf '%s\n' "$1" >"$legacy_retirement_state"
+}
+fake_legacy_avd_adb() {
+  local inventory_state remaining
+
+  printf '%s\n' "$*" >>"$legacy_retirement_calls"
+  if [ "$1" = devices ]; then
+    inventory_state="$(cat "$legacy_retirement_state")"
+    printf 'inventory-state=%s\n' "$inventory_state" >>"$legacy_retirement_calls"
+    [ "$inventory_state" != inventory-error ] || return 93
+    if [ "$inventory_state" = malformed ]; then
+      printf 'not an adb inventory\n'
+      return 0
+    fi
+    printf 'List of devices attached\n'
+    case "$inventory_state" in
+      initial|retained) printf 'emulator-5612\tdevice\n' ;;
+      offline:*)
+        printf 'emulator-5612\toffline\n'
+        remaining="${inventory_state#offline:}"
+        if [ "$remaining" -gt 1 ]; then
+          legacy_set_state "offline:$((remaining - 1))"
+        else
+          legacy_set_state absent
+        fi
+        ;;
+      absent) ;;
+      *) return 94 ;;
+    esac
+    return 0
+  fi
+  [ "$1" = -s ] && [ "$2" = emulator-5612 ] || return 90
+  shift 2
+  case "$*" in
+    'emu avd name') printf '%s\nOK\n' "$FAKE_LEGACY_AVD" ;;
+    'shell getprop qemu.urnetwork.acceptance_owner') printf '\n' ;;
+    'emu avd id')
+      [ "$FAKE_LEGACY_ID_AVAILABLE" -eq 1 ] || return 1
+      printf '%s\nOK\n' "$FAKE_LEGACY_OWNER"
+      ;;
+    'emu kill')
+      case "$FAKE_LEGACY_AFTER_KILL" in
+        absent|retained|inventory-error|malformed)
+          legacy_set_state "$FAKE_LEGACY_AFTER_KILL"
+          ;;
+        transient-offline) legacy_set_state offline:2 ;;
+        *) return 95 ;;
+      esac
+      return "$FAKE_LEGACY_KILL_STATUS"
+      ;;
+    wait-for-disconnect) return 96 ;;
+    *) return 91 ;;
+  esac
+}
+android_acceptance_emulator_disconnect_poll_sleep() { :; }
+
+# This is the live migration boundary: the kill request performs its side
+# effect, then reports timeout/failure because its transport disappeared before
+# the console reply completed. Confirmed absence must still retire the guest.
+legacy_set_state initial
+FAKE_LEGACY_AFTER_KILL=absent
+FAKE_LEGACY_KILL_STATUS=124
+[ "$(android_acceptance_retire_legacy_reserved_avd \
+  fake_legacy_avd_adb urnetwork-acceptance 3)" = retired ] || \
+  fail "a completed legacy retirement inherited adb kill's failure status"
+grep -Fxq -- '-s emulator-5612 emu kill' "$legacy_retirement_calls" || \
+  fail "legacy reserved AVD retirement did not issue one bounded kill"
+grep -Fxq -- '-s emulator-5612 emu avd id' "$legacy_retirement_calls" || \
+  fail "legacy retirement did not classify the emulator's default instance ID"
+if grep -Fq 'qemu.urnetwork.acceptance_owner' "$legacy_retirement_calls"; then
+  fail "legacy retirement still depends on the ignored custom boot property"
+fi
+grep -Fxq -- 'inventory-state=absent' "$legacy_retirement_calls" || \
+  fail "legacy reserved AVD retirement did not confirm immediate absence"
+if grep -Fq 'wait-for-disconnect' "$legacy_retirement_calls"; then
+  fail "legacy retirement still trusts serial-targeted disconnect exit status"
+fi
+
+: >"$legacy_retirement_calls"
+legacy_set_state initial
+FAKE_LEGACY_AFTER_KILL=transient-offline
+FAKE_LEGACY_KILL_STATUS=0
+[ "$(android_acceptance_retire_legacy_reserved_avd \
+  fake_legacy_avd_adb urnetwork-acceptance 4)" = retired ] || \
+  fail "a transient offline transport was not polled through exact absence"
+grep -Fxq -- 'inventory-state=offline:2' "$legacy_retirement_calls" || \
+  fail "legacy retirement did not observe the first offline terminal transition"
+grep -Fxq -- 'inventory-state=offline:1' "$legacy_retirement_calls" || \
+  fail "legacy retirement did not keep polling an offline transport"
+grep -Fxq -- 'inventory-state=absent' "$legacy_retirement_calls" || \
+  fail "legacy retirement did not observe absence after transient offline state"
+
+: >"$legacy_retirement_calls"
+legacy_set_state initial
+FAKE_LEGACY_AFTER_KILL=retained
+FAKE_LEGACY_KILL_STATUS=1
+if android_acceptance_retire_legacy_reserved_avd \
+    fake_legacy_avd_adb urnetwork-acceptance 3 >/dev/null; then
+  fail "legacy retirement passed while the exact transport remained listed"
+fi
+[ "$(grep -Fc 'inventory-state=retained' "$legacy_retirement_calls")" -eq 3 ] || \
+  fail "retained legacy transport was not checked for the exact poll bound"
+
+: >"$legacy_retirement_calls"
+legacy_set_state initial
+FAKE_LEGACY_AFTER_KILL=inventory-error
+FAKE_LEGACY_KILL_STATUS=0
+if android_acceptance_retire_legacy_reserved_avd \
+    fake_legacy_avd_adb urnetwork-acceptance 3 >/dev/null; then
+  fail "legacy retirement treated an inventory error as transport absence"
+fi
+grep -Fxq -- 'inventory-state=inventory-error' "$legacy_retirement_calls" || \
+  fail "legacy retirement did not reach its failed inventory boundary"
+
+: >"$legacy_retirement_calls"
+legacy_set_state initial
+FAKE_LEGACY_AFTER_KILL=malformed
+if android_acceptance_retire_legacy_reserved_avd \
+    fake_legacy_avd_adb urnetwork-acceptance 3 >/dev/null; then
+  fail "legacy retirement treated malformed inventory as transport absence"
+fi
+grep -Fxq -- 'inventory-state=malformed' "$legacy_retirement_calls" || \
+  fail "legacy retirement did not inspect the malformed inventory"
+
+: >"$legacy_retirement_calls"
+legacy_set_state initial
+if android_acceptance_retire_legacy_reserved_avd \
+    fake_legacy_avd_adb urnetwork-acceptance 0 >/dev/null; then
+  fail "legacy retirement accepted an invalid disconnect poll bound"
+else
+  [ "$?" -eq 2 ] || fail "invalid legacy disconnect bound returned the wrong status"
+fi
+[ ! -s "$legacy_retirement_calls" ] || \
+  fail "invalid legacy disconnect bound reached adb before validation"
+
+: >"$legacy_retirement_calls"
+legacy_set_state initial
+FAKE_LEGACY_OWNER=''
+if android_acceptance_retire_legacy_reserved_avd \
+    fake_legacy_avd_adb urnetwork-acceptance 3 >/dev/null; then
+  fail "legacy retirement accepted an empty emulator instance ID"
+fi
+if grep -Fq 'emu kill' "$legacy_retirement_calls"; then
+  fail "legacy migration killed an emulator with an unclassifiable instance ID"
+fi
+
+: >"$legacy_retirement_calls"
+legacy_set_state initial
+FAKE_LEGACY_OWNER=urnetwork-acceptance
+FAKE_LEGACY_ID_AVAILABLE=0
+if android_acceptance_retire_legacy_reserved_avd \
+    fake_legacy_avd_adb urnetwork-acceptance 3 >/dev/null; then
+  fail "legacy retirement accepted an unavailable emulator instance ID"
+fi
+if grep -Fq 'emu kill' "$legacy_retirement_calls"; then
+  fail "legacy migration killed an emulator whose instance ID query failed"
+fi
+
+: >"$legacy_retirement_calls"
+legacy_set_state initial
+FAKE_LEGACY_AFTER_KILL=absent
+FAKE_LEGACY_KILL_STATUS=0
+FAKE_LEGACY_ID_AVAILABLE=1
+FAKE_LEGACY_OWNER="$$"
+if android_acceptance_retire_legacy_reserved_avd \
+    fake_legacy_avd_adb urnetwork-acceptance 3 >/dev/null; then
+  fail "a per-launch-ID reserved AVD was retired as legacy"
+fi
+if grep -Fq 'emu kill' "$legacy_retirement_calls"; then
+  fail "legacy migration killed a per-launch-ID AVD"
+fi
+
+: >"$legacy_retirement_calls"
+legacy_set_state initial
+FAKE_LEGACY_OWNER=urnetwork-acceptance
+FAKE_LEGACY_AVD=other-avd
+[ "$(android_acceptance_retire_legacy_reserved_avd \
+  fake_legacy_avd_adb urnetwork-acceptance 3)" = none ] || \
+  fail "an unrelated AVD was classified as legacy acceptance state"
+if grep -Fq 'emu kill' "$legacy_retirement_calls"; then
+  fail "legacy migration killed an unrelated AVD"
+fi
+if android_acceptance_retire_legacy_reserved_avd \
+    fake_legacy_avd_adb custom-acceptance >/dev/null; then
+  fail "legacy retirement accepted a non-reserved custom AVD name"
+else
+  [ "$?" -eq 2 ] || fail "custom legacy AVD retirement returned the wrong status"
+fi
+android_acceptance_emulator_disconnect_poll_sleep() { sleep 0.5; }
+rm -f "$legacy_retirement_calls" "$legacy_retirement_state"
+
 preflight_test_dir="$(mktemp -d "${TMPDIR:-/tmp}/urnetwork-android-preflight.test.XXXXXX")"
 preflight_diagnostic="$preflight_test_dir/provider-preflight.txt"
 FAKE_PREFLIGHT_CPU="$preflight_fixture_dir/clean-cpu.txt"
@@ -899,6 +1857,18 @@ rm -f "$apk_test_dir/build/app.apk" "$apk_test_dir/build/test.apk"
   fail "cached app APK did not survive removal of the build output"
 [ "$(cat "$apk_test_dir/cache/test.apk")" = "test payload" ] || \
   fail "cached test APK did not survive removal of the build output"
+
+cache_fingerprint="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+android_acceptance_write_cache_metadata "$apk_test_dir/cache" acceptance-build "$cache_fingerprint" || \
+  fail "could not write cache metadata"
+android_acceptance_cache_is_current "$apk_test_dir/cache" "$cache_fingerprint" || \
+  fail "fresh APK cache was not accepted"
+printf '%s\n' "different" >"$apk_test_dir/cache/input.sha256"
+if android_acceptance_cache_is_current "$apk_test_dir/cache" "$cache_fingerprint"; then
+  fail "mismatched APK cache fingerprint was accepted"
+fi
+android_acceptance_write_cache_metadata "$apk_test_dir/cache" acceptance-build "$cache_fingerprint" || \
+  fail "could not restore cache metadata"
 
 install_calls="$apk_test_dir/install-calls"
 install_timeout_calls="$apk_test_dir/install-timeout-calls"
@@ -1089,6 +2059,39 @@ fi
   fail "full acceptance did not stop at the instrumentation APK failure"
 rm -rf "$apk_test_dir"
 
+fingerprint_tree="$(mktemp -d "${TMPDIR:-/tmp}/urnetwork-android-fingerprint.test.XXXXXX")"
+mkdir -p "$fingerprint_tree/app" "$fingerprint_tree/tests/__acceptance__/old-run"
+printf 'source one\n' >"$fingerprint_tree/app/Main.kt"
+printf 'gradle input\n' >"$fingerprint_tree/app/build.gradle"
+printf 'generated output\n' >"$fingerprint_tree/tests/__acceptance__/old-run/noise"
+printf 'sdk aar\n' >"$fingerprint_tree/sdk.aar"
+printf 'sdk sources\n' >"$fingerprint_tree/sdk-sources.jar"
+first_fingerprint="$(android_acceptance_input_fingerprint \
+  "$fingerprint_tree" "$fingerprint_tree/sdk.aar" "$fingerprint_tree/sdk-sources.jar" github Github)" || \
+  fail "could not fingerprint fallback source tree"
+second_fingerprint="$(android_acceptance_input_fingerprint \
+  "$fingerprint_tree" "$fingerprint_tree/sdk.aar" "$fingerprint_tree/sdk-sources.jar" github Github)" || \
+  fail "could not repeat fingerprint fallback source tree"
+[ "$first_fingerprint" = "$second_fingerprint" ] || \
+  fail "unchanged source tree received a different fingerprint"
+printf 'new generated output\n' >"$fingerprint_tree/tests/__acceptance__/old-run/noise"
+[ "$(android_acceptance_input_fingerprint \
+  "$fingerprint_tree" "$fingerprint_tree/sdk.aar" "$fingerprint_tree/sdk-sources.jar" github Github)" = "$first_fingerprint" ] || \
+  fail "generated acceptance artifacts changed the input fingerprint"
+printf 'source two\n' >"$fingerprint_tree/app/Main.kt"
+changed_fingerprint="$(android_acceptance_input_fingerprint \
+  "$fingerprint_tree" "$fingerprint_tree/sdk.aar" "$fingerprint_tree/sdk-sources.jar" github Github)" || \
+  fail "could not fingerprint changed source tree"
+[ "$changed_fingerprint" != "$first_fingerprint" ] || \
+  fail "source change did not invalidate the input fingerprint"
+printf 'warp.version=1\n' >"$fingerprint_tree/app/local.properties"
+local_properties_fingerprint="$(android_acceptance_input_fingerprint \
+  "$fingerprint_tree" "$fingerprint_tree/sdk.aar" "$fingerprint_tree/sdk-sources.jar" github Github)" || \
+  fail "could not fingerprint local.properties"
+[ "$local_properties_fingerprint" != "$changed_fingerprint" ] || \
+  fail "local.properties change did not invalidate the input fingerprint"
+rm -rf "$fingerprint_tree"
+
 timeout() {
   shift
   "$@"
@@ -1122,6 +2125,7 @@ reset_readiness_fake() {
   FAKE_READY_ABI=arm64-v8a,armeabi-v7a
   FAKE_READY_ABI_AVAILABLE=1
   FAKE_READY_AVD=urnetwork-acceptance
+  FAKE_READY_OWNER_PID="$$"
   FAKE_READY_LOCK_DISABLED=true
   FAKE_READY_DREAMING_LOCKSCREEN=false
   FAKE_READY_WINDOW_AVAILABLE=1
@@ -1154,6 +2158,7 @@ fake_readiness_adb() {
     'emu avd name')
       printf '%s\nOK\n' "$FAKE_READY_AVD"
       ;;
+    'emu avd id') printf '%s\nOK\n' "$FAKE_READY_OWNER_PID" ;;
     'shell getprop sys.boot_completed')
       printf '%s\n' "$FAKE_READY_BOOT"
       ;;
@@ -1248,9 +2253,16 @@ owned_diagnostic_field_is() {
     fail "owned AVD diagnostic $field was not $expected"
 }
 
+prepare_physical_readiness() {
+  [ "$#" -eq 7 ] || return 2
+  android_acceptance_prepare_device \
+    "$1" "$2" "$3" "$4" "$5" \
+    "$readiness_interactive" device-001 readiness "$6" "$7" 3
+}
+
 reset_readiness_fake
 FAKE_READY_LARGE_POWER=1
-android_acceptance_prepare_device \
+prepare_physical_readiness \
   fake_readiness_adb readiness-device 010181 "$readiness_dir/state" "$readiness_status" 1 1 || \
   fail "a ready supported-ARM device with working API TCP was rejected"
 readiness_status_is ready
@@ -1267,7 +2279,7 @@ fi
 
 reset_readiness_fake
 FAKE_READY_ADB_AVAILABLE=0
-if android_acceptance_prepare_device \
+if prepare_physical_readiness \
     fake_readiness_adb readiness-device 010181 "$readiness_dir/state" "$readiness_status" 1 1; then
   fail "an unavailable adb device passed readiness"
 fi
@@ -1275,7 +2287,7 @@ readiness_status_is adb-unavailable
 
 reset_readiness_fake
 FAKE_READY_BOOT=0
-if android_acceptance_prepare_device \
+if prepare_physical_readiness \
     fake_readiness_adb readiness-device 010181 "$readiness_dir/state" "$readiness_status" 1 1; then
   fail "an unbooted device passed readiness"
 fi
@@ -1283,7 +2295,7 @@ readiness_status_is boot-incomplete
 
 reset_readiness_fake
 FAKE_READY_API_AVAILABLE=0
-if android_acceptance_prepare_device \
+if prepare_physical_readiness \
     fake_readiness_adb readiness-device 010181 "$readiness_dir/state" "$readiness_status" 1 1; then
   fail "a device with unreadable Android API level passed readiness"
 fi
@@ -1291,7 +2303,7 @@ readiness_status_is api-unavailable
 
 reset_readiness_fake
 FAKE_READY_API=25
-if android_acceptance_prepare_device \
+if prepare_physical_readiness \
     fake_readiness_adb readiness-device 010181 "$readiness_dir/state" "$readiness_status" 1 1; then
   fail "a device older than the base shipping SDK passed readiness"
 fi
@@ -1299,7 +2311,7 @@ readiness_status_is shipping-api-unsupported
 
 reset_readiness_fake
 FAKE_READY_ABI_AVAILABLE=0
-if android_acceptance_prepare_device \
+if prepare_physical_readiness \
     fake_readiness_adb readiness-device 010181 "$readiness_dir/state" "$readiness_status" 1 1; then
   fail "a device with unreadable ABI state passed readiness"
 fi
@@ -1307,14 +2319,14 @@ readiness_status_is abi-unavailable
 
 reset_readiness_fake
 FAKE_READY_ABI=armeabi-v7a,armeabi
-android_acceptance_prepare_device \
+prepare_physical_readiness \
   fake_readiness_adb readiness-device 010181 "$readiness_dir/state" "$readiness_status" 1 1 || \
   fail "a shipping 32-bit ARM device was rejected"
 readiness_status_is ready
 
 reset_readiness_fake
 FAKE_READY_ABI=x86_64,x86
-if android_acceptance_prepare_device \
+if prepare_physical_readiness \
     fake_readiness_adb readiness-device 010181 "$readiness_dir/state" "$readiness_status" 1 1; then
   fail "a device without a general shipping ARM ABI passed readiness"
 fi
@@ -1322,7 +2334,7 @@ readiness_status_is shipping-abi-unsupported
 
 reset_readiness_fake
 FAKE_READY_UNLOCK_STATE=unknown
-if android_acceptance_prepare_device \
+if prepare_physical_readiness \
     fake_readiness_adb readiness-device 010181 "$readiness_dir/state" "$readiness_status" 1 1; then
   fail "a device with unknown unlock state passed readiness"
 fi
@@ -1366,6 +2378,15 @@ if grep -Eq 'shell wm size|shell input swipe|KEYCODE_[0-9]' "$readiness_calls"; 
 fi
 
 reset_readiness_fake
+FAKE_READY_OWNER_PID=test-owner
+ANDROID_ACCEPTANCE_EMULATOR_OWNER_TOKEN=test-owner \
+  android_acceptance_prepare_owned_emulator \
+    fake_readiness_adb emulator-5558 urnetwork-acceptance "$$" \
+    "$readiness_dir/state" "$readiness_status" "$readiness_interactive" 1 1 1 || \
+  fail "an explicit non-PID guest ownership token was not propagated"
+readiness_status_is ready
+
+reset_readiness_fake
 FAKE_READY_DREAMING_LOCKSCREEN=absent
 android_acceptance_prepare_owned_emulator \
   fake_readiness_adb emulator-5558 urnetwork-acceptance "$$" \
@@ -1376,8 +2397,23 @@ owned_diagnostic_field_is "$readiness_interactive" window absent
 owned_diagnostic_field_is "$readiness_interactive" result ready
 
 # Ownership is an explicit gate, not an inference from an emulator-* serial.
-# A dead child, a different AVD name, or permanently unknown trust state must
-# fail without attempting a credential or reaching the network probe.
+# A stale instance ID, dead child, different AVD name, or permanently unknown
+# trust state must fail without mutation or a network probe.
+reset_readiness_fake
+FAKE_READY_OWNER_PID=foreign
+if android_acceptance_prepare_owned_emulator \
+    fake_readiness_adb emulator-5558 urnetwork-acceptance "$$" \
+    "$readiness_dir/state" "$readiness_status" "$readiness_interactive" 1 1 1; then
+  fail "a stale guest at the expected serial and AVD name was accepted as owned"
+fi
+readiness_status_is owned-emulator-interactive-failed
+owned_diagnostic_field_is "$readiness_interactive" owner mismatch
+owned_diagnostic_field_is "$readiness_interactive" wake unchecked
+owned_diagnostic_field_is "$readiness_interactive" result failed
+if grep -Eq 'shell wm dismiss-keyguard|shell toybox nc' "$readiness_calls"; then
+  fail "a guest with a mismatched instance ID was mutated or network-probed"
+fi
+
 reset_readiness_fake
 FAKE_READY_AVD=foreign-avd
 if android_acceptance_prepare_owned_emulator \
@@ -1499,7 +2535,7 @@ for failure_case in network dns tcp; do
     network) FAKE_READY_LARGE_CONNECTIVITY=1 ;;
     dns) FAKE_READY_LARGE_PROBE=1 ;;
   esac
-  if android_acceptance_prepare_device \
+  if prepare_physical_readiness \
       fake_readiness_adb readiness-device 010181 "$readiness_dir/state" "$readiness_status" 1 1; then
     fail "$failure_case failure passed device readiness"
   fi
@@ -1513,7 +2549,7 @@ done
 reset_readiness_fake
 FAKE_READY_TCP_SUCCEEDS_AFTER=1
 FAKE_READY_TCP_FAILURE=tcp
-android_acceptance_prepare_device \
+prepare_physical_readiness \
   fake_readiness_adb readiness-device 010181 "$readiness_dir/state" "$readiness_status" 1 1 || \
   fail "an already-enabled network did not recover on a later TCP probe"
 readiness_status_is ready
@@ -1526,7 +2562,7 @@ FAKE_READY_TCP_SUCCEEDS_AFTER=1
 FAKE_READY_TCP_FAILURE=network
 FAKE_READY_WIFI=disabled
 FAKE_READY_SCAN=0
-android_acceptance_prepare_device \
+prepare_physical_readiness \
   fake_readiness_adb readiness-device 010181 "$readiness_dir/state" "$readiness_status" 1 1 || \
   fail "an initially offline device did not recover through its saved Wi-Fi configuration"
 readiness_status_is ready
@@ -1550,7 +2586,7 @@ reset_readiness_fake
 FAKE_READY_TCP_SUCCEEDS_AFTER=99
 FAKE_READY_WIFI=disabled
 FAKE_READY_WIFI_ENABLE=0
-if android_acceptance_prepare_device \
+if prepare_physical_readiness \
     fake_readiness_adb readiness-device 010181 "$readiness_dir/state" "$readiness_status" 1 1; then
   fail "a failed Wi-Fi enable passed readiness"
 fi
@@ -1561,7 +2597,7 @@ readiness_status_is wifi-enable-failed
 reset_readiness_fake
 FAKE_READY_TCP_SUCCEEDS_AFTER=99
 FAKE_READY_WIFI=unknown
-if android_acceptance_prepare_device \
+if prepare_physical_readiness \
     fake_readiness_adb readiness-device 010181 "$readiness_dir/state" "$readiness_status" 1 1; then
   fail "an unknown Wi-Fi state passed readiness"
 fi
@@ -1584,26 +2620,32 @@ unlock_calls="$device_helper_dir/unlock-calls"
 unlock_keys="$device_helper_dir/unlock-keys"
 unlock_submissions="$device_helper_dir/unlock-submissions"
 unlock_wake_polls="$device_helper_dir/unlock-wake-polls"
+unlock_trust_polls="$device_helper_dir/unlock-trust-polls"
 unlock_pending_polls="$device_helper_dir/unlock-pending-polls"
 unlock_pending="$device_helper_dir/unlock-pending"
 unlock_surface="$device_helper_dir/unlock-surface"
+unlock_diagnostic="$device_helper_dir/unlock-diagnostic.txt"
 
 reset_unlock_fake() {
   printf '1\n' >"$unlock_state"
   printf '0\n' >"$unlock_submissions"
   printf '0\n' >"$unlock_wake_polls"
+  printf '0\n' >"$unlock_trust_polls"
   printf '0\n' >"$unlock_pending_polls"
   : >"$unlock_calls"
   : >"$unlock_keys"
-  rm -f "$unlock_pending" "$unlock_surface"
+  rm -f "$unlock_pending" "$unlock_surface" "$unlock_diagnostic"
   FAKE_UNLOCK_AWAKE_AFTER=1
+  FAKE_UNLOCK_POWER_UNKNOWN_BEFORE=0
+  FAKE_UNLOCK_PRE_SUBMIT_UNKNOWN_BEFORE=0
   FAKE_UNLOCK_UNLOCK_AFTER=1
-  FAKE_UNLOCK_POST_SUBMIT_UNKNOWN=0
+  FAKE_UNLOCK_POST_SUBMIT_UNKNOWN_BEFORE=0
   FAKE_UNLOCK_SIZE='Physical size: 1080x2400'
 }
 
 fake_unlock_adb() {
-  local current_state eval_status pending_count remote_script submission_count wake_count
+  local current_state eval_status known_count pending_count remote_script submission_count
+  local trust_count wake_count
   [ "$1" = -s ] && [ -n "$2" ] || return 90
   shift 2
   printf '%s\n' "$*" >>"$unlock_calls"
@@ -1616,7 +2658,9 @@ fake_unlock_adb() {
           wake_count="$(tr -d '\r\n' <"$unlock_wake_polls")"
           wake_count=$((wake_count + 1))
           printf '%s\n' "$wake_count" >"$unlock_wake_polls"
-          if [ "$wake_count" -ge "$FAKE_UNLOCK_AWAKE_AFTER" ]; then
+          if [ "$wake_count" -le "$FAKE_UNLOCK_POWER_UNKNOWN_BEFORE" ]; then
+            printf 'wake state unavailable\n'
+          elif [ "$wake_count" -ge "$FAKE_UNLOCK_AWAKE_AFTER" ]; then
             printf '  mWakefulness=Awake\n'
           else
             printf '  mWakefulness=Asleep\n'
@@ -1624,15 +2668,24 @@ fake_unlock_adb() {
           ;;
         'dumpsys trust')
           if [ -e "$unlock_pending" ]; then
-            if [ "$FAKE_UNLOCK_POST_SUBMIT_UNKNOWN" -eq 1 ]; then
-              printf 'lock state unavailable\n'
-              return 0
-            fi
             pending_count="$(tr -d '\r\n' <"$unlock_pending_polls")"
             pending_count=$((pending_count + 1))
             printf '%s\n' "$pending_count" >"$unlock_pending_polls"
-            if [ "$pending_count" -ge "$FAKE_UNLOCK_UNLOCK_AFTER" ]; then
+            if [ "$pending_count" -le "$FAKE_UNLOCK_POST_SUBMIT_UNKNOWN_BEFORE" ]; then
+              printf 'lock state unavailable\n'
+              return 0
+            fi
+            known_count=$((pending_count - FAKE_UNLOCK_POST_SUBMIT_UNKNOWN_BEFORE))
+            if [ "$known_count" -ge "$FAKE_UNLOCK_UNLOCK_AFTER" ]; then
               printf '0\n' >"$unlock_state"
+            fi
+          else
+            trust_count="$(tr -d '\r\n' <"$unlock_trust_polls")"
+            trust_count=$((trust_count + 1))
+            printf '%s\n' "$trust_count" >"$unlock_trust_polls"
+            if [ "$trust_count" -le "$FAKE_UNLOCK_PRE_SUBMIT_UNKNOWN_BEFORE" ]; then
+              printf 'lock state unavailable\n'
+              return 0
             fi
           fi
           current_state="$(tr -d '\r\n' <"$unlock_state")"
@@ -1728,20 +2781,37 @@ else
   [ "$?" -eq 2 ] || fail "an unknown OEM lock state was not fail-closed"
 fi
 
+# Poll-count tests are state driven; wall-clock sleeping would add no coverage.
+android_acceptance_interactive_poll_sleep() { :; }
+
 reset_unlock_fake
 FAKE_UNLOCK_AWAKE_AFTER=3
-FAKE_UNLOCK_UNLOCK_AFTER=3
+FAKE_UNLOCK_POWER_UNKNOWN_BEFORE=2
+FAKE_UNLOCK_PRE_SUBMIT_UNKNOWN_BEFORE=2
+FAKE_UNLOCK_POST_SUBMIT_UNKNOWN_BEFORE=1
+FAKE_UNLOCK_UNLOCK_AFTER=2
 unlock_log="$device_helper_dir/unlock-log"
 android_acceptance_unlock_device \
-  fake_unlock_adb test-device 010181 >"$unlock_log" 2>&1 || \
+  fake_unlock_adb test-device 010181 "$unlock_diagnostic" device-011 readiness 4 \
+  >"$unlock_log" 2>&1 || \
   fail "a locked authorized device was not unlocked"
 [ "$(cat "$unlock_state")" = 0 ] || fail "unlock completion was not verified"
 [ "$(cat "$unlock_wake_polls")" -eq 3 ] || \
-  fail "the asynchronous OEM wake transition was not polled"
+  fail "the transient unknown OEM wake transition was not polled"
+[ "$(grep -Fxc 'shell input keyevent KEYCODE_WAKEUP' "$unlock_calls")" -eq 1 ] || \
+  fail "the wake command was submitted more than once"
+[ "$(cat "$unlock_trust_polls")" -eq 3 ] || \
+  fail "the transient unknown pre-credential trust state was not polled"
 [ "$(cat "$unlock_pending_polls")" -eq 3 ] || \
-  fail "the asynchronous OEM unlock transition was not polled"
+  fail "the mixed unknown/locked OEM unlock transition was not polled"
 [ "$(cat "$unlock_submissions")" -eq 1 ] || \
   fail "the private credential was not submitted exactly once"
+grep -Fxq 'stage=complete' "$unlock_diagnostic" || \
+  fail "successful physical unlock did not retain its completed stage"
+grep -Fxq 'credential=submitted' "$unlock_diagnostic" || \
+  fail "successful physical unlock did not retain its credential state"
+grep -Fxq 'result=ready' "$unlock_diagnostic" || \
+  fail "successful physical unlock did not retain its terminal result"
 [ "$(sed -n '1p' "$unlock_keys")" = KEYCODE_0 ] || \
   fail "the leading-zero unlock code was not preserved as a digit key"
 if grep -Fq 010181 "$unlock_log" "$unlock_calls" "$unlock_keys"; then
@@ -1753,39 +2823,129 @@ fi
 submission_count="$(cat "$unlock_submissions")"
 swipe_count="$(grep -Fc 'shell input swipe 540 1920 540 480 300' "$unlock_calls")"
 android_acceptance_unlock_device \
-  fake_unlock_adb test-device 010181 >/dev/null 2>&1 || \
+  fake_unlock_adb test-device 010181 "$unlock_diagnostic" device-011 readiness 4 \
+  >/dev/null 2>&1 || \
   fail "an already-unlocked device was rejected"
 [ "$(cat "$unlock_submissions")" = "$submission_count" ] || \
   fail "an already-unlocked device received the unlock code"
 [ "$(grep -Fc 'shell input swipe 540 1920 540 480 300' "$unlock_calls")" = "$swipe_count" ] || \
   fail "an already-unlocked device reopened its credential surface"
 if android_acceptance_unlock_device \
-    fake_unlock_adb test-device '01 0181' >/dev/null 2>&1; then
+    fake_unlock_adb test-device '01 0181' \
+    "$unlock_diagnostic" device-011 readiness 4 >/dev/null 2>&1; then
   fail "a malformed Android unlock code was accepted"
 fi
 [ "$(cat "$unlock_submissions")" = "$submission_count" ] || \
   fail "a malformed Android unlock code reached SystemUI"
 
+# A trust signal can settle directly from unknown to unlocked. That path must
+# return ready without ever opening or submitting to the credential surface.
+reset_unlock_fake
+printf '0\n' >"$unlock_state"
+FAKE_UNLOCK_PRE_SUBMIT_UNKNOWN_BEFORE=2
+android_acceptance_unlock_device \
+  fake_unlock_adb test-device 010181 \
+  "$unlock_diagnostic" device-011 readiness 3 >/dev/null 2>&1 || \
+  fail "an unknown-to-unlocked pre-credential transition was rejected"
+[ "$(cat "$unlock_trust_polls")" -eq 3 ] || \
+  fail "unknown-to-unlocked trust observations did not reach the known state"
+[ "$(cat "$unlock_submissions")" -eq 0 ] || \
+  fail "an unknown-to-unlocked device received the credential"
+grep -Fxq 'credential=not-required' "$unlock_diagnostic" || \
+  fail "unknown-to-unlocked diagnostics did not record the credential-free result"
+
 reset_unlock_fake
 FAKE_UNLOCK_SIZE='size unavailable'
 if android_acceptance_unlock_device \
-    fake_unlock_adb test-device 010181 >/dev/null 2>&1; then
+    fake_unlock_adb test-device 010181 \
+    "$unlock_diagnostic" device-011 readiness 4 >/dev/null 2>&1; then
   fail "an unlock with unknown display geometry was accepted"
 fi
 [ "$(cat "$unlock_submissions")" -eq 0 ] || \
   fail "unknown display geometry sent a credential to an unlocated surface"
 
-# A post-submit state that becomes untrustworthy must fail closed without
-# resubmitting the credential. A later runner invocation may be authorized,
-# but one helper invocation is never a PIN retry loop.
+# Unknown pre-credential observations are retried, but exhaustion fails before
+# any credential reaches an unverified surface.
 reset_unlock_fake
-FAKE_UNLOCK_POST_SUBMIT_UNKNOWN=1
+FAKE_UNLOCK_PRE_SUBMIT_UNKNOWN_BEFORE=99
 if android_acceptance_unlock_device \
-    fake_unlock_adb test-device 010181 >/dev/null 2>&1; then
+    fake_unlock_adb test-device 010181 \
+    "$unlock_diagnostic" device-011 readiness 3 >/dev/null 2>&1; then
+  fail "an unknown pre-credential OEM state was accepted"
+fi
+[ "$(cat "$unlock_trust_polls")" -eq 3 ] || \
+  fail "unknown pre-credential observations were not retried to the bound"
+[ "$(cat "$unlock_submissions")" -eq 0 ] || \
+  fail "an unknown pre-credential state received the credential"
+grep -Fxq 'stage=pre-credential' "$unlock_diagnostic" || \
+  fail "unknown pre-credential diagnostics collapsed the failing stage"
+grep -Fxq 'trust=unknown' "$unlock_diagnostic" || \
+  fail "unknown pre-credential diagnostics omitted the trust state"
+grep -Fxq 'credential=not-submitted' "$unlock_diagnostic" || \
+  fail "unknown pre-credential diagnostics misreported PIN submission"
+
+# A post-submit state that stays untrustworthy must fail closed after bounded
+# observation retries without ever resubmitting the credential.
+reset_unlock_fake
+FAKE_UNLOCK_POST_SUBMIT_UNKNOWN_BEFORE=99
+if android_acceptance_unlock_device \
+    fake_unlock_adb test-device 010181 \
+    "$unlock_diagnostic" device-011 instrumentation 3 >/dev/null 2>&1; then
   fail "an unverifiable OEM unlock was accepted"
 fi
+[ "$(cat "$unlock_pending_polls")" -eq 3 ] || \
+  fail "unknown post-credential observations were not retried to the bound"
 [ "$(cat "$unlock_submissions")" -eq 1 ] || \
   fail "an unverifiable OEM unlock repeated the credential"
+grep -Fxq 'stage=post-credential' "$unlock_diagnostic" || \
+  fail "unknown post-credential diagnostics collapsed the failing stage"
+grep -Fxq 'trust=unknown' "$unlock_diagnostic" || \
+  fail "unknown post-credential diagnostics omitted the trust state"
+grep -Fxq 'credential=submitted' "$unlock_diagnostic" || \
+  fail "unknown post-credential diagnostics lost the one PIN submission"
+
+# Power observations use the same bounded tri-state contract and must fail
+# before trust or credential handling if no authoritative signal arrives.
+reset_unlock_fake
+FAKE_UNLOCK_POWER_UNKNOWN_BEFORE=99
+if android_acceptance_unlock_device \
+    fake_unlock_adb test-device 010181 \
+    "$unlock_diagnostic" device-011 client 3 >/dev/null 2>&1; then
+  fail "an unverifiable OEM wake was accepted"
+fi
+[ "$(cat "$unlock_wake_polls")" -eq 3 ] || \
+  fail "unknown power observations were not retried to the bound"
+[ "$(cat "$unlock_submissions")" -eq 0 ] || \
+  fail "an unknown power state received the credential"
+
+# The durable artifact contains only finite classifications and caller-supplied
+# sanitized attribution. It must never retain the adb serial or PIN.
+grep -Fxq 'device_id=device-011' "$unlock_diagnostic" || \
+  fail "physical interactive diagnostic omitted its sanitized device ID"
+grep -Fxq 'role=client' "$unlock_diagnostic" || \
+  fail "physical interactive diagnostic omitted its role"
+grep -Fxq 'stage=wake-observe' "$unlock_diagnostic" || \
+  fail "physical interactive diagnostic collapsed the failing wake stage"
+grep -Fxq 'attempt=3' "$unlock_diagnostic" || \
+  fail "physical interactive diagnostic omitted the terminal retry count"
+grep -Fxq 'wake_command=sent' "$unlock_diagnostic" || \
+  fail "physical interactive diagnostic omitted its one successful wake command"
+grep -Fxq 'power=unknown' "$unlock_diagnostic" || \
+  fail "physical interactive diagnostic omitted unknown power state"
+grep -Fxq 'credential=not-submitted' "$unlock_diagnostic" || \
+  fail "physical interactive diagnostic misreported credential submission"
+grep -Fxq 'result=failed' "$unlock_diagnostic" || \
+  fail "physical interactive diagnostic omitted its terminal result"
+if unlock_diagnostic_mode="$(stat -c '%a' "$unlock_diagnostic" 2>/dev/null)"; then
+  :
+else
+  unlock_diagnostic_mode="$(stat -f '%Lp' "$unlock_diagnostic")"
+fi
+[ "$unlock_diagnostic_mode" = 600 ] || \
+  fail "physical interactive diagnostic mode was not 0600"
+if grep -Eq 'test-device|010181' "$unlock_diagnostic"; then
+  fail "physical interactive diagnostic exposed a serial or credential"
+fi
 
 # Real adb may drain inherited stdin. Each helper invocation must own /dev/null
 # so a fleet loop cannot silently lose every row after its first device.
@@ -1796,7 +2956,8 @@ printf '%s\n' test-device second-device >"$device_helper_dir/device-rows"
 FAKE_UNLOCK_DRAIN_STDIN=1
 while IFS= read -r helper_serial; do
   android_acceptance_unlock_device \
-    fake_unlock_adb "$helper_serial" 010181 >/dev/null 2>&1 || \
+    fake_unlock_adb "$helper_serial" 010181 \
+    "$unlock_diagnostic" device-011 readiness 3 >/dev/null 2>&1 || \
     fail "stdin-draining adb rejected $helper_serial"
   printf '%s\n' "$helper_serial" >>"$device_helper_dir/device-seen"
 done <"$device_helper_dir/device-rows"
@@ -1819,6 +2980,7 @@ printf '0\n' >"$unlock_state"
 printf '1\n' >"$unlock_state"
 android_acceptance_run_after_unlock \
   fake_unlock_adb test-device 010181 \
+  "$unlock_diagnostic" device-011 instrumentation 3 \
   run_if_execution_unlocked launched || \
   fail "a device re-locked during install was not refreshed before execution"
 [ "$(cat "$execution_marker")" = launched ] || \
@@ -1828,16 +2990,18 @@ android_acceptance_run_after_unlock \
 
 rm -f "$execution_marker"
 reset_unlock_fake
-FAKE_UNLOCK_POST_SUBMIT_UNKNOWN=1
+FAKE_UNLOCK_POST_SUBMIT_UNKNOWN_BEFORE=99
 if android_acceptance_run_after_unlock \
     fake_unlock_adb test-device 010181 \
+    "$unlock_diagnostic" device-011 instrumentation 3 \
     run_if_execution_unlocked should-not-run >/dev/null 2>&1; then
   fail "an unverifiable post-install unlock was accepted"
 fi
 [ ! -e "$execution_marker" ] || \
   fail "the product command ran after an unverifiable unlock"
 if android_acceptance_run_after_unlock \
-    fake_unlock_adb test-device 010181 >/dev/null 2>&1; then
+    fake_unlock_adb test-device 010181 \
+    "$unlock_diagnostic" device-011 instrumentation 3 >/dev/null 2>&1; then
   fail "an empty post-unlock execution command was accepted"
 else
   [ "$?" -eq 2 ] || fail "an empty execution command returned the wrong status"
@@ -1848,7 +3012,7 @@ fi
 # setup step may sit between that boundary and its UI/instrumentation launch.
 runner_source="$here/test-main.sh"
 owned_selection_source="$(sed -n \
-  '/^runner_owns_fallback_emulator()/,/^capture_device_fleet ||/p' "$runner_source")"
+  '/^runner_started_fallback_emulator()/,/^capture_device_fleet ||/p' "$runner_source")"
 # This intentionally asserts the literal runner ownership expression.
 # shellcheck disable=SC2016
 grep -Fq '[ "$target_serial" = "$started_emulator_serial" ]' \
@@ -1864,6 +3028,9 @@ grep -Fq 'android_acceptance_prepare_device' <<<"$owned_selection_source" || \
   fail "non-owned targets no longer use strict physical-device readiness"
 grep -Fq 'android_acceptance_unlock_device' <<<"$owned_selection_source" || \
   fail "non-owned execution no longer uses the private-PIN gate"
+grep -Fq '"$diagnostic_file" "$diagnostic_device_id" readiness 180 24 20' \
+  <<<"$owned_selection_source" || \
+  fail "physical readiness lacks sanitized role-attributed interactive diagnostics"
 
 peer_boot_source="$(sed -n '/^boot_peer_emulator()/,/^wait_physical_status()/p' "$runner_source")"
 grep -Fq 'android_acceptance_prepare_owned_emulator' <<<"$peer_boot_source" || \
@@ -1912,6 +3079,9 @@ grep -Fq 'provider-interactive.txt' <<<"$peer_source" || \
   fail "peer provider launch lacks its own durable diagnostic artifact"
 grep -Fq 'client-interactive.txt' <<<"$peer_source" || \
   fail "peer client launch lacks its own durable diagnostic artifact"
+grep -Fq '"$serial" "$client_diagnostic_id" client "$out/client-interactive.txt"' \
+  <<<"$peer_source" || \
+  fail "peer client interactive evidence lacks sanitized client attribution"
 grep -Fq 'provider-preflight.txt' <<<"$peer_source" || \
   fail "peer provider launch lacks role-attributed preflight evidence"
 grep -Fq 'client-preflight.txt' <<<"$peer_source" || \
@@ -1948,6 +3118,8 @@ grep -Fq 'instrumentation-preflight.txt' <<<"$cell_source" || \
 preflight_wrapper_source="$(sed -n \
   '/^run_after_selected_device_interactive()/,/^capture_device_fleet ||/p' \
   "$runner_source")"
+grep -Fq '"$diagnostic_device_id" "$role" 20' <<<"$preflight_wrapper_source" || \
+  fail "physical launch boundaries do not attribute interactive diagnostics"
 preflight_command_line="$(grep -Fn -m1 'android_acceptance_preflight_device' \
   <<<"$preflight_wrapper_source" | cut -d: -f1)"
 preflight_execute_line="$(grep -Fn -m1 '  "$@"' \
@@ -2628,10 +3800,40 @@ fi
 
 setup_source="$here/../build/all/android/setup.sh"
 [ -f "$setup_source" ] || fail "Android setup source is missing"
-# This intentionally asserts the literal setup launch expression.
+# Setup must launch and clean only its own read-only guest. Reusing an already
+# running same-name AVD was the source of the writable lock that rejected the
+# acceptance runner's peer.
 # shellcheck disable=SC2016
-grep -Fq 'args=(-avd "$avd_name" -gpu host ' "$setup_source" || \
-  fail "Android setup smoke does not launch with host rendering"
+grep -Fq 'android_acceptance_retire_legacy_reserved_avd' \
+  "$setup_source" || \
+  fail "Android setup cannot retire the default-ID legacy reserved AVD"
+# shellcheck disable=SC2016
+grep -Fq 'android_acceptance_no_running_avd "$adb" "$avd_name"' \
+  "$setup_source" || \
+  fail "Android setup does not reject a pre-existing same-name AVD"
+# shellcheck disable=SC2016
+if grep -Fq 'reusing running $avd_name' "$setup_source"; then
+  fail "Android setup still reuses an unowned same-name AVD"
+fi
+# shellcheck disable=SC2016
+grep -Fq 'args=(-avd "$avd_name" -read-only -gpu host ' "$setup_source" || \
+  fail "Android setup smoke does not launch read-only with host rendering"
+grep -Fq 'run_android_acceptance_shared_avd_emulator' "$setup_source" || \
+  fail "Android setup bypasses the shared AVD launch ownership gate"
+grep -Fq 'exec "$emulator" "$@" -id "$owner_token"' \
+  "$here/test-main-lib.sh" || \
+  fail "shared AVD launch does not inject a console-reported instance ID"
+if rg -n 'qemu\.urnetwork\.acceptance_owner' \
+    "$here/test-main-lib.sh" "$runner_source" "$setup_source" >/dev/null; then
+  fail "live Android launch or ownership still depends on the ignored boot property"
+fi
+grep -Fq 'android_acceptance_wait_for_runner_owned_emulator' "$setup_source" || \
+  fail "Android setup does not wait for its exact guest proof before smoke checks"
+if grep -Fq 'wait-for-device' "$setup_source"; then
+  fail "Android setup still treats transport readiness as guest ownership readiness"
+fi
+grep -Fq 'android_acceptance_stop_emulator_child' "$setup_source" || \
+  fail "Android setup signals cleanup through the adb serial instead of its exact child"
 setup_preflight_line="$(grep -n -m1 'android_acceptance_preflight_device' \
   "$setup_source" | cut -d: -f1)"
 setup_success_line="$(grep -n -m1 'SMOKE TEST PASSED' "$setup_source" | cut -d: -f1)"
@@ -2639,4 +3841,89 @@ setup_success_line="$(grep -n -m1 'SMOKE TEST PASSED' "$setup_source" | cut -d: 
   [ "$setup_preflight_line" -lt "$setup_success_line" ] || \
   fail "Android setup can claim smoke success before resource/dialog preflight"
 
+# The live acceptance runner also starts from a no-reuse boundary and binds
+# its fallback serial to the explicit port given to the exact child.
+grep -Fq 'android_acceptance_retire_legacy_reserved_avd' \
+  "$runner_source" || \
+  fail "Android acceptance cannot retire the default-ID legacy reserved AVD"
+# shellcheck disable=SC2016
+grep -Fq 'android_acceptance_no_running_avd "$adb" "$avd_name"' \
+  "$runner_source" || \
+  fail "Android acceptance does not reject a pre-existing same-name AVD"
+if grep -Fq 'find_avd_serial' "$runner_source"; then
+  fail "fallback AVD ownership is still inferred by searching for its name"
+fi
+# shellcheck disable=SC2016
+grep -Fq 'started_emulator_serial="emulator-$port"' "$runner_source" || \
+  fail "fallback AVD serial is not bound to its explicit launch port"
+grep -Fq 'android_acceptance_wait_for_runner_owned_emulator' "$runner_source" || \
+  fail "fallback AVD does not wait for its exact guest ownership evidence"
+[ "$(grep -Fc 'android_acceptance_stop_emulator_child' "$runner_source")" -eq 3 ] || \
+  fail "fallback, early peer, and normal peer cleanup do not join exact children"
+
+# The tabletop job runs once per canonical run, on GitHub when the run has it
+# and else on Play, and never in smoke or diagnostic runs.
+[ "$(android_acceptance_tabletop_target canonical 0 github play solana_dapp fdroid)" = github ] || \
+  fail "the full matrix does not run the tabletop job on GitHub"
+[ "$(android_acceptance_tabletop_target canonical 0 solana_dapp play)" = play ] || \
+  fail "a run without GitHub does not run the tabletop job on Play"
+for tabletop_skip in 'canonical 0 solana_dapp fdroid' 'canonical 1 github' 'diagnostic 0 github'; do
+  # shellcheck disable=SC2086
+  [ -z "$(android_acceptance_tabletop_target $tabletop_skip)" ] || \
+    fail "the tabletop job ran for: $tabletop_skip"
+done
+# The job's exact Gradle vector, run against a stub timeout in a fixture app
+# directory: the managed device's task for the flavor, emulator control, the
+# setup limit, the one class, the cell's build id, then the caller's arguments.
+tabletop_fixture="$(mktemp -d "${TMPDIR:-/tmp}/urnetwork-android-tabletop.test.XXXXXX")"
+mkdir -p "$tabletop_fixture/app"
+tabletop_argv="$(
+  timeout() { printf '%s|%s|' "$PWD" "$BRINGYOUR_HOME"; printf '%s ' "$@"; }
+  android_acceptance_run_tabletop_job "$tabletop_fixture/app" /fixture-root Github \
+    pixelFoldApi36 com.bringyour.network.ui.connect.ConnectTabletopTest fixture-build \
+    --max-workers 7
+)"
+tabletop_app_dir="$(cd "$tabletop_fixture/app" && pwd)"
+[ "$tabletop_argv" = "$tabletop_app_dir|/fixture-root|3600 ./gradlew :app:pixelFoldApi36GithubDebugAndroidTest -Pandroid.experimental.androidTest.enableEmulatorControl=true -Pandroid.experimental.testOptions.managedDevices.setupTimeoutMinutes=30 -Pandroid.testInstrumentationRunnerArguments.class=com.bringyour.network.ui.connect.ConnectTabletopTest -PurnetworkAcceptanceBuildId=fixture-build --max-workers 7 " ] || \
+  fail "the tabletop job's Gradle vector changed: $tabletop_argv"
+for tabletop_invalid in \
+  "$tabletop_fixture/missing Root Github pixelFoldApi36 a.B b" \
+  "$tabletop_fixture/app Root Solana_dapp pixelFoldApi36 a.B b" \
+  "$tabletop_fixture/app Root Github pixel-fold a.B b" \
+  "$tabletop_fixture/app Root Github pixelFoldApi36 a;B b" \
+  "$tabletop_fixture/app Root Github pixelFoldApi36 a.B b/c"; do
+  # shellcheck disable=SC2086
+  if ( timeout() { return 0; }; android_acceptance_run_tabletop_job $tabletop_invalid ); then
+    fail "the tabletop job accepted: $tabletop_invalid"
+  fi
+done
+# Results are copied from the flavor's managed-device folder, private.
+mkdir -p "$tabletop_fixture/build/outputs/androidTest-results/managedDevice/githubDebug/pixelFoldApi36"
+printf '<testsuite/>\n' \
+  >"$tabletop_fixture/build/outputs/androidTest-results/managedDevice/githubDebug/pixelFoldApi36/TEST-tabletop.xml"
+android_acceptance_collect_tabletop_results \
+  "$tabletop_fixture/build" Github pixelFoldApi36 "$tabletop_fixture/out" || \
+  fail "the tabletop job's managed-device results were not collected"
+[ -f "$tabletop_fixture/out/results/TEST-tabletop.xml" ] || \
+  fail "the tabletop job's JUnit result was not kept"
+if android_acceptance_collect_tabletop_results \
+    "$tabletop_fixture/build" Play pixelFoldApi36 "$tabletop_fixture/out-play"; then
+  fail "a flavor without managed-device results reported collected results"
+fi
+rm -rf "$tabletop_fixture"
+# shellcheck disable=SC2016
+grep -Fq 'tabletop_target="$(android_acceptance_tabletop_target "$execution_mode" "$smoke_only" $targets)"' \
+  "$runner_source" || \
+  fail "the runner does not choose its tabletop target"
+grep -Fq 'android_acceptance_run_tabletop_job \' "$runner_source" || \
+  fail "the runner does not run the tabletop job"
+grep -Fq '"$tabletop_out" "$tabletop_target" tabletop failed "$tabletop_status"' "$runner_source" || \
+  fail "a failed tabletop job is not recorded as its own phase"
+
+bash "$here/test-main-p2p.test.sh"
+bash "$here/test-main-observation.test.sh"
+bash "$here/test-main-completion.test.sh"
+bash "$here/test-main-reporting.test.sh"
+bash "$here/test-main-authorization.test.sh"
+bash "$here/test-main-diagnostic-avd.test.sh"
 echo "android/test-main.sh runner tests passed"

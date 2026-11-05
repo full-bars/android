@@ -21,11 +21,13 @@ import com.android.billingclient.api.PendingPurchasesParams
 import com.android.billingclient.api.ProductDetails
 import com.android.billingclient.api.Purchase
 import com.android.billingclient.api.PurchasesUpdatedListener
+import com.android.billingclient.api.GetBillingConfigParams
 import com.android.billingclient.api.QueryProductDetailsParams
 import com.android.billingclient.api.QueryPurchasesParams
 import com.android.billingclient.api.queryProductDetails
 import com.bringyour.network.MainApplication
 import com.bringyour.network.PendingPurchaseReconcileWorker
+import com.bringyour.network.PurchaseReportPolicy
 import com.bringyour.network.PurchaseReporter
 import com.bringyour.network.R
 import com.bringyour.network.TAG
@@ -63,7 +65,7 @@ class PlanViewModel @Inject constructor(
     private var consumedRestoredSubscriptionSequence = 0L
 
     /**
-     * A purchase that Google Play accepted but has NOT completed: it is awaiting
+     * A purchase that Google Play accepted but has not completed: it is awaiting
      * approval (a child needing a parent's OK) or an out-of-band payment. The PURCHASED
      * state does not arrive now -- it lands later, and `reconcileExistingSubscriptions`
      * picks it up on the next billing connection.
@@ -78,7 +80,7 @@ class PlanViewModel @Inject constructor(
     private var consumedPurchasePendingSequence = 0L
 
     /**
-     * The server verified the Play purchase but it is linked to a DIFFERENT network
+     * The server verified the Play purchase but it is linked to a different network
      * than this session (terminal `wrong_network` report). The purchase is real --
      * it is still acknowledged so Play does not auto-refund it -- but this session
      * gets no credit, so the user is told it was purchased under a different
@@ -93,7 +95,7 @@ class PlanViewModel @Inject constructor(
      * answering `pending`) within the bounded in-session report attempts. Play has
      * the money; the daily PendingPurchaseReconcileWorker carries the report until
      * the server answers. The user sees "payment received, confirmation delayed" --
-     * NOT a failure (they must not buy again) and NOT a success (the server has not
+     * not a failure (they must not buy again) and not a success (the server has not
      * credited anything yet).
      */
     private val _purchaseReportDeferredSequence = MutableStateFlow(0L)
@@ -120,6 +122,70 @@ class PlanViewModel @Inject constructor(
      * the printed price.
      */
     var formattedYearlySubscriptionPrice by mutableStateOf(FALLBACK_YEARLY_PRICE)
+
+    /**
+     * The store's localized amounts (major units + ISO currency) once its
+     * offers have loaded; null until then. PlanPresentation prints from these
+     * so the per-month equivalent and the offer card use the store's figure.
+     */
+    var storeYearlyPrice by mutableStateOf<com.bringyour.network.ui.upgrade.StorePrice?>(null)
+        private set
+    var storeMonthlyPrice by mutableStateOf<com.bringyour.network.ui.upgrade.StorePrice?>(null)
+        private set
+
+    /**
+     * The store whose win-back offer this flavor sells (mmm/reengagement/
+     * PLAN.md "THE STORES"): Play, through the monthly base plan's offer the
+     * server names by tag (`winback_offer.play_offer_tag`).
+     */
+    val winbackStore: String = com.bringyour.sdk.Sdk.WinbackOfferStorePlay
+
+    /**
+     * Play's price for the first paid period of each monthly offer that has
+     * tags of its own, by tag (the win-back offer's discounted first month);
+     * empty until the offers load. A tag Play does not list has no price, and
+     * the picker then shows no win-back: the purchase would buy the base plan.
+     */
+    var storeMonthlyOfferPrices by mutableStateOf<Map<String, com.bringyour.network.ui.upgrade.StorePrice>>(emptyMap())
+        private set
+
+    /**
+     * Play's billing country for this account (the storefront), from
+     * `getBillingConfigAsync`; null until it answers. The balance request
+     * carries it so the server resolves the price tier from the storefront.
+     */
+    var billingCountry by mutableStateOf<String?>(null)
+        private set
+
+    /**
+     * The Play tag of the offer the server names for the plan being bought
+     * (set by the purchaser from the balance): the welcome offer's for yearly,
+     * the win-back offer's for monthly. The purchase prefers the offer carrying
+     * it and otherwise never buys a tagged offer.
+     */
+    @Volatile
+    var preferredOfferTag: String? = null
+
+    /**
+     * What the purchase in flight is, for the purchase events: set by the
+     * purchaser when it starts the Play flow, consumed on the result.
+     */
+    @Volatile
+    var pendingPurchaseEvent: PendingPurchaseEvent? = null
+
+    data class PendingPurchaseEvent(val plan: String, val trial: Boolean, val price: Double, val currency: String)
+
+    private fun emitPurchaseEvent(outcome: String, errorClass: String = "") {
+        val pending = pendingPurchaseEvent ?: return
+        pendingPurchaseEvent = null
+        val product = com.bringyour.network.analytics.ClientEvents.PRODUCT_PLAY_SUPPORTER
+        val store = com.bringyour.sdk.Sdk.EventStorePlay
+        when (outcome) {
+            "completed" -> com.bringyour.network.analytics.ClientEvents.purchaseCompleted(store, product, pending.plan, pending.trial, pending.price, pending.currency)
+            "cancelled" -> com.bringyour.network.analytics.ClientEvents.purchaseCancelled(store, product, pending.plan, pending.trial, pending.price, pending.currency)
+            else -> com.bringyour.network.analytics.ClientEvents.purchaseFailed(store, product, pending.plan, pending.trial, pending.price, pending.currency, errorClass)
+        }
+    }
 
     /** The plan the next purchase buys: yearly is the highlighted default, monthly the quiet alternative. */
     var selectedPlan by mutableStateOf(PlanType.YEARLY)
@@ -181,6 +247,7 @@ class PlanViewModel @Inject constructor(
                 Log.i("Upgrade", "billing result ${billingResult.responseCode}")
 
                 if (billingResult.responseCode == BillingResponseCode.OK) {
+                    loadBillingCountry(client)
                     reconcileExistingSubscriptions(client, closeUpgradeUiForRecoveredPurchase) { recoveredPurchase ->
                         if (recoveredPurchase && !continueAfterRecoveredPurchase) {
                             setInProgress(false)
@@ -223,6 +290,7 @@ class PlanViewModel @Inject constructor(
 
             } else if (billingResult.responseCode == BillingResponseCode.USER_CANCELED) {
                 // Handle an error caused by a user cancelling the purchase flow.
+                emitPurchaseEvent("cancelled")
                 setInProgress(false)
                 Log.i("PlanViewModel", "purchases updated listener USER CANCELED")
             } else {
@@ -230,6 +298,7 @@ class PlanViewModel @Inject constructor(
                 // FIXME  show error message of billing error
 
                 val msg = "Billing error: ${billingResult.responseCode} ${billingResult.debugMessage}"
+                emitPurchaseEvent("failed", "play_${billingResult.responseCode}")
 
                 setChangePlanError(msg)
                 setInProgress(false)
@@ -295,7 +364,20 @@ class PlanViewModel @Inject constructor(
         client.queryPurchasesAsync(params) { billingResult, purchases ->
             if (billingResult.responseCode == BillingResponseCode.OK) {
                 val recoveredPurchases = purchases.filter {
-                    it.purchaseState == Purchase.PurchaseState.PURCHASED && !it.isAcknowledged
+                    PurchaseReporter.actionFor(context, it) == PurchaseReportPolicy.Action.ReportAndAcknowledge
+                }
+                /**
+                 * Acknowledged purchases the server never answered terminally: the
+                 * ones a pre-report build acknowledged on PURCHASED with no server
+                 * contact (UPGRADE.md N1). Filtering on `!isAcknowledged` alone made
+                 * an acknowledged-but-uncredited purchase invisible to every later
+                 * reconcile; each is now reported once, quietly.
+                 */
+                val unreportedPurchases = purchases.filter {
+                    PurchaseReporter.actionFor(context, it) == PurchaseReportPolicy.Action.Report
+                }
+                if (unreportedPurchases.isNotEmpty()) {
+                    reportAcknowledgedPurchases(unreportedPurchases)
                 }
                 if (recoveredPurchases.isNotEmpty()) {
                     /**
@@ -326,7 +408,11 @@ class PlanViewModel @Inject constructor(
                 }
                 if (hasPending) {
                     PendingPurchaseReconcileWorker.markPendingSeen(context)
-                } else if (recoveredPurchases.isEmpty() && !PurchaseReporter.hasEntries(context)) {
+                } else if (
+                    recoveredPurchases.isEmpty() &&
+                    unreportedPurchases.isEmpty() &&
+                    !PurchaseReporter.hasEntries(context)
+                ) {
                     PendingPurchaseReconcileWorker.markSettled(context)
                 }
 
@@ -370,16 +456,18 @@ class PlanViewModel @Inject constructor(
      * purchase, in order (the shared sequence lives in PurchaseReporter; the
      * PendingPurchaseReconcileWorker runs the same one):
      *
-     *  1. PERSIST the purchase token durably, before anything else.
-     *  2. REPORT it to the server and retry (bounded in-session) until a terminal
+     *  1. Persist the purchase token durably, before anything else.
+     *  2. Report it to the server and retry (bounded in-session) until a terminal
      *     answer.
-     *  3. Only THEN acknowledge with Play and drop the persisted token.
+     *  3. Only then acknowledge with Play and drop the persisted token.
      *
-     * The success overlay and the confirmation poll fire ONLY on a server credit
+     * The success overlay and the confirmation poll fire only on a server credit
      * (credited/already_credited) -- this replaces the old optimistic emit at
      * acknowledge time, where "You're premium." could be backed by nothing.
      * wrong_network and invalid still acknowledge (the purchase is real; Play must
-     * not auto-refund it) but surface honestly instead of celebrating.
+     * not auto-refund it) but surface honestly instead of celebrating. An invalid
+     * answer for a purchase without an account link (a Play Store promo code
+     * redemption) is not this network's and stays quiet (PurchaseReportPolicy.Outcome).
      */
     private fun reportAndAcknowledgePurchases(
         purchases: List<Purchase>,
@@ -397,7 +485,7 @@ class PlanViewModel @Inject constructor(
              * Play fires PurchasesUpdatedListener with OK for a PENDING purchase too
              * (pending purchases are enabled -- see enablePendingPurchases above). It is
              * not complete and no PURCHASED state arrives now, so there is nothing to
-             * report or acknowledge -- but the user MUST be told, or the spinner just
+             * report or acknowledge -- but the user must be told, or the spinner just
              * stops and they are left staring at the plan screen assuming it failed.
              */
             val hasPending = purchases.any {
@@ -417,7 +505,11 @@ class PlanViewModel @Inject constructor(
             return
         }
 
-        val unacknowledgedPurchases = purchasedSubscriptions.filter { !it.isAcknowledged }
+        // unacknowledged purchases, and acknowledged ones the server never answered
+        // terminally (PurchaseReportPolicy)
+        val unacknowledgedPurchases = purchasedSubscriptions.filter {
+            PurchaseReporter.actionFor(context, it) != PurchaseReportPolicy.Action.None
+        }
 
         /**
          * Step 1, before any network or billing call: persist the proof and arm the
@@ -431,10 +523,17 @@ class PlanViewModel @Inject constructor(
         }
 
         if (unacknowledgedPurchases.isEmpty()) {
-            // already acknowledged: a terminal answer was reached in an earlier
-            // session (or predates the report path). The entitlement is real --
-            // celebrate and let the poll confirm.
-            emitSuccessOrRestored(emitSuccess, emitRestored)
+            // every purchase reached a terminal answer in an earlier session:
+            // celebrate only what the server credited then
+            val credited = purchasedSubscriptions.any {
+                PurchaseReporter.Result(
+                    PurchaseReporter.reportedTerminalStatus(context, it.purchaseToken),
+                    acknowledged = true
+                ).credited
+            }
+            if (credited) {
+                emitSuccessOrRestored(emitSuccess, emitRestored)
+            }
             if (updateProgress) {
                 setInProgress(false)
             }
@@ -466,11 +565,15 @@ class PlanViewModel @Inject constructor(
                     billingClient,
                     purchase
                 )
-                when {
-                    result.credited -> credited = true
-                    result.wrongNetwork -> wrongNetwork = true
-                    result.invalid -> invalid = true
-                    else -> deferred = true
+                when (result.outcome) {
+                    PurchaseReportPolicy.Outcome.Credited -> credited = true
+                    PurchaseReportPolicy.Outcome.WrongNetwork -> wrongNetwork = true
+                    PurchaseReportPolicy.Outcome.Invalid -> invalid = true
+                    PurchaseReportPolicy.Outcome.NotThisNetwork -> Log.i(
+                        TAG,
+                        "PurchaseReporter: a purchase without an account link is not this network's"
+                    )
+                    PurchaseReportPolicy.Outcome.Deferred -> deferred = true
                 }
             }
 
@@ -496,6 +599,41 @@ class PlanViewModel @Inject constructor(
         }
     }
 
+    /**
+     * The quiet legacy sweep: report acknowledged purchases the server never
+     * answered terminally. Play keeps no record of whether our server saw them, so
+     * this is the only path that can still credit a purchase a pre-report build
+     * acknowledged while its webhook was lost. Only a fresh credit is news to the
+     * user (the restored overlay); already_credited, wrong_network and invalid just
+     * set the token's reported-terminal flag so it is never reported again.
+     */
+    private fun reportAcknowledgedPurchases(purchases: List<Purchase>) {
+        purchases.forEach { PurchaseReporter.persist(context, it) }
+        PendingPurchaseReconcileWorker.markPendingSeen(context)
+
+        // the proofs are persisted and the worker is armed; nothing is lost
+        val billingClient = _billingClient.value ?: return
+        val api = (context.applicationContext as? MainApplication)?.api
+
+        viewModelScope.launch {
+            var credited = false
+            for (purchase in purchases) {
+                val result = PurchaseReporter.reportAndAcknowledge(
+                    context,
+                    api,
+                    billingClient,
+                    purchase
+                )
+                if (result.status == com.bringyour.sdk.Sdk.PurchaseReportStatusCredited) {
+                    credited = true
+                }
+            }
+            if (credited) {
+                _restoredSubscriptionSequence.update { it + 1L }
+            }
+        }
+    }
+
     private fun emitSuccessOrRestored(emitSuccess: Boolean, emitRestored: Boolean) {
         if (emitSuccess) {
             emitUpgradeSuccessIfNeeded(true)
@@ -506,6 +644,7 @@ class PlanViewModel @Inject constructor(
 
     private fun emitUpgradeSuccessIfNeeded(emitSuccess: Boolean) {
         if (emitSuccess) {
+            emitPurchaseEvent("completed")
             _upgradeSuccessSequence.update { it + 1L }
             viewModelScope.launch {
                 _onUpgradeSuccess.emit(Unit)
@@ -594,6 +733,9 @@ class PlanViewModel @Inject constructor(
 
     private fun applyStoreOffers(productDetails: ProductDetails) {
         val offers = productDetails.subscriptionOfferDetails ?: emptyList()
+        storeYearlyPrice = null
+        storeMonthlyPrice = null
+        storeMonthlyOfferPrices = emptyMap()
         // what Play actually returned for this device and account, so a missing
         // plan can be told apart from a classification bug from a log alone
         Log.i(
@@ -611,17 +753,51 @@ class PlanViewModel @Inject constructor(
         val yearly = PlanOffers.yearly(planOffers)?.let { offers[it.index] }
         // the price is the first paid phase: a free trial phase comes first
         // in the list and reads "Free"
-        formattedMonthlySubscriptionPrice = monthly?.pricingPhases?.pricingPhaseList
-            ?.firstOrNull { 0L < it.priceAmountMicros }
-            ?.formattedPrice
-            ?: FALLBACK_MONTHLY_PRICE
+        val monthlyPaid = monthly?.pricingPhases?.pricingPhaseList?.firstOrNull { 0L < it.priceAmountMicros }
+        formattedMonthlySubscriptionPrice = monthlyPaid?.formattedPrice ?: FALLBACK_MONTHLY_PRICE
+        monthlyPaid?.let {
+            storeMonthlyPrice = com.bringyour.network.ui.upgrade.StorePrice(it.priceAmountMicros / 1_000_000.0, it.priceCurrencyCode)
+        }
         // a Play answer without a yearly base plan keeps the fallback price: the
         // yearly plan is assumed to exist, and a tap then surfaces the store's
         // error rather than a hidden plan
-        formattedYearlySubscriptionPrice = yearly?.pricingPhases?.pricingPhaseList
-            ?.firstOrNull { 0L < it.priceAmountMicros }
-            ?.formattedPrice
-            ?: FALLBACK_YEARLY_PRICE
+        // the regular yearly price is the last paid phase: the welcome offer's
+        // discounted first year sits in front of it
+        val yearlyPaid = yearly?.pricingPhases?.pricingPhaseList?.lastOrNull { 0L < it.priceAmountMicros }
+        formattedYearlySubscriptionPrice = yearlyPaid?.formattedPrice ?: FALLBACK_YEARLY_PRICE
+        yearlyPaid?.let {
+            storeYearlyPrice = com.bringyour.network.ui.upgrade.StorePrice(it.priceAmountMicros / 1_000_000.0, it.priceCurrencyCode)
+        }
+        // each tagged monthly offer's first paid period: the win-back offer's
+        // discounted first month sits in front of the base price
+        val tagged = mutableMapOf<String, com.bringyour.network.ui.upgrade.StorePrice>()
+        planOffers.filter { it.periodDays in 28..31 && !it.basePlan }.forEach { planOffer ->
+            val paid = offers[planOffer.index].pricingPhases.pricingPhaseList.firstOrNull { 0L < it.priceAmountMicros }
+                ?: return@forEach
+            for (tag in planOffer.tags) {
+                tagged.putIfAbsent(tag, com.bringyour.network.ui.upgrade.StorePrice(paid.priceAmountMicros / 1_000_000.0, paid.priceCurrencyCode))
+            }
+        }
+        storeMonthlyOfferPrices = tagged
+    }
+
+    /** Asks Play for the account's billing country once per connection; the app sends it as the storefront. */
+    private fun loadBillingCountry(client: BillingClient) {
+        if (billingCountry != null) {
+            return
+        }
+        runCatching {
+            client.getBillingConfigAsync(GetBillingConfigParams.newBuilder().build()) { result, config ->
+                if (result.responseCode == BillingResponseCode.OK && config != null) {
+                    val country = config.countryCode
+                    if (!country.isNullOrBlank()) {
+                        billingCountry = country.uppercase()
+                    }
+                } else {
+                    Log.i("PlanViewModel", "billing config unavailable: ${result.responseCode} ${result.debugMessage}")
+                }
+            }
+        }.onFailure { Log.i("PlanViewModel", "billing config query failed: ${it.message}") }
     }
 
     val setInProgress: (Boolean) -> Unit = { ip ->
@@ -682,18 +858,35 @@ internal fun offerFreeDays(offer: com.android.billingclient.api.ProductDetails.S
     return parseIsoPeriodDays(free.billingPeriod) ?: 0
 }
 
-/** Play's offers reduced to the picker's decision data, in Play's order. */
-internal fun List<com.android.billingclient.api.ProductDetails.SubscriptionOfferDetails>.toPlanOffers(): List<PlanOffer> =
-    mapIndexed { index, offer -> PlanOffer(index = index, periodDays = offerPeriodDays(offer), freeDays = offerFreeDays(offer)) }
+/**
+ * Play's offers reduced to the picker's decision data, in Play's order. The
+ * base plan is the entry without an offer id; an offer's tags are its own,
+ * its base plan's left out (Play reports them together).
+ */
+internal fun List<com.android.billingclient.api.ProductDetails.SubscriptionOfferDetails>.toPlanOffers(): List<PlanOffer> {
+    val baseTags = filter { it.offerId == null }.associate { it.basePlanId to it.offerTags.toSet() }
+    return mapIndexed { index, offer ->
+        val basePlan = offer.offerId == null
+        PlanOffer(
+            index = index,
+            periodDays = offerPeriodDays(offer),
+            freeDays = offerFreeDays(offer),
+            tags = if (basePlan) offer.offerTags else PlanOffers.ownTags(offer.offerTags, baseTags[offer.basePlanId].orEmpty()),
+            basePlan = basePlan,
+        )
+    }
+}
 
 /**
  * Picks the offer to buy for a plan (see [PlanOffers.forPlan]): for the yearly
  * plan the offer with the free trial when Play returns one, so the purchase
- * carries the trial the picker promised.
+ * carries the trial the picker promised; for either plan the offer tagged
+ * `preferTag` when Play lists it, and never another tagged offer.
  */
 internal fun offerForPlan(
     offers: List<com.android.billingclient.api.ProductDetails.SubscriptionOfferDetails>,
     plan: PlanType,
+    preferTag: String? = null,
 ): com.android.billingclient.api.ProductDetails.SubscriptionOfferDetails? {
-    return PlanOffers.forPlan(offers.toPlanOffers(), plan)?.let { offers[it.index] }
+    return PlanOffers.forPlan(offers.toPlanOffers(), plan, preferTag)?.let { offers[it.index] }
 }

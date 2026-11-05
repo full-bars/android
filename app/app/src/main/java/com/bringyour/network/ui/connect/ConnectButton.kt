@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
@@ -35,10 +36,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.PointerIcon
+import androidx.compose.ui.input.pointer.pointerHoverIcon
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.tooling.preview.Preview
@@ -50,6 +55,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
 import com.bringyour.network.R
+import com.bringyour.network.ui.components.focusRing
 import com.bringyour.network.ui.shared.models.ConnectStatus
 import com.bringyour.network.ui.theme.Black
 import com.bringyour.network.ui.theme.BlueMedium
@@ -76,7 +82,9 @@ fun ConnectButton(
     getStateColor: (ProviderPointState?) -> Color,
     displayReconnectTunnel: Boolean,
     insufficientBalance: Boolean,
-    isPollingSubscriptionBalance: Boolean
+    isPollingSubscriptionBalance: Boolean,
+    // the warning below is a paying account's data limit, for the button's name
+    dataLimitReached: Boolean = false,
 ) {
 
     var currentStatus by remember { mutableStateOf<ConnectStatus?>(null) }
@@ -98,18 +106,33 @@ fun ConnectButton(
 
     }
 
+    // one name for the button in each state; the icons it draws are decorative
+    val description = connectButtonDescriptionId(
+        status = updatedStatus,
+        insufficientBalance = insufficientBalance,
+        isPollingSubscriptionBalance = isPollingSubscriptionBalance,
+        displayReconnectTunnel = displayReconnectTunnel,
+        dataLimitReached = dataLimitReached,
+    )?.let { stringResource(id = it) }
+
     Box(
         modifier = Modifier
             .size(if (isTv()) 128.dp else 256.dp)
 //            .widthIn(max = 256.dp)
 //            .heightIn(max = 256.dp)
+            // the keyboard's focus: a ring around the graphic's round face,
+            // outside its square, so the clip below leaves it whole
+            .focusRing(shape = CircleShape, outset = 6.dp)
             .clipToBounds()
             .background(color = Color(0x0AFFFFFF))
     ) {
         Box(
             modifier = Modifier
                 .fillMaxSize()
+                // Enter and Space press it as a tap does
+                .pointerHoverIcon(PointerIcon.Hand)
                 .clickable(onClick = onClick)
+                .semantics { if (description != null) contentDescription = description }
                 .zIndex(0f)
         ) {
 
@@ -138,7 +161,32 @@ fun ConnectButton(
                 ) {
                     Icon(
                         painter = painterResource(id = R.drawable.icon_warning),
-                        contentDescription = "Insufficient balance",
+                        contentDescription = null,
+                        tint = TextMuted
+                    )
+                }
+            }
+
+            /**
+             * Connect failed: no provider could be reached (the sdk's
+             * CONNECT_FAILED). The warning replaces the grid, as the error
+             * state of the desktop apps' connect canvas does, until a provider
+             * lands or the user retries.
+             */
+            AnimatedVisibility(
+                visible = updatedStatus == ConnectStatus.CONNECT_FAILED && !insufficientBalance,
+                enter = fadeIn(),
+                exit = fadeOut(),
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize(),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center
+                ) {
+                    Icon(
+                        painter = painterResource(id = R.drawable.icon_warning),
+                        contentDescription = null,
                         tint = TextMuted
                     )
                 }
@@ -162,7 +210,7 @@ fun ConnectButton(
                 }
             }
 
-            if (!insufficientBalance) {
+            if (!insufficientBalance && updatedStatus != ConnectStatus.CONNECT_FAILED) {
                 ConnectingButtonContent(
                     providerGridPoints = providerGridPoints,
                     grid = grid,
@@ -178,7 +226,7 @@ fun ConnectButton(
 
         Image(
             painter = painterResource(id = R.drawable.connect_mask),
-            contentDescription = "Connect Mask",
+            contentDescription = null,
             contentScale = ContentScale.Crop,
             modifier = Modifier
                 .size(512.dp)
@@ -226,12 +274,12 @@ private fun ConnectingButtonContent(
         ) {
             Image(
                 painter = painterResource(id = R.drawable.connector_globe),
-                contentDescription = "Connecting"
+                contentDescription = null
             )
         }
 
         GridCanvas(
-            size = 248.dp, // slightly smaller than the parent so points don't rub against the mask edges
+            size = CONNECT_GRID_CANVAS_SIZE,
             providerGridPoints = providerGridPoints,
             grid = grid,
             updatedStatus = status,
@@ -243,17 +291,27 @@ private fun ConnectingButtonContent(
     }
 }
 
+// The provider grid canvas side: slightly smaller than the widget so points
+// don't rub against the mask edges.
+val CONNECT_GRID_CANVAS_SIZE = 248.dp
+// the gap between adjacent points, in pixels
+const val CONNECT_GRID_POINT_PADDING_PX = 1f
+
 class AnimatedProviderGridPoint(
     val clientId: Id,
     val x: Int,
     val y: Int,
     initialState: ProviderPointState,
     initialDone: Boolean = false,
+    // the colors of the extenders carrying this provider (K2, K3), as opaque
+    // ARGB ints in the sdk's order; empty for a provider reached directly
+    initialExtenderRings: List<Int> = listOf(),
     val radius: Animatable<Float, AnimationVector1D> = Animatable(0f),
     val color: Animatable<Color, AnimationVector4D> = Animatable(Color.Transparent)
 ) {
     var state by mutableStateOf(initialState)
     var done by mutableStateOf(initialDone)
+    var extenderRings by mutableStateOf(initialExtenderRings)
 }
 
 @Composable
@@ -270,7 +328,7 @@ fun GridCanvas(
     val localDensityCurrent = LocalDensity.current
     val pointSize = grid?.width?.let { (size.value / it.toFloat()) * localDensityCurrent.density }
         ?: 2.toFloat()
-    val padding = 1f
+    val padding = CONNECT_GRID_POINT_PADDING_PX
     var currentStatus by remember { mutableStateOf<ConnectStatus?>(null) }
     val animatedPoints = remember { mutableStateMapOf<Id, AnimatedProviderGridPoint>() }
 
@@ -476,7 +534,8 @@ fun GridCanvas(
                         point.clientId,
                         point.x,
                         point.y,
-                        newState
+                        newState,
+                        initialExtenderRings = extenderRingArgbList(point.extenderColorHexes)
                     )
                     if (currentStatus != ConnectStatus.CONNECTED) {
                         launch {
@@ -510,67 +569,78 @@ fun GridCanvas(
 
                     animatedPoints[point.clientId] = animatedPoint
                 }
-            } else if (animatedPoint.state != newState) {
+            } else {
 
-                if (currentStatus != ConnectStatus.CONNECTED) {
-                    launch {
-                        try {
-                            animatedPoint.color.animateTo(
-                                getStateColor(newState),
-                                animationSpec = tween(durationMillis = 500)
-                            )
-                        } catch (e: Exception) {
-                            if (!animatedPoint.done) {
-                                animatedPoint.color.snapTo(getStateColor(animatedPoint.state))
-                            }
-                        }
-                    }
+                // the extenders carrying a provider change while the point
+                // stays put -- a transport migration briefly carries two --
+                // so the rings follow the grid point on every update
+                val extenderRings = extenderRingArgbList(point.extenderColorHexes)
+                if (animatedPoint.extenderRings != extenderRings) {
+                    animatedPoint.extenderRings = extenderRings
                 }
 
-                animatedPoint.state = newState
+                if (animatedPoint.state != newState) {
 
-                val done =
-                    newState == ProviderPointState.REMOVED || newState == ProviderPointState.EVALUATION_FAILED || newState == ProviderPointState.NOT_ADDED
-                if (animatedPoint.done != done) {
-                    if (done) {
-                        launch {
-                            // Remove point
-                            try {
-                                animatedPoint.radius.animateTo(
-                                    0f,
-                                    animationSpec = tween(
-                                        durationMillis = 500,
-                                        delayMillis = 500
-                                    )
-                                )
-                            } catch (e: Exception) {
-                                if (animatedPoint.done) {
-                                    // Failure(androidx.compose.runtime.LeftCompositionCancellationException: The coroutine scope left the composition)
-                                    animatedPoint.radius.snapTo(0f)
-                                }
-                            } finally {
-                                if (animatedPoint.done) {
-                                    animatedPoints.remove(animatedPoint.clientId)
-                                }
-                            }
-                        }
-                    } else {
+                    if (currentStatus != ConnectStatus.CONNECTED) {
                         launch {
                             try {
-                                animatedPoint.radius.animateTo(
-                                    pointSize / 2 - padding / 2,
+                                animatedPoint.color.animateTo(
+                                    getStateColor(newState),
                                     animationSpec = tween(durationMillis = 500)
                                 )
                             } catch (e: Exception) {
                                 if (!animatedPoint.done) {
-                                    animatedPoint.radius.snapTo(pointSize / 2 - padding / 2)
+                                    animatedPoint.color.snapTo(getStateColor(animatedPoint.state))
                                 }
                             }
                         }
                     }
-                }
 
-                animatedPoint.done = done
+                    animatedPoint.state = newState
+
+                    val done =
+                        newState == ProviderPointState.REMOVED || newState == ProviderPointState.EVALUATION_FAILED || newState == ProviderPointState.NOT_ADDED
+                    if (animatedPoint.done != done) {
+                        if (done) {
+                            launch {
+                                // Remove point
+                                try {
+                                    animatedPoint.radius.animateTo(
+                                        0f,
+                                        animationSpec = tween(
+                                            durationMillis = 500,
+                                            delayMillis = 500
+                                        )
+                                    )
+                                } catch (e: Exception) {
+                                    if (animatedPoint.done) {
+                                        // Failure(androidx.compose.runtime.LeftCompositionCancellationException: The coroutine scope left the composition)
+                                        animatedPoint.radius.snapTo(0f)
+                                    }
+                                } finally {
+                                    if (animatedPoint.done) {
+                                        animatedPoints.remove(animatedPoint.clientId)
+                                    }
+                                }
+                            }
+                        } else {
+                            launch {
+                                try {
+                                    animatedPoint.radius.animateTo(
+                                        pointSize / 2 - padding / 2,
+                                        animationSpec = tween(durationMillis = 500)
+                                    )
+                                } catch (e: Exception) {
+                                    if (!animatedPoint.done) {
+                                        animatedPoint.radius.snapTo(pointSize / 2 - padding / 2)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    animatedPoint.done = done
+                }
             }
         }
     }
@@ -593,13 +663,19 @@ fun GridCanvas(
                 Canvas(modifier = Modifier.size(size)) {
                     // our provider grid
                     animatedPoints.values.forEach { point ->
-                        drawCircle(
-                            color = point.color.value,
-                            radius = point.radius.value,
+                        // the dot's own animating diameter is the cell the
+                        // rings are laid out in, so they grow in and shrink
+                        // out with it and never reach past the cell edge (K2)
+                        drawExtenderDot(
                             center = Offset(
                                 point.x * pointSize + pointSize / 2,
                                 point.y * pointSize + pointSize / 2
-                            )
+                            ),
+                            cellSizePx = point.radius.value * 2,
+                            color = point.color.value,
+                            ringArgb = point.extenderRings,
+                            strokePx = EXTENDER_RING_STROKE_DP.dp.toPx(),
+                            gapPx = EXTENDER_RING_GAP_DP.dp.toPx(),
                         )
                     }
 
@@ -627,7 +703,7 @@ fun GridCanvas(
                 ) {
                     Icon(
                         painter = painterResource(id = R.drawable.icon_warning),
-                        contentDescription = "",
+                        contentDescription = null,
                         tint = TextMuted
                     )
                 }

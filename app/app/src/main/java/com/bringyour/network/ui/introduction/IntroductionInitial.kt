@@ -1,5 +1,6 @@
 package com.bringyour.network.ui.introduction
 
+import com.bringyour.network.ui.components.rememberFoldSafeSheetState
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.foundation.layout.fillMaxSize
@@ -16,11 +17,11 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -32,6 +33,10 @@ import com.bringyour.network.R
 import com.bringyour.network.ui.IntroRoute
 import com.bringyour.network.ui.components.redeemTransferBalanceCode.RedeemTransferBalanceCodeSheet
 import com.bringyour.network.ui.shared.viewmodels.PlanViewModel
+import com.bringyour.network.ui.shared.viewmodels.SubscriptionBalanceViewModel
+import com.bringyour.sdk.Sdk
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import com.bringyour.network.ui.theme.Black
 import com.bringyour.network.ui.theme.NeueBitLargeTextStyle
 import com.bringyour.network.ui.theme.TextMuted
@@ -43,20 +48,22 @@ fun IntroductionInitial(
     navController: NavHostController,
     dismiss: () -> Unit,
     planViewModel: PlanViewModel,
-    createSolanaPaymentIntent: (
-        reference: String,
-        plan: String,
-        onSuccess: (amountUsd: Double) -> Unit,
-        onError: () -> Unit
-    ) -> Unit,
-    setPendingSolanaSubscriptionReference: (String) -> Unit,
+    subscriptionBalanceViewModel: SubscriptionBalanceViewModel,
     onStripePaymentSuccess: () -> Unit,
     onRedeemTransferBalanceCodeSuccess: () -> Unit,
-    isCheckingSolanaTransaction: Boolean
 ) {
 
-    var isPresentingRedeemTransferBalanceSheet by remember { mutableStateOf(false) }
-    val redeemTransferBalanceSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    var isPresentingRedeemTransferBalanceSheet by rememberSaveable { mutableStateOf(false) }
+
+    // the welcome offer is issued the moment this plan step renders (idempotent
+    // on the server; never for the in-app holdout), so the card can show it
+    val experiments by subscriptionBalanceViewModel.experiments.collectAsState()
+    LaunchedEffect(experiments) {
+        if (experiments != null && !subscriptionBalanceViewModel.isOfferHoldout) {
+            subscriptionBalanceViewModel.issueOnboardingOffer(Sdk.OfferSurfaceIntroStep)
+        }
+    }
+    val redeemTransferBalanceSheetState = rememberFoldSafeSheetState()
 
     Scaffold(
         topBar = {
@@ -97,12 +104,9 @@ fun IntroductionInitial(
 
                 SubscriptionOptions(
                     planViewModel = planViewModel,
-                    createSolanaPaymentIntent = createSolanaPaymentIntent,
-                    onSolanaUriOpened = { reference ->
-                        setPendingSolanaSubscriptionReference(reference)
-                    },
+                    subscriptionBalanceViewModel = subscriptionBalanceViewModel,
+                    surface = Sdk.OfferSurfaceIntroStep,
                     onStripePaymentSuccess = onStripePaymentSuccess,
-                    isCheckingSolanaTransaction = isCheckingSolanaTransaction
                 )
             }
 

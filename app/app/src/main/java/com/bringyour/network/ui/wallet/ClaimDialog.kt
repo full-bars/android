@@ -142,18 +142,10 @@ fun ClaimDialog(
                 )
                 is ClaimDialogState.Unavailable -> {
                     Text(
-                        stringResource(id = R.string.chain_rpc_unreachable),
+                        claimsReadFailureText(state.detail),
                         style = MaterialTheme.typography.bodyMedium,
                         color = Red
                     )
-                    if (!state.detail.isNullOrBlank() && state.detail != stringResource(id = R.string.chain_rpc_unreachable)) {
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Text(
-                            state.detail,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = TextMuted
-                        )
-                    }
                     Spacer(modifier = Modifier.height(16.dp))
                     DialogButtons(
                         primary = stringResource(id = R.string.retry),
@@ -240,7 +232,7 @@ private fun ReadyContent(
                 Text(
                     listOfNotNull(
                         shortSs58(gasKey.mirrorSs58),
-                        state.gasTao?.let { "${EarningsFormat.tao(it)} TAO" }
+                        state.gasTao?.let { stringResource(id = R.string.tao_amount_linux, EarningsFormat.tao(it)) }
                     ).joinToString(" · "),
                     style = MaterialTheme.typography.bodyMedium
                 )
@@ -266,7 +258,7 @@ private fun ReadyContent(
 }
 
 @Composable
-private fun NeedsGasContent(
+internal fun NeedsGasContent(
     state: ClaimDialogState.NeedsGas,
     onDismiss: () -> Unit,
     onRetry: () -> Unit,
@@ -308,7 +300,7 @@ private fun NeedsGasContent(
                 color = TextMuted
             )
             Text(
-                "${EarningsFormat.tao(state.gasTao)} TAO",
+                stringResource(id = R.string.tao_amount_linux, EarningsFormat.tao(state.gasTao)),
                 style = MaterialTheme.typography.bodyMedium
             )
         }
@@ -355,8 +347,6 @@ private fun ProgressContent(
     formatAlpha: (Long) -> String,
     explorerTxUrl: (String) -> String,
 ) {
-    val context = LocalContext.current
-
     Column(modifier = Modifier.fillMaxWidth()) {
         progress.forEach { p ->
             Row(
@@ -385,61 +375,7 @@ private fun ProgressContent(
                     }
                 }
 
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    when (p.status) {
-                        ClaimProgressStatus.PENDING -> CircularProgressIndicator(
-                            modifier = Modifier.size(16.dp),
-                            color = TextMuted,
-                            trackColor = TextFaint,
-                            strokeWidth = 2.dp
-                        )
-                        ClaimProgressStatus.SENT -> {
-                            Text(
-                                stringResource(id = R.string.claim_sent),
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = BlueMedium
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(14.dp),
-                                color = BlueMedium,
-                                trackColor = TextFaint,
-                                strokeWidth = 2.dp
-                            )
-                        }
-                        ClaimProgressStatus.CONFIRMED -> {
-                            Icon(Icons.Filled.Check, contentDescription = null, tint = Green, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text(
-                                stringResource(id = R.string.claim_confirmed),
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = Green
-                            )
-                        }
-                        ClaimProgressStatus.FAILED -> {
-                            Icon(Icons.Filled.Close, contentDescription = null, tint = Red, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text(
-                                stringResource(id = R.string.claim_failed),
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = Red
-                            )
-                        }
-                    }
-                    p.txHash?.let { txHash ->
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Icon(
-                            Icons.Filled.OpenInNew,
-                            contentDescription = txHash,
-                            tint = TextMuted,
-                            modifier = Modifier
-                                .size(16.dp)
-                                .clickable {
-                                    context.startActivity(Intent(Intent.ACTION_VIEW, explorerTxUrl(txHash).toUri()))
-                                }
-                        )
-                    }
-                }
+                ClaimStatusTrailing(status = p.status, txHash = p.txHash, explorerTxUrl = explorerTxUrl)
             }
         }
 
@@ -472,6 +408,78 @@ private fun ProgressContent(
         )
     }
 }
+
+/** A claim row's end: its status, and the explorer link once it has a transaction. */
+@Composable
+internal fun ClaimStatusTrailing(
+    status: ClaimProgressStatus,
+    txHash: String?,
+    explorerTxUrl: (String) -> String,
+) {
+    val context = LocalContext.current
+
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        when (status) {
+            ClaimProgressStatus.PENDING -> CircularProgressIndicator(
+                modifier = Modifier.size(16.dp),
+                color = TextMuted,
+                trackColor = TextFaint,
+                strokeWidth = 2.dp
+            )
+            ClaimProgressStatus.SENT -> {
+                Text(
+                    stringResource(id = R.string.claim_sent),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = BlueMedium
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                CircularProgressIndicator(
+                    modifier = Modifier.size(14.dp),
+                    color = BlueMedium,
+                    trackColor = TextFaint,
+                    strokeWidth = 2.dp
+                )
+            }
+            ClaimProgressStatus.CONFIRMED -> {
+                Icon(Icons.Filled.Check, contentDescription = null, tint = Green, modifier = Modifier.size(16.dp))
+                Spacer(modifier = Modifier.width(4.dp))
+                Text(
+                    stringResource(id = R.string.claim_confirmed),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Green
+                )
+            }
+            ClaimProgressStatus.FAILED -> {
+                Icon(Icons.Filled.Close, contentDescription = null, tint = Red, modifier = Modifier.size(16.dp))
+                Spacer(modifier = Modifier.width(4.dp))
+                Text(
+                    stringResource(id = R.string.claim_failed),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Red
+                )
+            }
+        }
+        txHash?.let { txHash ->
+            Spacer(modifier = Modifier.width(8.dp))
+            Icon(
+                Icons.Filled.OpenInNew,
+                contentDescription = txHash,
+                tint = TextMuted,
+                modifier = Modifier
+                    .size(16.dp)
+                    .clickable {
+                        context.startActivity(Intent(Intent.ACTION_VIEW, explorerTxUrl(txHash).toUri()))
+                    }
+            )
+        }
+    }
+}
+
+/** A failed claims read in the store's words (claimsReadFailureRes), or the SDK's detail. */
+@Composable
+internal fun claimsReadFailureText(message: String?): String =
+    claimsReadFailureRes(message)?.let { stringResource(id = it) }
+        ?: snLedgerClaimFailureDetail(message.orEmpty())
 
 /** The SDK reports "<code>: <reason>"; known codes have a string of the same name. */
 @Composable
@@ -532,7 +540,7 @@ private fun CopyRow(value: String) {
 }
 
 @Composable
-private fun DialogButtons(
+internal fun DialogButtons(
     primary: String,
     onPrimary: () -> Unit,
     secondary: String? = null,

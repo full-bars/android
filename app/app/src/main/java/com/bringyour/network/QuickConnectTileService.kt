@@ -22,11 +22,15 @@ import com.bringyour.sdk.Sub
  * VPN service. The first-ever connect needs the system VPN consent dialog, which only an activity
  * can present, so that case hands off to the app (which completes the start via `vpnRequestStart`).
  *
- * It is an active, toggleable tile: the app pushes state with [requestListeningState] whenever the
- * connection changes, and accessibility reads it as a switch. The icon is the solid connector
- * mark in both states, as on iOS; the system tints the active tile, which is what carries the
- * state (Android 16 QPR1 tiles snap to 1x1, icon only). It toggles from the lock screen without
- * unlocking, like the system's own connectivity tiles (product decision, 2026-09-01).
+ * It is an active, toggleable tile, and accessibility reads it as a switch. The system binds an
+ * active tile only when the app asks ([requestListeningState]) or on a tap, never when the shade
+ * opens, so the app asks whenever what the tile says may have changed ([follow]). The icon is the
+ * solid connector mark in both states, as on iOS; the system tints the active tile, which is what
+ * carries the state (Android 16 QPR1 tiles snap to 1x1, icon only).
+ *
+ * It toggles from the lock screen without unlocking, like the system's own connectivity tiles
+ * (product decision, 2026-09-01). Samsung's cover screen shows only its own fixed Quick Settings,
+ * so the tile is not offered there.
  */
 class QuickConnectTileService : TileService() {
 
@@ -48,10 +52,54 @@ class QuickConnectTileService : TileService() {
                 requestListeningState(context, ComponentName(context, QuickConnectTileService::class.java))
             }
         }
+
+        /** What the tile last said in this process, null before it said anything. Main thread. */
+        var renderedStatus: com.bringyour.network.ui.connect.QuickConnectStatus? = null
+            private set
+
+        /**
+         * Keeps the tile saying the current status for the life of the process: follows the
+         * device, its window and its tunnel, and asks the system to show the tile again when they
+         * change what it says (QuickConnectTileRefresh). An active tile stops listening right
+         * after it answers a request, so its own listeners miss them. Call once, main thread.
+         */
+        fun follow(app: MainApplication) {
+            val mainHandler = Handler(Looper.getMainLooper())
+            val refresh = QuickConnectTileRefresh(
+                post = { mainHandler.post(it) },
+                status = { QuickConnect.status(app) },
+                rendered = { renderedStatus },
+                placed = { isAdded(app) },
+                requestUpdate = { requestUpdate(app) },
+            )
+            // main thread: each device's subscriptions replace the last one's
+            var subs: List<Sub> = listOf()
+            app.deviceManager.addDeviceChangeListener { device ->
+                mainHandler.post {
+                    subs.forEach { it.close() }
+                    subs = listOfNotNull(
+                        device?.addWindowStatusChangeListener { refresh.changed() },
+                        device?.addTunnelChangeListener { refresh.changed() },
+                    )
+                    // a sign in or out, and the first device of the process
+                    refresh.deviceChanged()
+                }
+            }
+        }
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var connectSub: Sub? = null
+    // the window and the tunnel, which decide whether the subtitle says connected
+    private var statusSubs: List<Sub> = listOf()
+    // re-rendered only when what the subtitle says changes, with one check
+    // pending at a time: the window reports each provider's evaluation, a
+    // burst of reports while the shade is open
+    private val statusCheck = CoalescedPost(post = { mainHandler.post(it) }) {
+        if (QuickConnect.status(app) != renderedStatus) {
+            render()
+        }
+    }
 
     private val app: MainApplication
         get() = applicationContext as MainApplication
@@ -59,6 +107,7 @@ class QuickConnectTileService : TileService() {
     override fun onTileAdded() {
         super.onTileAdded()
         setAdded(this, true)
+        com.bringyour.network.analytics.ClientEvents.widgetAdded(com.bringyour.network.analytics.ClientEvents.WIDGET_QUICK_SETTINGS)
         // an active tile shows the manifest defaults until it is bound once
         requestUpdate(this)
     }
@@ -70,46 +119,67 @@ class QuickConnectTileService : TileService() {
 
     override fun onStartListening() {
         super.onStartListening()
-        // keep the tile live while the shade is open
+        // keep the tile live while it listens, mostly after a tap; an active
+        // tile stops listening once it answers a request, and follow keeps
+        // it current between
         connectSub?.close()
         connectSub = app.device?.addConnectChangeListener {
             mainHandler.post { render() }
         }
+        statusSubs.forEach { it.close() }
+        statusSubs = listOfNotNull(
+            app.device?.addWindowStatusChangeListener { statusCheck.request() },
+            app.device?.addTunnelChangeListener { statusCheck.request() },
+        )
         render()
+        // a tap decides on a fresh balance: fetch it while the shade is open
+        // so the tap rarely has to wait for it
+        if (!QuickConnect.isConnected(app)) {
+            app.refreshStartConnectBalanceIfStale()
+        }
     }
 
     override fun onStopListening() {
         connectSub?.close()
         connectSub = null
+        statusSubs.forEach { it.close() }
+        statusSubs = listOf()
         super.onStopListening()
     }
 
     override fun onClick() {
         super.onClick()
-        when (QuickConnect.toggle(app, source = "tile")) {
-            QuickConnect.Result.APPLIED -> render()
-            QuickConnect.Result.NEEDS_CONSENT -> {
-                render()
-                openApp()
+        // locked too: no unlock first (product decision, 2026-09-01)
+        toggle()
+    }
+
+    private fun toggle() {
+        QuickConnect.toggle(app, source = "tile") { result ->
+            // the decided state: also a refused start's off, before the upgrade screen
+            render()
+            when (result) {
+                QuickConnect.Result.APPLIED -> {}
+                QuickConnect.Result.NEEDS_CONSENT,
+                QuickConnect.Result.NEEDS_APP,
+                QuickConnect.Result.NEEDS_UPGRADE -> openApp()
             }
-            QuickConnect.Result.NEEDS_APP -> openApp()
         }
+        // a start waiting on its balance shows connecting from the tap
+        render()
     }
 
     private fun render() {
         val tile = qsTile ?: return
         val configured = QuickConnect.isConfigured(app)
-        val connected = configured && QuickConnect.isConnected(app)
-        tile.state = if (connected) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
+        val shown = if (configured) QuickConnect.shown(app) else com.bringyour.network.ui.connect.QuickConnectShown.OFF
+        tile.state = if (shown == com.bringyour.network.ui.connect.QuickConnectShown.OFF) Tile.STATE_INACTIVE else Tile.STATE_ACTIVE
         tile.icon = Icon.createWithResource(this, R.drawable.ic_tile_quick_on)
         tile.label = getString(R.string.app_name)
-        val subtitle = getString(
-            when {
-                !configured -> R.string.widget_not_signed_in
-                connected -> R.string.tile_status_connected
-                else -> R.string.tile_status_disconnected
-            },
-        )
+        // connected only once it is, with the tunnel up; else the connect
+        // screen's connecting, couldn't connect or tunnel down line
+        val status = QuickConnect.status(app)
+        renderedStatus = status
+        val subtitle = getString(com.bringyour.network.ui.connect.quickConnectStatusText(status))
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             tile.subtitle = subtitle
         }

@@ -19,16 +19,18 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.bringyour.network.DeviceManager
 import com.bringyour.network.ForegroundDeviceControllerOwner
+import com.bringyour.network.MainApplication
 import com.bringyour.network.TAG
+import com.bringyour.network.TransportDelayUi
 import com.bringyour.network.ui.shared.models.ConnectStatus
 import com.bringyour.network.ui.theme.BlueLight
+import com.bringyour.network.ui.stats.IpFamilyPoint
 import com.bringyour.network.ui.theme.Green
 import com.bringyour.network.ui.theme.Pink
 import com.bringyour.network.ui.theme.Red
 import com.bringyour.network.ui.theme.Yellow
 import com.bringyour.sdk.ConnectGrid
 import com.bringyour.sdk.ConnectLocation
-import com.bringyour.sdk.ConnectViewController
 import com.bringyour.sdk.ContractStatus
 import com.bringyour.sdk.DeviceLocal
 import com.bringyour.sdk.Id
@@ -46,21 +48,68 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
+/**
+ * The connect screen: the presented connect view controller of the current
+ * device while the app is in the foreground, its grid, location and status,
+ * and the connect and disconnect the screen makes.
+ *
+ * It reaches the sdk through [ConnectDevice] and [ConnectController], the
+ * device changes through `deviceChanges`, the process lifecycle, the start
+ * connect gate and the connect command queue through constructor arguments,
+ * so tests run it on a fake sdk with a held gate and a held queue
+ * (ConnectViewModelTest). The app's are the device manager's device,
+ * ProcessLifecycleOwner, MainApplication.checkStartConnect and
+ * MainApplication.connectCommands.
+ *
+ * Its connects and disconnects run on the connect command queue, off the main
+ * thread ([ConnectCommands]), and the screen shows each tap's state from the
+ * tap until the queue has run it; then it reads the controller's status again.
+ * The presented controller and its listeners close on the queue too, after
+ * the commands made so far, so a disconnect tapped just before the app goes
+ * to the background still reaches the sdk.
+ */
 @HiltViewModel
 class ConnectViewModel
-@Inject
-constructor(
+internal constructor(
         private val deviceManager: DeviceManager,
+        private val appContext: android.content.Context,
+        private val processLifecycle: Lifecycle,
+        deviceChanges: (listener: (ConnectDevice?) -> Unit) -> (() -> Unit),
+        private val startConnect: StartConnect,
+        private val connectCommands: ConnectCommands,
 ) : ViewModel(), DefaultLifecycleObserver {
 
-    private var connectVc: ConnectViewController? = null
-    private var viewControllerDevice: DeviceLocal? = null
+    @Inject
+    constructor(
+        deviceManager: DeviceManager,
+        @dagger.hilt.android.qualifiers.ApplicationContext appContext: android.content.Context,
+    ) : this(
+        deviceManager = deviceManager,
+        appContext = appContext,
+        processLifecycle = ProcessLifecycleOwner.get().lifecycle,
+        deviceChanges = { listener ->
+            deviceManager.addDeviceChangeListener { device ->
+                listener(device?.let { SdkConnectDevice(it) })
+            }
+        },
+        startConnect = (appContext as? com.bringyour.network.MainApplication)?.startConnect
+            ?: StartConnect(check = { it(false) }, render = {}),
+        connectCommands = (appContext as? com.bringyour.network.MainApplication)?.connectCommands
+            // only a test context has no app: commands run where they are made
+            ?: ConnectCommands(execute = { it.run() }, postMain = { it.run() }),
+    )
+
+    private var connectVc: ConnectController? = null
+    private var viewControllerDevice: ConnectDevice? = null
+    // the device last published, also while no controller is presented
+    private var currentDevice: ConnectDevice? = null
 
     private val subs = mutableListOf<Sub>()
-    private val processLifecycle = ProcessLifecycleOwner.get().lifecycle
     private var removeDeviceChangeListener: (() -> Unit)? = null
+    private var removeCommandsListener: (() -> Unit)? = null
+    private var removeStartListener: (() -> Unit)? = null
     private val controllerOwner =
-        ForegroundDeviceControllerOwner<DeviceLocal, ConnectViewController>(
+        ForegroundDeviceControllerOwner<ConnectDevice, ConnectController>(
             open = { openConnectViewController(it) },
             close = { device, vc -> closeConnectViewController(device, vc) },
         )
@@ -77,6 +126,12 @@ constructor(
     var providerGridPoints by mutableStateOf<Map<Id, ProviderGridPoint>>(mapOf())
         private set
 
+    // the same providers as plain data for the connect drawer's IP family
+    // status row (the sdk state and category), derived with the grid so the
+    // two views always describe one snapshot
+    var ipFamilyPoints by mutableStateOf<List<IpFamilyPoint>>(listOf())
+        private set
+
     var grid by mutableStateOf<ConnectGrid?>(null)
         private set
 
@@ -86,7 +141,25 @@ constructor(
     private var lastGridSignature: String = ""
 
     // var grid by mutableStateOf<ConnectGrid?>(null)
-    private var tunnelConnected = false
+    // read by the connect screen and the balance notice, for what they say about
+    // the traffic while a connection is refused
+    var tunnelConnected by mutableStateOf(false)
+        private set
+
+    // a paying account refused at a data limit, from the process-wide DataLimitGate
+    var dataLimitReached by mutableStateOf(false)
+        private set
+
+    val setDataLimitReached: (Boolean) -> Unit = { reached ->
+        dataLimitReached = reached
+    }
+
+    // A failed connect attempt (the sdk's CONNECT_FAILED, or no provider in the
+    // window past the time bound, while the user wants to be connected) is
+    // handed to the whitelist probe, which decides whether to run (P052).
+    private val connectFailureMonitor = ConnectFailureMonitor()
+    private var connectFailureCheckJob: Job? = null
+    private var connectFailureCheckAtMillis: Long? = null
 
     var displayReconnectTunnel by mutableStateOf(false)
         private set
@@ -157,6 +230,16 @@ constructor(
     private val _contractStatus = MutableStateFlow<ContractStatus?>(null)
     val contractStatus: StateFlow<ContractStatus?> = _contractStatus
 
+    private val _transportDelay = MutableStateFlow(TransportDelayUi.None)
+
+    /**
+     * The device's transport delay while the screen presents a controller
+     * (apple/DELAY.md §7.1): the slow internet pill shows while its quality
+     * is above 0. Its listener closes with the controller in the background,
+     * so it is read again when the controller opens; none without one.
+     */
+    val transportDelay: StateFlow<TransportDelayUi> = _transportDelay
+
     private val successPoints = mutableListOf<AnimatedSuccessPoint>()
 
     val canvasSize = 248.dp
@@ -164,7 +247,7 @@ constructor(
     val shuffledSuccessPoints = mutableStateListOf<AnimatedSuccessPoint>()
 
     val device: DeviceLocal?
-        get() = viewControllerDevice ?: deviceManager.device
+        get() = (viewControllerDevice as? SdkConnectDevice)?.device ?: deviceManager.device
 
     val initSuccessPoints: (Float) -> Unit = { canvasSizePx ->
 
@@ -223,11 +306,51 @@ constructor(
         shuffledSuccessPoints.addAll(successPoints.shuffled())
     }
 
+    // the start connect gate for the connect screen, and the connecting
+    // state it shows while the gate fetches the balance
+    private val connectDisplay = ConnectStatusDisplay()
+
+    /**
+     * What the connect screen shows: the connecting state while a start waits
+     * on its balance, else [connectStatus] (StartConnectAdmission).
+     */
+    val displayConnectStatus: StateFlow<ConnectStatus> = connectDisplay.displayStatus
+
+    /**
+     * Every in-app connect (the connect button and drawer, a location pick, a
+     * link) passes the start connect gate: out of balance it opens the
+     * upgrade screen instead of starting the tunnel, and the connect waits on
+     * the balance to be retried by itself (MainApplication.startConnectBlocked).
+     * The gate may first fetch a fresh account balance, so the connect starts
+     * from its callback, and the screen shows the connecting state meanwhile.
+     */
     val connect: (ConnectLocation?) -> Unit = { location ->
-        if (location != null) {
-            connectVc?.connect(location)
-        } else {
-            connectVc?.connectBestAvailable()
+        val app = appContext as? com.bringyour.network.MainApplication
+        val device = currentDevice
+        if (device != null) {
+            startConnect.request(
+                connectEnabled = connectCommands.connectRequested(device),
+                connect = true,
+                owner = this,
+                apply = { blocked ->
+                    if (currentDevice?.identity === device.identity) {
+                        if (blocked) {
+                            Log.i(TAG, "[connect]blocked: insufficient balance")
+                            app?.startConnectBlocked(location)
+                        } else {
+                            app?.clearBalanceRecovery()
+                            // the user's own connect lifts the revoke fence
+                            app?.clearVpnRevokeFence()
+                            runCommand(connect = true) { vc ->
+                                if (location != null) vc.connect(location) else vc.connectBestAvailable()
+                            }
+                        }
+                    }
+                },
+                waiting = {},
+                ended = {},
+                onResult = {},
+            )
         }
     }
 
@@ -263,7 +386,7 @@ constructor(
 
     }
 
-    private fun addListener(listener: (ConnectViewController) -> Sub) {
+    private fun addListener(listener: (ConnectController) -> Sub) {
         connectVc?.let { subs.add(listener(it)) }
     }
 
@@ -284,16 +407,54 @@ constructor(
         val sub = device?.addContractStatusChangeListener {
             viewModelScope.launch {
                 if (viewControllerDevice === device) {
+                    // out of balance never disconnects: connect stays requested so
+                    // nothing leaves outside the tunnel. InsufficientBalanceMonitor
+                    // alerts the user, who can upgrade or disconnect
                     refreshContractStatus()
-                    if (_contractStatus.value?.insufficientBalance == true &&
-                                _connectStatus.value != ConnectStatus.DISCONNECTED
-                    ) {
-                        disconnect()
-                    }
                 }
             }
         }
         sub?.let { subs.add(it) }
+    }
+
+    private val addTransportDelayListener = {
+        val device = viewControllerDevice
+        val sub = device?.addTransportDelayChangeListener { delay ->
+            viewModelScope.launch {
+                if (viewControllerDevice === device) {
+                    _transportDelay.value = delay
+                }
+            }
+        }
+        sub?.let { subs.add(it) }
+        // the listener reports changes only: read the current value once it
+        // is registered, so a change in between is not missed
+        refreshTransportDelay()
+    }
+
+    /** Reads the device's transport delay again: the numbers change without a report. */
+    private val refreshTransportDelay: () -> Unit = {
+        _transportDelay.value = viewControllerDevice?.transportDelay ?: TransportDelayUi.None
+    }
+
+    // the locations' ticker, run while the pill shows its numbers
+    private val transportDelayRefreshTicker = LocationsRefreshTicker(
+        scope = viewModelScope,
+        intervalMillis = SLOW_INTERNET_PILL_REFRESH_MILLIS,
+        isFetching = { false },
+        refresh = { refreshTransportDelay() },
+    )
+
+    /**
+     * The slow internet pill shows its slow content on the visible screen
+     * (`true`) or not (apple/DELAY.md §5.2): while it does, its numbers are
+     * read at once and then every [SLOW_INTERNET_PILL_REFRESH_MILLIS].
+     */
+    val setSlowInternetPillVisible: (Boolean) -> Unit = { visible ->
+        if (visible) {
+            refreshTransportDelay()
+        }
+        transportDelayRefreshTicker.setVisible(visible)
     }
 
     private fun updateGrid() {
@@ -313,8 +474,16 @@ constructor(
             }
             newProviderGridPoints = updateProviderGridPoints
             signature.append(newWindowCurrentSize).append(';')
+            // the family is in the signature: a local downgrade changes a
+            // provider's category without changing its state or position, and
+            // the status row must follow it. the extender colors are in it for
+            // the same reason: a transport migration changes the rings on a
+            // dot that has not otherwise moved (K2)
             newProviderGridPoints.values
-                .map { "${it.clientId.idStr}:${it.state}:${it.x}:${it.y}" }
+                .map {
+                    "${it.clientId.idStr}:${it.state}:${it.x}:${it.y}:${it.ipFamily}" +
+                            ":${it.extenderColorHexes}"
+                }
                 .sorted()
                 .forEach { signature.append(it).append('|') }
         } else {
@@ -333,10 +502,19 @@ constructor(
         }
         lastGridSignature = newSignature
 
+        val newIpFamilyPoints = newProviderGridPoints.values.map { point ->
+            IpFamilyPoint(
+                state = point.state,
+                ipFamily = point.ipFamily,
+            )
+        }
+
         viewModelScope.launch {
             this@ConnectViewModel.grid = grid
             windowCurrentSize = newWindowCurrentSize
             providerGridPoints = newProviderGridPoints
+            ipFamilyPoints = newIpFamilyPoints
+            checkConnectFailure()
         }
     }
 
@@ -351,13 +529,72 @@ constructor(
         }
     }
 
+    /**
+     * Folds the view controller's raw status and window into the connect failure
+     * monitor and hands a failed attempt to MainApplication's whitelist probe,
+     * whose own trigger (cellular, network country, cool-down) decides whether
+     * it runs. It reads the raw status, so the pure policy needs no ui model.
+     * Main thread.
+     */
+    private fun checkConnectFailure() {
+        val failed = connectFailureMonitor.observe(
+            connectRequested = viewControllerDevice?.connectEnabled == true,
+            connectionStatus = connectVc?.connectionStatus,
+            windowProviderCount = windowCurrentSize,
+            nowMillis = System.currentTimeMillis(),
+        )
+        if (failed) {
+            (appContext.applicationContext as? MainApplication)
+                ?.maybeRunWhitelistProbe(connectFailed = true)
+        }
+        scheduleConnectFailureCheck()
+    }
+
+    // The time bound has to be checked even when no status or window event
+    // arrives, so re-check when the pending attempt's bound elapses.
+    private fun scheduleConnectFailureCheck() {
+        val timeoutAtMillis = connectFailureMonitor.timeoutAtMillis()
+        if (timeoutAtMillis == connectFailureCheckAtMillis) {
+            return
+        }
+        connectFailureCheckJob?.cancel()
+        connectFailureCheckJob = null
+        connectFailureCheckAtMillis = timeoutAtMillis
+        if (timeoutAtMillis == null) {
+            return
+        }
+        connectFailureCheckJob = viewModelScope.launch {
+            delay(maxOf(0L, timeoutAtMillis - System.currentTimeMillis()))
+            connectFailureCheckJob = null
+            connectFailureCheckAtMillis = null
+            checkConnectFailure()
+        }
+    }
+
+    /** Forgets the current attempt and its pending re-check: the device or view controller changed. */
+    private fun resetConnectFailureMonitor() {
+        connectFailureMonitor.reset()
+        connectFailureCheckJob?.cancel()
+        connectFailureCheckJob = null
+        connectFailureCheckAtMillis = null
+    }
+
     private fun updateConnectionStatus() {
+        viewModelScope.launch { checkConnectFailure() }
         connectVc?.let { vc ->
             vc.connectionStatus?.let { status ->
                 ConnectStatus.fromString(status)?.let { statusFromStr ->
                     viewModelScope.launch {
+                        val wasConnected = _connectStatus.value == ConnectStatus.CONNECTED
                         _connectStatus.value = statusFromStr
+                        connectDisplay.reported(statusFromStr)
                         updateDisplayReconnectTunnel()
+                        if (statusFromStr == ConnectStatus.CONNECTED && !wasConnected) {
+                            // the activation mark, once per network (the facade dedups)
+                            com.bringyour.network.analytics.ClientEvents.connectFirst(
+                                deviceManager.jwtFlow.value?.networkId?.toString()
+                            )
+                        }
                     }
                 }
             }
@@ -365,7 +602,9 @@ constructor(
     }
 
     val addConnectionStatusListener = {
-        addListener { vc -> vc.addConnectionStatusListener { updateConnectionStatus() } }
+        // the sdk reports on its own thread, the queue's for a command's own
+        // status: read on the main thread, with the rest of the view model
+        addListener { vc -> vc.addConnectionStatusListener { viewModelScope.launch { updateConnectionStatus() } } }
     }
 
     private fun updateSelectedLocation() {
@@ -379,7 +618,60 @@ constructor(
         addListener { vc -> vc.addSelectedLocationListener { updateSelectedLocation() } }
     }
 
-    val disconnect: () -> Unit = { connectVc?.disconnect() }
+    val disconnect: () -> Unit = {
+        // the user's disconnect: nothing is reconnected by itself after it,
+        // and a start still waiting on its balance does not connect
+        com.bringyour.network.VpnLifecycleLog.record({ appContext.createDeviceProtectedStorageContext().filesDir }, "disconnect requested", "connect screen")
+        (appContext as? com.bringyour.network.MainApplication)?.clearBalanceRecovery()
+        startConnect.cancel()
+        runCommand(connect = false) { it.disconnect() }
+    }
+
+    /**
+     * Queues `command`, a connect (`connect`) or a disconnect, on the connect
+     * command queue, off the main thread ([ConnectCommands]). It runs on the
+     * presented controller or, without one, on a controller opened for it on
+     * the current device and closed after, so a connect or disconnect always
+     * reaches the sdk. The presented controller is closed in the background,
+     * and a start the gate admits after the app left the foreground found none
+     * and was lost. The quick connect surfaces and the balance recovery connect
+     * the same way, as the Apple app does without a presented controller
+     * (ConnectViewModel.performOnSdk). The presented controller closes on the
+     * queue after this command (closeConnectViewController). Main thread.
+     */
+    private fun runCommand(connect: Boolean, command: (ConnectController) -> Unit) {
+        val presented = connectVc
+        val device = (if (presented != null) viewControllerDevice else null) ?: currentDevice ?: return
+        connectCommands.run(device = device.identity, connect = connect) {
+            if (presented != null) {
+                command(presented)
+            } else {
+                val vc = device.openConnectViewController()
+                try {
+                    command(vc)
+                } finally {
+                    device.closeViewController(vc)
+                }
+            }
+        }
+    }
+
+    /**
+     * The queue made or finished a command: until the last one made on this
+     * device has run, the newest one's own first status stands in for the
+     * sdk's, and then the controller's status is read again. A device change
+     * drops the previous device's commands from the status.
+     */
+    private fun commandsChanged() {
+        val pending = connectCommands.pending(currentDevice?.identity)
+        connectDisplay.commandPending(
+            pending?.let { connect -> if (connect) ConnectStatus.DESTINATION_SET else ConnectStatus.DISCONNECTED }
+        )
+        if (pending == null) {
+            // the sdk has every command now
+            updateConnectionStatus()
+        }
+    }
 
     val addTunnelListener: () -> Unit = {
         val device = viewControllerDevice
@@ -424,7 +716,12 @@ constructor(
         controllerOwner.setForeground(
             processLifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
         )
-        removeDeviceChangeListener = deviceManager.addDeviceChangeListener { device ->
+        removeCommandsListener = connectCommands.addListener { commandsChanged() }
+        removeStartListener = startConnect.addListener {
+            connectDisplay.startWaiting(startConnect.waiting)
+        }
+        connectDisplay.startWaiting(startConnect.waiting)
+        removeDeviceChangeListener = deviceChanges { device ->
             viewModelScope.launch {
                 setupDevice(device)
             }
@@ -453,7 +750,7 @@ constructor(
             windowSize.windowSizeMax.toInt() == 1
     }
 
-    private fun setupDevice(device: DeviceLocal?) {
+    private fun setupDevice(device: ConnectDevice?) {
         selectedLocation = null
         grid = null
         providerGridPoints = mapOf()
@@ -462,15 +759,25 @@ constructor(
         tunnelConnected = false
         displayReconnectTunnel = false
         _contractStatus.value = null
+        _transportDelay.value = TransportDelayUi.None
+        resetConnectFailureMonitor()
+        // a start waiting on its balance belonged to the previous device
+        if (currentDevice != null && currentDevice?.identity !== device?.identity) {
+            startConnect.cancel()
+        }
+        currentDevice = device
         if (device == null) {
             _connectStatus.value = ConnectStatus.DISCONNECTED
+            connectDisplay.reported(ConnectStatus.DISCONNECTED)
         } else {
             loadPerformanceProfile()
         }
         controllerOwner.setDevice(device)
+        // the previous device's commands no longer show
+        commandsChanged()
     }
 
-    private fun openConnectViewController(device: DeviceLocal): ConnectViewController {
+    private fun openConnectViewController(device: ConnectDevice): ConnectController {
         val vc = device.openConnectViewController()
         viewControllerDevice = device
         connectVc = vc
@@ -479,16 +786,26 @@ constructor(
         addGridListener()
         addConnectionStatusListener()
         addContractStatusListener()
+        addTransportDelayListener()
         vc.start()
         update()
         return vc
     }
 
-    private fun closeConnectViewController(device: DeviceLocal, vc: ConnectViewController) {
-        subs.forEach { sub -> sub.close() }
+    private fun closeConnectViewController(device: ConnectDevice, vc: ConnectController) {
+        // on the queue, after the commands made so far, which may still run on
+        // this controller: a closed controller refuses a disconnect, so one
+        // tapped just before the app left the foreground was lost. The closes
+        // also take the device's locks, which a command holds while it runs.
+        // A listener reporting until then reads the current controller, or
+        // checks its device
+        val closingSubs = subs.toList()
         subs.clear()
-        vc.stop()
-        device.closeViewController(vc)
+        connectCommands.afterCommands {
+            closingSubs.forEach { sub -> sub.close() }
+            vc.stop()
+            device.closeViewController(vc)
+        }
         if (connectVc === vc) {
             connectVc = null
             viewControllerDevice = null
@@ -496,6 +813,10 @@ constructor(
             providerGridPoints = mapOf()
             windowCurrentSize = 0
             lastGridSignature = ""
+            // its listener is closing: never show a stale reading, it is read
+            // again when a controller opens
+            _transportDelay.value = TransportDelayUi.None
+            resetConnectFailureMonitor()
         }
     }
 
@@ -508,11 +829,23 @@ constructor(
     override fun onCleared() {
         removeDeviceChangeListener?.invoke()
         removeDeviceChangeListener = null
+        removeCommandsListener?.invoke()
+        removeCommandsListener = null
+        removeStartListener?.invoke()
+        removeStartListener = null
         processLifecycle.removeObserver(this)
+        // a start still waiting on its balance never connects once the
+        // screen is gone, as the Apple app's is dropped with its view model
+        startConnect.cancel(this)
+        currentDevice = null
         controllerOwner.close()
         super.onCleared()
     }
 }
+
+// the slow internet pill's numbers move without a report: read again this
+// often while it shows them (the notification's own refresh is 30 s)
+const val SLOW_INTERNET_PILL_REFRESH_MILLIS = 10_000L
 
 enum class ProviderPointState {
     IN_EVALUATION,

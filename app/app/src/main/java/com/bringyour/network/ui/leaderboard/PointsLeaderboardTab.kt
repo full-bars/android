@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -37,13 +38,17 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -53,6 +58,7 @@ import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.bringyour.network.R
 import com.bringyour.network.ui.components.URSwitch
+import com.bringyour.network.ui.components.keyboardScrollable
 import com.bringyour.network.ui.indexedLazyListKey
 import com.bringyour.network.ui.theme.Green500
 import com.bringyour.network.ui.theme.HeadingLargeCondensed
@@ -69,23 +75,65 @@ import kotlinx.coroutines.flow.distinctUntilChanged
  * in a header card, sort chips, and the infinitely scrolling ranked list.
  * Rows, ranks and pages all come from the sdk view controller through the
  * view model; nothing here sorts, ranks or pages.
+ *
+ * The list carries the draggable position indicator of mmm/DESIGNSTYLE.md
+ * ("Long ranked lists", RankedListPositionIndicator): a track spanning
+ * positions 1..N of the whole ranked population whose thumb marks the
+ * position at the top of the screen; a release seeks the controller to the
+ * rank under the thumb, after which the list pages backward as well as
+ * forward from that window.
+ *
+ * `resetToTop` counts the taps on the Points tab (including re-taps): each
+ * change scrolls the list back to the top, reloading the first page when the
+ * loaded window no longer starts at position 1.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun PointsLeaderboardTab(
     snackbarHostState: SnackbarHostState,
+    resetToTop: Int = 0,
+    // false where the own-stats card sits beside the list (the leaderboard's
+    // list-detail layout); its list item stays, empty, so the rows keep their place
+    showHeader: Boolean = true,
+    // the emoji tag editor, kept by the leaderboard so the card beside the
+    // list can open it too
+    showEmojiSheet: Boolean,
+    setShowEmojiSheet: (Boolean) -> Unit,
     viewModel: PointsLeaderboardViewModel = hiltViewModel(),
 ) {
     val rows by viewModel.rows.collectAsState()
     val listState = rememberLazyListState()
+    val keyboardScope = rememberCoroutineScope()
+
+    // a tab tap scrolls up; after a seek the window is reloaded from the top
+    // first so the top of the list is rank 1 again
+    LaunchedEffect(resetToTop) {
+        if (resetToTop <= 0) {
+            return@LaunchedEffect
+        }
+        when (LeaderboardTabReset.onTabTap(isPointsTab = true, firstLoadedPosition = viewModel.firstLoadedPosition)) {
+            LeaderboardTabReset.Action.RELOAD_FROM_TOP -> {
+                viewModel.reloadFromTop()
+                listState.scrollToItem(0)
+            }
+            LeaderboardTabReset.Action.SCROLL_TO_TOP -> {
+                listState.animateScrollToItem(0)
+            }
+        }
+    }
     val refreshState = rememberPullToRefreshState()
     var refreshing by remember { mutableStateOf(false) }
-    var showEmojiSheet by remember { mutableStateOf(false) }
     var emojiSaveError by remember { mutableStateOf<String?>(null) }
+    // each opening of the editor starts without the last save's error
+    LaunchedEffect(showEmojiSheet) {
+        if (showEmojiSheet) {
+            emojiSaveError = null
+        }
+    }
 
     val ownNetworkId = viewModel.me?.row?.networkId
-    // the caller always sees their own name: the me row's, or the jwt's until
-    // me lands; the own list row shows it too when it is anonymous to others
+    // the own-stats card always shows the caller's own name: the me row's, or
+    // the jwt's until me lands; the list row is what everyone else sees
     val jwtNetworkName by viewModel.ownNetworkName.collectAsState()
     val ownName = viewModel.me?.row?.displayName?.takeIf { it.isNotEmpty() } ?: jwtNetworkName
 
@@ -119,6 +167,67 @@ fun PointsLeaderboardTab(
             }
     }
 
+    // after a seek, ask for the page before the window when the first rows
+    // come into reach. Compose keeps the first visible row anchored by its
+    // position key when rows are prepended; only when the header above the
+    // rows is on screen would the prepended rows push the old first row down,
+    // so that case re-anchors the row explicitly at its last known offset.
+    val hasMoreBefore = viewModel.hasMoreBefore
+    var anchorRowIndex by remember { mutableIntStateOf(-1) }
+    var anchorRowOffset by remember { mutableIntStateOf(0) }
+    var headerVisible by remember { mutableStateOf(true) }
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.layoutInfo.visibleItemsInfo }
+            .collect { visible ->
+                headerVisible = (visible.firstOrNull()?.index ?: 0) < POINTS_LIST_ROWS_OFFSET
+                val firstRow = visible.firstOrNull { it.index >= POINTS_LIST_ROWS_OFFSET }
+                anchorRowIndex = firstRow?.index ?: -1
+                anchorRowOffset = firstRow?.offset ?: 0
+            }
+    }
+    LaunchedEffect(listState, rows.size, viewModel.isLoading, hasMoreBefore, hasError) {
+        snapshotFlow { listState.layoutInfo.visibleItemsInfo.firstOrNull()?.index ?: -1 }
+            .distinctUntilChanged()
+            .collect { firstVisibleItem ->
+                if (firstVisibleItem < 0) {
+                    return@collect
+                }
+                if (
+                    PointsLeaderboardPaging.shouldLoadMoreBefore(
+                        firstVisibleRowIndex = firstVisibleItem - POINTS_LIST_ROWS_OFFSET,
+                        rowCount = rows.size,
+                        isLoading = viewModel.isLoading,
+                        hasMoreBefore = hasMoreBefore,
+                        hasError = hasError,
+                    )
+                ) {
+                    viewModel.loadMoreBefore()
+                }
+            }
+    }
+    val firstPosition = rows.firstOrNull()?.position ?: 0L
+    var previousFirstPosition by remember { mutableLongStateOf(0L) }
+    // the rank a released thumb asked for; cleared once its page has landed
+    // and the list sits at that row
+    var pendingSeekRank by remember { mutableLongStateOf(0L) }
+    LaunchedEffect(firstPosition, rows.size) {
+        val previous = previousFirstPosition
+        previousFirstPosition = firstPosition
+        val seekRank = pendingSeekRank
+        if (seekRank > 0L && rows.isNotEmpty()) {
+            val index = rows.indexOfFirst { it.position >= seekRank }
+            if (index >= 0 && rows.first().position <= seekRank) {
+                pendingSeekRank = 0L
+                listState.scrollToItem(POINTS_LIST_ROWS_OFFSET + index)
+                return@LaunchedEffect
+            }
+        }
+        if (previous > 0L && firstPosition in 1L until previous && headerVisible && anchorRowIndex >= 0) {
+            val prepended = (previous - firstPosition).toInt().coerceAtMost(rows.size)
+            listState.scrollToItem(anchorRowIndex + prepended, -anchorRowOffset)
+        }
+    }
+
     LaunchedEffect(viewModel.actionError) {
         val message = viewModel.actionError ?: return@LaunchedEffect
         snackbarHostState.showSnackbar(
@@ -137,7 +246,7 @@ fun PointsLeaderboardTab(
                 emojiSaveError = null
                 viewModel.saveEmojiTag(tag) { error ->
                     if (error == null) {
-                        showEmojiSheet = false
+                        setShowEmojiSheet(false)
                     } else {
                         emojiSaveError = error
                     }
@@ -147,7 +256,7 @@ fun PointsLeaderboardTab(
                 emojiSaveError = null
                 viewModel.saveEmojiTag("") { error ->
                     if (error == null) {
-                        showEmojiSheet = false
+                        setShowEmojiSheet(false)
                     } else {
                         emojiSaveError = error
                     }
@@ -155,7 +264,7 @@ fun PointsLeaderboardTab(
             },
             onDismiss = {
                 emojiSaveError = null
-                showEmojiSheet = false
+                setShowEmojiSheet(false)
             },
         )
     }
@@ -168,52 +277,90 @@ fun PointsLeaderboardTab(
             viewModel.refresh()
         },
     ) {
-        LazyColumn(
-            state = listState,
+        Box(
             modifier = Modifier.tabletReadableColumn().fillMaxSize()
         ) {
-            item(key = "points-header") {
-                PointsHeader(
-                    viewModel = viewModel,
-                    ownName = ownName,
-                    onEditEmoji = {
-                        emojiSaveError = null
-                        showEmojiSheet = true
-                    },
-                )
-            }
+            LazyColumn(
+                state = listState,
+                modifier = Modifier
+                    .fillMaxSize()
+                    // its rows take no focus: the keyboard scrolls the list
+                    // itself, as the indicator beside it does by drag
+                    .keyboardScrollable(
+                        state = listState,
+                        scope = keyboardScope,
+                        linePx = with(LocalDensity.current) { LeaderboardKeyboardLine.toPx() },
+                    )
+            ) {
+                item(key = "points-header") {
+                    if (showHeader) {
+                        PointsHeader(
+                            viewModel = viewModel,
+                            ownName = ownName,
+                            onEditEmoji = {
+                                emojiSaveError = null
+                                setShowEmojiSheet(true)
+                            },
+                        )
+                    }
+                }
 
-            item(key = "points-sort") {
-                PointsSortChips(
-                    sort = viewModel.sort,
-                    setSort = viewModel::selectSort,
-                )
-            }
-
-            itemsIndexed(
-                rows,
-                key = { index, row -> indexedLazyListKey("points", index, row.networkId) },
-            ) { _, row ->
-                Column {
-                    HorizontalDivider()
-                    PointsRow(
-                        row = row,
+                item(key = "points-sort") {
+                    PointsSortChips(
                         sort = viewModel.sort,
-                        isNetworkRow = ownNetworkId != null && ownNetworkId == row.networkId,
-                        ownName = ownName,
+                        setSort = viewModel::selectSort,
+                    )
+                }
+
+                // keyed by the row's position in the total order (no ties),
+                // which is what keeps the first visible row anchored when a
+                // page is prepended. A server without positions (every row
+                // 0) falls back to the index key; it has no seek either
+                itemsIndexed(
+                    rows,
+                    key = { index, row ->
+                        if (row.position > 0L) row.position else indexedLazyListKey("points", index, row.networkId)
+                    },
+                ) { _, row ->
+                    Column {
+                        HorizontalDivider()
+                        PointsRow(
+                            row = row,
+                            sort = viewModel.sort,
+                            isNetworkRow = ownNetworkId != null && ownNetworkId == row.networkId,
+                        )
+                    }
+                }
+
+                item(key = "points-footer") {
+                    PointsFooter(
+                        rowCount = rows.size,
+                        isLoading = viewModel.isLoading,
+                        hasLoaded = viewModel.hasLoaded,
+                        errorMessage = viewModel.errorMessage,
+                        retry = viewModel::retry,
                     )
                 }
             }
 
-            item(key = "points-footer") {
-                PointsFooter(
-                    rowCount = rows.size,
-                    isLoading = viewModel.isLoading,
-                    hasLoaded = viewModel.hasLoaded,
-                    errorMessage = viewModel.errorMessage,
-                    retry = viewModel::retry,
-                )
-            }
+            val positions = remember(rows) { rows.map { it.position } }
+            RankedListPositionIndicator(
+                listState = listState,
+                positions = positions,
+                rowsOffset = POINTS_LIST_ROWS_OFFSET,
+                total = viewModel.totalRanked,
+                hasMoreBefore = hasMoreBefore,
+                hasMoreAfter = viewModel.hasMoreAfter,
+                label = { rank -> rankedListLabel(viewModel.scrollLabel(rank)) },
+                onSeek = { rank ->
+                    pendingSeekRank = rank
+                    viewModel.seekToRank(rank)
+                },
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .fillMaxHeight()
+                    .padding(vertical = 8.dp),
+            )
         }
     }
 }
@@ -222,7 +369,7 @@ fun PointsLeaderboardTab(
 private const val POINTS_LIST_ROWS_OFFSET = 2
 
 @Composable
-private fun PointsHeader(
+internal fun PointsHeader(
     viewModel: PointsLeaderboardViewModel,
     ownName: String,
     onEditEmoji: () -> Unit,
@@ -331,7 +478,8 @@ private fun PointsHeader(
 
                 HorizontalDivider(color = MainBorderBase)
 
-                Spacer(modifier = Modifier.height(16.dp))
+                // the switch's 48 dp touch target fills the rest
+                Spacer(modifier = Modifier.height(4.dp))
 
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -345,7 +493,8 @@ private fun PointsHeader(
                         modifier = Modifier.weight(1f)
                     )
 
-                    Spacer(modifier = Modifier.width(12.dp))
+                    // the switch's touch target adds 6 dp of its own
+                    Spacer(modifier = Modifier.width(6.dp))
 
                     URSwitch(
                         checked = viewModel.isPointsPublic,
@@ -355,7 +504,6 @@ private fun PointsHeader(
                 }
 
                 if (!viewModel.isPointsPublic) {
-                    Spacer(modifier = Modifier.height(8.dp))
                     Text(
                         stringResource(id = R.string.points_leaderboard_private_hint),
                         style = MaterialTheme.typography.bodySmall,
@@ -454,17 +602,17 @@ private fun PointsRow(
     row: PointsLeaderboardRowUi,
     sort: String,
     isNetworkRow: Boolean,
-    ownName: String = "",
 ) {
     val rank = when (sort) {
         Sdk.PointsLeaderboardSortBlocks -> row.rankBlocksText
         Sdk.PointsLeaderboardSortStreak -> row.rankStreakText
         else -> row.rankPointsText
     }
-    // an anonymous row reads "Anonymous" to everyone but its owner, who sees
-    // their own name (the highlight keys on the network id, never the name)
+    // an anonymous row reads "Anonymous" to everyone, its owner included: the
+    // caller sees the list as everyone sees it, and only the highlight (keyed
+    // on the network id, never the name) marks the own row
     val name = if (row.anonymous || row.displayName.isEmpty()) {
-        if (isNetworkRow && ownName.isNotEmpty()) ownName else stringResource(id = R.string.anonymous)
+        stringResource(id = R.string.anonymous)
     } else {
         row.displayName
     }

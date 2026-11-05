@@ -1,10 +1,12 @@
 package com.bringyour.network.ui.leaderboard
 
+import com.bringyour.network.ui.components.KeyboardScroll
+
 /**
  * Pure rules behind the points leaderboard screen, kept free of Compose and of
  * the sdk (whose class init loads the native library) so they unit test on the
- * jvm. The sdk view controller owns the data; these only decide WHEN the
- * screen asks it for more and HOW the emoji editor reads a validation.
+ * jvm. The sdk view controller owns the data; these only decide when the
+ * screen asks it for more and how the emoji editor reads a validation.
  */
 object PointsLeaderboardPaging {
 
@@ -14,7 +16,7 @@ object PointsLeaderboardPaging {
     /**
      * True when the list has scrolled close enough to its end that the next
      * page should be requested. `lastVisibleRowIndex` is the index into the
-     * ROWS (header and footer items excluded); -1 when no row is visible.
+     * rows (header and footer items excluded); -1 when no row is visible.
      * The controller itself refuses a second in-flight page and a page past
      * the end, so this only avoids asking in the first place.
      *
@@ -36,6 +38,26 @@ object PointsLeaderboardPaging {
             return false
         }
         return lastVisibleRowIndex >= rowCount - 1 - threshold
+    }
+
+    /**
+     * True when the list has scrolled close enough to the start of a seeked
+     * window that the page before it should be requested. `firstVisibleRowIndex`
+     * is the index into the rows of the first visible item (negative while the
+     * header above the rows is on screen). Same error gate as forward paging.
+     */
+    fun shouldLoadMoreBefore(
+        firstVisibleRowIndex: Int,
+        rowCount: Int,
+        isLoading: Boolean,
+        hasMoreBefore: Boolean,
+        hasError: Boolean = false,
+        threshold: Int = LOAD_MORE_THRESHOLD,
+    ): Boolean {
+        if (rowCount <= 0 || isLoading || !hasMoreBefore || hasError) {
+            return false
+        }
+        return firstVisibleRowIndex <= threshold
     }
 }
 
@@ -101,5 +123,121 @@ object EmojiTagEditor {
             return ""
         }
         return tag.substring(0, start)
+    }
+}
+
+/**
+ * Pure geometry of the draggable position indicator on the points list
+ * (mmm/DESIGNSTYLE.md "Long ranked lists"): the track spans positions 1..N of
+ * the sdk's total order, the thumb's top marks the position at the top of the
+ * screen and its length is the loaded window, and a drag maps the thumb's
+ * place on the track back to a rank. Free of Compose so it unit tests on the
+ * jvm; the composable feeds it pixels and gets pixels back.
+ */
+object PointsLeaderboardIndicator {
+    /** The thumb never shrinks below this, so it stays a hand-sized target. */
+    const val MIN_THUMB_DP = 44
+
+    /** Thumb top and height in pixels on the track. */
+    data class Thumb(val topPx: Float, val heightPx: Float)
+
+    /**
+     * The thumb whose top marks `position` (1-based) of `total`, sized to the
+     * loaded window of `windowRows` rows, on a track `trackPx` tall with a
+     * `minThumbPx` floor. The thumb travels the track minus its own height so
+     * its top reaches position 1 at the top and position N at the bottom.
+     * Null when there is nothing to show.
+     */
+    fun thumb(position: Long, windowRows: Long, total: Long, trackPx: Float, minThumbPx: Float): Thumb? {
+        if (total <= 0L || position <= 0L || windowRows <= 0L || trackPx <= 0f) {
+            return null
+        }
+        val windowPx = (windowRows.toFloat() / total.toFloat()).coerceIn(0f, 1f) * trackPx
+        val heightPx = maxOf(windowPx, minThumbPx).coerceIn(0f, trackPx)
+        val topPx = fractionOf(position, total) * (trackPx - heightPx)
+        return Thumb(topPx = topPx, heightPx = heightPx)
+    }
+
+    /**
+     * The rank under the thumb's top edge for a fraction of its travel,
+     * clamped to 1..total; 0 is the first rank and 1 the last.
+     */
+    fun rankAt(fraction: Float, total: Long): Long {
+        if (total <= 0L) {
+            return 1L
+        }
+        val f = fraction.coerceIn(0f, 1f)
+        return (1L + Math.round(f * (total - 1).toFloat())).coerceIn(1L, total)
+    }
+
+    /** The fraction of the thumb's travel that puts its top edge at `rank`. */
+    fun fractionOf(rank: Long, total: Long): Float {
+        if (total <= 1L) {
+            return 0f
+        }
+        return ((rank.coerceIn(1L, total) - 1).toFloat() / (total - 1).toFloat()).coerceIn(0f, 1f)
+    }
+
+    /**
+     * The rank the keyboard moves the focused thumb to from `rank`: an arrow
+     * by a hundredth of the ranking, a page key by a tenth, never by less than
+     * one rank, and Home and End to the first and last.
+     */
+    fun keyRank(scroll: KeyboardScroll, rank: Long, total: Long): Long {
+        if (total <= 0L) {
+            return 1L
+        }
+        val line = maxOf(1L, total / 100L)
+        val page = maxOf(1L, total / 10L)
+        val to = when (scroll) {
+            KeyboardScroll.LineUp -> rank - line
+            KeyboardScroll.LineDown -> rank + line
+            KeyboardScroll.PageUp -> rank - page
+            KeyboardScroll.PageDown -> rank + page
+            KeyboardScroll.Top -> 1L
+            KeyboardScroll.Bottom -> total
+        }
+        return to.coerceIn(1L, total)
+    }
+
+    /** The fraction of travel for a thumb top at `topPx` given its `thumb`. */
+    fun fractionAt(topPx: Float, trackPx: Float, thumbHeightPx: Float): Float {
+        val travel = trackPx - thumbHeightPx
+        if (travel <= 0f) {
+            return 0f
+        }
+        return (topPx / travel).coerceIn(0f, 1f)
+    }
+
+    /**
+     * Whether the indicator is shown at all: only for a list longer than the
+     * viewport (more rows than fit, or more pages than loaded) with something
+     * ranked.
+     */
+    fun isVisible(total: Long, loadedRows: Int, visibleRows: Int, hasMoreBefore: Boolean, hasMoreAfter: Boolean): Boolean {
+        if (total <= 0L || loadedRows <= 0) {
+            return false
+        }
+        return hasMoreBefore || hasMoreAfter || loadedRows > visibleRows
+    }
+}
+
+/**
+ * What tapping a leaderboard tab does to its list (design rule: a tab tap,
+ * including re-tapping the selected tab, scrolls to the top).
+ */
+object LeaderboardTabReset {
+    enum class Action { SCROLL_TO_TOP, RELOAD_FROM_TOP }
+
+    /**
+     * For the Points list: a window that no longer starts at position 1 (after
+     * a seek) reloads from the top, otherwise the list just scrolls up. The
+     * Data list always just scrolls.
+     */
+    fun onTabTap(isPointsTab: Boolean, firstLoadedPosition: Long): Action {
+        if (isPointsTab && firstLoadedPosition > 1L) {
+            return Action.RELOAD_FROM_TOP
+        }
+        return Action.SCROLL_TO_TOP
     }
 }

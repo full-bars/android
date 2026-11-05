@@ -1,8 +1,8 @@
 package com.bringyour.network.ui.stats
 
+import com.bringyour.network.ui.components.FoldSafeModalBottomSheet
+import com.bringyour.network.ui.components.rememberFoldSafeSheetState
 import com.bringyour.network.ui.components.tabletReadableColumn
-import android.icu.text.RelativeDateTimeFormatter
-import android.text.format.DateUtils
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -16,32 +16,36 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBarDefaults
-import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
@@ -52,6 +56,9 @@ import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -60,9 +67,14 @@ import androidx.navigation.NavController
 import com.bringyour.network.R
 import com.bringyour.network.ui.indexedLazyListKey
 import com.bringyour.network.ui.components.ButtonStyle
+import com.bringyour.network.ui.components.InfoIconWithOverlay
 import com.bringyour.network.ui.components.SwipeToRevealRow
 import com.bringyour.network.ui.components.URButton
+import com.bringyour.network.ui.components.URTextInput
+import com.bringyour.network.utils.SplitRuleHostError
+import com.bringyour.network.utils.SplitRuleHostInput
 import com.bringyour.network.ui.theme.Black
+import com.bringyour.network.ui.theme.BlueLight
 import com.bringyour.network.ui.theme.BlueMedium
 import com.bringyour.network.ui.theme.Green
 import com.bringyour.network.ui.theme.Red
@@ -71,14 +83,32 @@ import com.bringyour.network.ui.theme.TextFaint
 import com.bringyour.network.ui.theme.MainTintedBackgroundBase
 import com.bringyour.network.ui.theme.TextMuted
 import com.bringyour.network.ui.theme.TopBarTitleTextStyle
+import com.bringyour.network.ui.theme.Yellow400
 import com.bringyour.network.utils.formatByteCountCompact
+import com.bringyour.network.utils.relativeTime
 import kotlinx.coroutines.launch
 
-private data class RuleEditorTarget(
+internal data class RuleEditorTarget(
     val candidates: List<String>,
     val selected: Set<String>,
     val ruleId: String?,
 )
+
+/**
+ * The editor for "Route locally" on a safety-ruled action: a new local rule
+ * with all of the action's host values selected. Null when the action does
+ * not offer it (see [BlockActionUi.offersRouteLocal])
+ */
+internal fun routeLocalEditorTarget(action: BlockActionUi): RuleEditorTarget? =
+    if (action.offersRouteLocal) {
+        RuleEditorTarget(
+            candidates = action.hostValues,
+            selected = action.hostValues.toSet(),
+            ruleId = null,
+        )
+    } else {
+        null
+    }
 
 /**
  * Live routing decisions with the split rules pinned on top.
@@ -100,7 +130,7 @@ fun SplitRulesScreen(
     val scope = rememberCoroutineScope()
 
     var editorTarget by remember { mutableStateOf<RuleEditorTarget?>(null) }
-    val editorSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val editorSheetState = rememberFoldSafeSheetState()
 
     val actions = blockActionsViewModel.blockActions
     val rules = blockActionsViewModel.splitRules
@@ -159,7 +189,7 @@ fun SplitRulesScreen(
                 ruleId = rule.id,
             )
         } else {
-            // create a rule from the action's host values, all initially UNSELECTED:
+            // create a rule from the action's host values, all initially unselected:
             // the common case is picking one or a few server names, so pre-selecting
             // everything just makes the user uncheck the rest
             RuleEditorTarget(
@@ -181,7 +211,7 @@ fun SplitRulesScreen(
                 },
                 navigationIcon = {
                     IconButton(onClick = { navController.popBackStack() }) {
-                        Icon(Icons.AutoMirrored.Filled.KeyboardArrowLeft, contentDescription = "Back")
+                        Icon(Icons.AutoMirrored.Filled.KeyboardArrowLeft, contentDescription = stringResource(id = R.string.back))
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
@@ -217,10 +247,23 @@ fun SplitRulesScreen(
                     SectionHeader(stringResource(id = R.string.rules))
                 }
 
+                item(key = "add-rule-action") {
+                    AddRuleRow(
+                        enabled = blockActionsViewModel.canCreateRule,
+                        onClick = {
+                            editorTarget = RuleEditorTarget(
+                                candidates = emptyList(),
+                                selected = emptySet(),
+                                ruleId = null,
+                            )
+                        }
+                    )
+                }
+
                 if (rules.isEmpty()) {
                     item(key = "rules-empty") {
                         Text(
-                            stringResource(id = R.string.split_rules_hint),
+                            stringResource(id = R.string.split_rules_host_hint),
                             style = MaterialTheme.typography.bodyMedium,
                             color = TextFaint,
                             modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
@@ -234,7 +277,7 @@ fun SplitRulesScreen(
                         }
                     ) { _, rule ->
                         SwipeToRevealRow(
-                            onDelete = { blockActionsViewModel.removeRule(rule.id) }
+                            onAction = { blockActionsViewModel.removeRule(rule.id) }
                         ) {
                             SplitRuleRow(
                                 rule = rule,
@@ -294,7 +337,10 @@ fun SplitRulesScreen(
                     ) { _, action ->
                         BlockActionRow(
                             action = action,
-                            onClick = { openEditor(action) }
+                            onClick = { openEditor(action) },
+                            onRouteLocal = {
+                                routeLocalEditorTarget(action)?.let { editorTarget = it }
+                            },
                         )
                     }
                 }
@@ -337,7 +383,7 @@ fun SplitRulesScreen(
      * create / edit rule sheet
      */
     editorTarget?.let { target ->
-        ModalBottomSheet(
+        FoldSafeModalBottomSheet(
             onDismissRequest = { editorTarget = null },
             sheetState = editorSheetState,
             containerColor = SheetBlack
@@ -439,11 +485,14 @@ private fun SplitRuleRow(
 // A block-action row. Chips, in order: the exact hosts/ips an override matched
 // (green), then the remaining hosts collapsed to base names (white outline), then a
 // single "X IPs" pill for the remaining ips. The block/route state chips trail.
+// A safety-ruled action adds a "Safety rule" chip with its detail, and "Route
+// locally" when a local split rule can override it.
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun BlockActionRow(
+internal fun BlockActionRow(
     action: BlockActionUi,
     onClick: () -> Unit,
+    onRouteLocal: () -> Unit,
 ) {
 
     Row(
@@ -508,6 +557,15 @@ private fun BlockActionRow(
                 }
             }
 
+            if (action.safetyRule) {
+                // no spacer: the line is 48 dp tall to touch, its info icon
+                // and "Route locally" (Touch_Targets)
+                SafetyRuleLine(
+                    offersRouteLocal = action.offersRouteLocal,
+                    onRouteLocal = onRouteLocal,
+                )
+            }
+
         }
 
         Spacer(modifier = Modifier.width(8.dp))
@@ -528,6 +586,54 @@ private fun BlockActionRow(
             )
         }
 
+    }
+}
+
+// The "Safety rule" chip with its detail behind the info icon, then "Route
+// locally" when offered.
+@Composable
+private fun SafetyRuleLine(
+    offersRouteLocal: Boolean,
+    onRouteLocal: () -> Unit,
+) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        StateChip(
+            text = stringResource(id = R.string.safety_rule),
+            color = Yellow400,
+            highlighted = false
+        )
+
+        InfoIconWithOverlay(
+            contentDescription = stringResource(id = R.string.safety_rule)
+        ) {
+            Column {
+                Text(
+                    stringResource(id = R.string.safety_rule),
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color.White
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    stringResource(id = R.string.safety_rule_detail),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = BlueLight
+                )
+            }
+        }
+
+        if (offersRouteLocal) {
+            Text(
+                stringResource(id = R.string.add_local_split_rule),
+                style = TextStyle(fontSize = 11.sp, fontWeight = FontWeight.Medium),
+                color = Green,
+                modifier = Modifier
+                    .clickable { onRouteLocal() }
+                    // 48 dp to touch, the text in the middle (Touch_Targets)
+                    .heightIn(min = 48.dp)
+                    .wrapContentHeight()
+            )
+        }
     }
 }
 
@@ -587,21 +693,6 @@ fun StateChip(
     )
 }
 
-private fun relativeTime(timeMillis: Long): String {
-    // the platform formatters localize for every locale; under 5s reads as "now"
-    val now = System.currentTimeMillis()
-    if (now - timeMillis < 5_000) {
-        return RelativeDateTimeFormatter.getInstance()
-            .format(RelativeDateTimeFormatter.Direction.PLAIN, RelativeDateTimeFormatter.AbsoluteUnit.NOW)
-    }
-    return DateUtils.getRelativeTimeSpanString(
-        timeMillis,
-        now,
-        DateUtils.SECOND_IN_MILLIS,
-        DateUtils.FORMAT_ABBREV_RELATIVE,
-    ).toString()
-}
-
 /**
  * Create or edit a split rule: select the host values to route locally
  */
@@ -614,7 +705,26 @@ private fun SplitRuleEditor(
 ) {
 
     var selected by remember { mutableStateOf(target.selected) }
+    var addedHosts by remember { mutableStateOf<List<String>>(emptyList()) }
+    var newHost by rememberSaveable(stateSaver = TextFieldValue.Saver) { mutableStateOf(TextFieldValue("")) }
     val isEditing = target.ruleId != null
+
+    val editableCandidates = remember(addedHosts, target.candidates) {
+        addedHosts + target.candidates
+    }
+
+    val validation = remember(newHost.text, editableCandidates) {
+        SplitRuleHostInput.validate(newHost.text, existing = editableCandidates)
+    }
+
+    val addTypedHost = {
+        val host = validation.normalized
+        if (host != null) {
+            addedHosts = listOf(host) + addedHosts
+            selected = selected + host
+            newHost = TextFieldValue("")
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -638,11 +748,62 @@ private fun SplitRuleEditor(
 
         Spacer(modifier = Modifier.height(8.dp))
 
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(modifier = Modifier.weight(1f)) {
+                URTextInput(
+                    value = newHost,
+                    onValueChange = { newHost = it },
+                    onDone = { addTypedHost() },
+                    placeholder = stringResource(id = R.string.split_rule_host_placeholder),
+                    label = null,
+                    keyboardOptions = KeyboardOptions(
+                        keyboardType = KeyboardType.Uri,
+                        imeAction = ImeAction.Done,
+                        autoCorrectEnabled = false,
+                    ),
+                )
+            }
+
+            Spacer(modifier = Modifier.width(8.dp))
+
+            Icon(
+                Icons.Filled.Add,
+                contentDescription = stringResource(id = R.string.add),
+                tint = if (validation.isAccepted) Green else TextFaint,
+                modifier = Modifier
+                    .size(24.dp)
+                    .clickable(enabled = validation.isAccepted) {
+                        addTypedHost()
+                    }
+            )
+        }
+
+        if (validation.error != null) {
+            Text(
+                splitRuleHostErrorMessage(validation.error),
+                style = MaterialTheme.typography.bodySmall,
+                color = Red,
+                modifier = Modifier.padding(top = 4.dp, bottom = 4.dp)
+            )
+        } else if (validation.note != null) {
+            Text(
+                stringResource(id = R.string.saved_as, validation.note),
+                style = MaterialTheme.typography.bodySmall,
+                color = TextMuted,
+                modifier = Modifier.padding(top = 4.dp, bottom = 4.dp)
+            )
+        } else {
+            Spacer(modifier = Modifier.height(8.dp))
+        }
+
         LazyColumn(
             modifier = Modifier.weight(1f, fill = false)
         ) {
             itemsIndexed(
-                target.candidates,
+                editableCandidates,
                 key = { index, host ->
                     indexedLazyListKey("rule-candidate", index, host)
                 }
@@ -678,14 +839,17 @@ private fun SplitRuleEditor(
 
         URButton(
             onClick = {
-                val hosts = target.candidates.filter { selected.contains(it) }
+                // a valid host still in the field is part of the rule: saving
+                // without tapping + must not silently drop it
+                val hosts = listOfNotNull(validation.normalized) +
+                    editableCandidates.filter { selected.contains(it) }
                 if (isEditing) {
                     onUpdate(target.ruleId!!, hosts)
                 } else {
                     onCreate(hosts)
                 }
             },
-            enabled = isEditing || selected.isNotEmpty()
+            enabled = isEditing || selected.isNotEmpty() || validation.isAccepted
         ) { buttonTextStyle ->
             Text(
                 stringResource(id = if (isEditing) R.string.update else R.string.create),
@@ -710,5 +874,44 @@ private fun SplitRuleEditor(
 
         Spacer(modifier = Modifier.height(16.dp))
 
+    }
+}
+
+@Composable
+private fun AddRuleRow(
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(enabled = enabled) { onClick() }
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            imageVector = Icons.Filled.Add,
+            contentDescription = null,
+            tint = if (enabled) Green else TextFaint,
+            modifier = Modifier.size(20.dp)
+        )
+        Spacer(modifier = Modifier.width(8.dp))
+        Text(
+            text = stringResource(id = R.string.add_a_rule),
+            style = MaterialTheme.typography.bodyMedium,
+            color = if (enabled) Green else TextFaint
+        )
+    }
+}
+
+@Composable
+private fun splitRuleHostErrorMessage(error: SplitRuleHostError): String {
+    return when (error) {
+        SplitRuleHostError.NotAscii -> stringResource(R.string.split_rule_error_not_ascii)
+        SplitRuleHostError.BadName -> stringResource(R.string.split_rule_error_bad_name)
+        SplitRuleHostError.BadWildcard -> stringResource(R.string.split_rule_error_bad_wildcard)
+        SplitRuleHostError.BadRange -> stringResource(R.string.split_rule_error_bad_range)
+        SplitRuleHostError.Duplicate -> stringResource(R.string.split_rule_error_duplicate)
+        is SplitRuleHostError.Covered -> stringResource(R.string.split_rule_error_covered, error.by)
     }
 }

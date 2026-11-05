@@ -14,8 +14,10 @@ class VpnPacketFlowConfigurationTest {
         connectRequested: Boolean = false,
         includedAppIds: Set<String> = emptySet(),
         excludedAppIds: Set<String> = emptySet(),
-        dnsIpv4s: List<String> = listOf("65.49.70.65"),
+        dnsIpv4s: List<String> = listOf("203.0.113.65"),
         clientIpv4: String? = "10.0.0.1",
+        dnsIpv6s: List<String> = listOf("2001:db8::65:49:70:65"),
+        clientIpv6: String? = "2001:db8:1::1",
     ): VpnPacketFlowConfiguration {
         return VpnPacketFlowConfiguration(
             offline = offline,
@@ -26,6 +28,8 @@ class VpnPacketFlowConfigurationTest {
             excludedAppIds = excludedAppIds,
             dnsIpv4s = dnsIpv4s,
             clientIpv4 = clientIpv4,
+            dnsIpv6s = dnsIpv6s,
+            clientIpv6 = clientIpv6,
         )
     }
 
@@ -62,7 +66,7 @@ class VpnPacketFlowConfigurationTest {
     @Test
     fun activePacketFlowRebuildsWhenSplitRulesChange() {
         val applied = configuration()
-        val desired = configuration(includedAppIds = setOf("com.android.chrome"))
+        val desired = configuration(includedAppIds = setOf("com.example.browser"))
 
         assertTrue(vpnPacketFlowNeedsRebuild(true, applied, desired))
     }
@@ -88,21 +92,21 @@ class VpnPacketFlowConfigurationTest {
         val servers = vpnDnsServersForClient(
             clientIpv4 = "10.0.0.128",
             deviceDnsIpv4s = listOf("10.0.0.128"),
-            fallbackDnsIpv4s = listOf("65.49.70.65"),
+            fallbackDnsIpv4s = listOf("203.0.113.65"),
         )
 
-        assertEquals(listOf("65.49.70.65"), servers)
+        assertEquals(listOf("203.0.113.65"), servers)
     }
 
     @Test
     fun assignedTunnelAddressIsRemovedFromConfiguredDnsList() {
         val servers = vpnDnsServersForClient(
             clientIpv4 = "10.0.0.128",
-            deviceDnsIpv4s = listOf("10.0.0.128", "9.9.9.9", "9.9.9.9"),
-            fallbackDnsIpv4s = listOf("65.49.70.65"),
+            deviceDnsIpv4s = listOf("10.0.0.128", "192.0.2.53", "192.0.2.53"),
+            fallbackDnsIpv4s = listOf("203.0.113.65"),
         )
 
-        assertEquals(listOf("9.9.9.9"), servers)
+        assertEquals(listOf("192.0.2.53"), servers)
     }
 
     @Test
@@ -114,22 +118,66 @@ class VpnPacketFlowConfigurationTest {
     }
 
     @Test
-    fun tunnelDnsNeverAdvertisesIpv6() {
+    fun ipv4TunnelDnsNeverAdvertisesIpv6() {
         val servers = vpnDnsServersForClient(
             clientIpv4 = "169.254.2.1",
-            deviceDnsIpv4s = listOf("fd00::53", "9.9.9.9"),
-            fallbackDnsIpv4s = listOf("65.49.70.65"),
+            deviceDnsIpv4s = listOf("fd00::53", "192.0.2.53"),
+            fallbackDnsIpv4s = listOf("203.0.113.65"),
         )
 
-        assertEquals(listOf("9.9.9.9"), servers)
+        assertEquals(listOf("192.0.2.53"), servers)
     }
 
     @Test
-    fun unsupportedIpv6IsBlockedWithoutBeingAdvertisedOnTheTunnel() {
+    fun ipv6IsCapturedLikeIpv4() {
         assertEquals(
-            VpnIpv6Policy.BLOCK_UNSUPPORTED,
+            VpnIpv6Policy.CAPTURE,
             configuration().ipv6Policy,
         )
+    }
+
+    @Test
+    fun activePacketFlowRebuildsWhenTheIpv6HalfChanges() {
+        val applied = configuration()
+
+        assertTrue(vpnPacketFlowNeedsRebuild(true, applied, configuration(clientIpv6 = "2001:db8:2::1")))
+        assertTrue(vpnPacketFlowNeedsRebuild(true, applied, configuration(dnsIpv6s = listOf("2001:db8::5353"))))
+        assertFalse(vpnPacketFlowNeedsRebuild(true, applied, configuration()))
+    }
+
+    @Test
+    fun tunnelIpv6AddressAcceptsOnlyIpv6Literals() {
+        assertEquals("2001:db8:1::1", vpnTunnelIpv6Address(" 2001:db8:1::1 "))
+        // an IPv4-mapped address is not a native IPv6 tunnel address
+        assertEquals(null, vpnTunnelIpv6Address("::ffff:10.0.0.1"))
+        assertEquals(null, vpnTunnelIpv6Address("10.0.0.1"))
+        assertEquals(null, vpnTunnelIpv6Address("fe80::1%wlan0"))
+        assertEquals(null, vpnTunnelIpv6Address("[fd00::1]"))
+        assertEquals(null, vpnTunnelIpv6Address("example.com"))
+        assertEquals(null, vpnTunnelIpv6Address("fd00::zz"))
+        assertEquals(null, vpnTunnelIpv6Address(null))
+    }
+
+    @Test
+    fun assignedIpv6TunnelAddressIsNeverUsedAsDns() {
+        val servers = vpnDnsServersIpv6ForClient(
+            clientIpv6 = "2001:db8:1::1",
+            deviceDnsIpv6s = listOf("2001:db8:1::1"),
+            fallbackDnsIpv6s = listOf("2001:db8::65:49:70:65"),
+        )
+
+        assertEquals(listOf("2001:db8::65:49:70:65"), servers)
+    }
+
+    @Test
+    fun ipv6DnsListKeepsOnlyDistinctIpv6Literals() {
+        val servers = vpnDnsServersIpv6ForClient(
+            clientIpv6 = "2001:db8:1::1",
+            deviceDnsIpv6s = listOf("192.0.2.53", "2001:db8::53", "2001:db8::53", " 2001:db8::5353 "),
+            fallbackDnsIpv6s = listOf("2001:db8::65:49:70:65"),
+        )
+
+        assertEquals(listOf("2001:db8::53", "2001:db8::5353"), servers)
     }
 
     @Test
@@ -148,14 +196,14 @@ class VpnPacketFlowConfigurationTest {
     fun offlineAlwaysRoutesToEscapeEvenWhenConnected() {
         assertEquals(
             VpnPacketFlowMode.ESCAPE,
-            vpnPacketFlowMode(offline = true, connected = true, killSwitch = false, connectRequested = false, includedAppIds = setOf("com.android.chrome")),
+            vpnPacketFlowMode(offline = true, connected = true, killSwitch = false, connectRequested = false, includedAppIds = setOf("com.example.browser")),
         )
     }
 
     @Test
     fun killSwitchKeepsCapturingEvenWhenNotConnected() {
         // Security regression guard: the kill switch ("Allow local traffic when
-        // disconnected" off) is implemented BY capturing everything with no
+        // disconnected" off) is implemented by capturing everything with no
         // exit. ESCAPE must never release the user's traffic to the ISP while
         // the kill switch is on, even when not connected.
         assertEquals(
@@ -168,7 +216,7 @@ class VpnPacketFlowConfigurationTest {
     fun killSwitchKeepsAllowingExplicitIncludesWhenNotConnected() {
         assertEquals(
             VpnPacketFlowMode.PER_APP_ALLOWLIST,
-            vpnPacketFlowMode(offline = false, connected = false, killSwitch = true, connectRequested = false, includedAppIds = setOf("com.android.chrome")),
+            vpnPacketFlowMode(offline = false, connected = false, killSwitch = true, connectRequested = false, includedAppIds = setOf("com.example.browser")),
         )
     }
 
@@ -188,7 +236,7 @@ class VpnPacketFlowConfigurationTest {
     fun connectRequestedWithIncludesStaysAllowlistDuringProviderDip() {
         assertEquals(
             VpnPacketFlowMode.PER_APP_ALLOWLIST,
-            vpnPacketFlowMode(offline = false, connected = false, killSwitch = false, connectRequested = true, includedAppIds = setOf("com.android.chrome")),
+            vpnPacketFlowMode(offline = false, connected = false, killSwitch = false, connectRequested = true, includedAppIds = setOf("com.example.browser")),
         )
     }
 
@@ -204,7 +252,7 @@ class VpnPacketFlowConfigurationTest {
     fun connectedWithIncludesRoutesToPerAppAllowlist() {
         assertEquals(
             VpnPacketFlowMode.PER_APP_ALLOWLIST,
-            vpnPacketFlowMode(offline = false, connected = true, killSwitch = false, connectRequested = false, includedAppIds = setOf("com.android.chrome")),
+            vpnPacketFlowMode(offline = false, connected = true, killSwitch = false, connectRequested = false, includedAppIds = setOf("com.example.browser")),
         )
     }
 
@@ -214,7 +262,7 @@ class VpnPacketFlowConfigurationTest {
         // live exit and no capture reason, nothing should be captured.
         assertEquals(
             VpnPacketFlowMode.ESCAPE,
-            vpnPacketFlowMode(offline = false, connected = false, killSwitch = false, connectRequested = false, includedAppIds = setOf("com.android.chrome")),
+            vpnPacketFlowMode(offline = false, connected = false, killSwitch = false, connectRequested = false, includedAppIds = setOf("com.example.browser")),
         )
     }
 
@@ -225,7 +273,7 @@ class VpnPacketFlowConfigurationTest {
     //   first pass:  escape <=> offline || !connected   (defeated the kill switch)
     // ---------------------------------------------------------------------
 
-    private val someIncludes = setOf("com.android.chrome")
+    private val someIncludes = setOf("com.example.browser")
 
     private fun mode(
         offline: Boolean = false,
@@ -316,7 +364,7 @@ class VpnPacketFlowConfigurationTest {
 
     @Test
     fun killSwitchNeverEscapesRegardlessOfConnectivityOrIncludes() {
-        // This is the CRITICAL regression the first-pass fix introduced:
+        // This is the critical regression the first-pass fix introduced:
         // `!connected -> ESCAPE` silently released user traffic to the ISP in
         // the clear while the kill switch was on. Escaping is never correct
         // while the user asked for capture-without-exit.
