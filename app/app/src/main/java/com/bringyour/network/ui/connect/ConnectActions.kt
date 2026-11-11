@@ -552,10 +552,8 @@ internal fun ConnectActionNotices(
             )
         }
 
-        // this flavor's checkout goes through the tunnel, so paying has to wait for
-        // the Disconnect above, which nothing presses for the user. A kill switch
-        // that is on keeps the VPN service up after it (vpnServiceRequired), so the
-        // line names that too
+        // Checkout may use the tunnel. Offer recovery steps only if payment fails;
+        // per-app rules may leave checkout outside it.
         if (outOfBalanceNotice.disconnectFirst) {
             Spacer(modifier = Modifier.height(8.dp))
             Text(

@@ -381,10 +381,9 @@ internal data class OutOfBalanceNotice(
  * that start can still fire. A refused start gets Cancel, the only way to
  * stop it.
  *
- * On a flavor whose checkout goes through the tunnel ([checkoutRidesTunnel]), a
- * tunnel holding the traffic stops a purchase too, so it says to disconnect first,
- * beside the Disconnect it names. Nothing disconnects for the user. With no tunnel
- * running nothing is in the way.
+ * A flavor whose checkout can use the tunnel ([checkoutRidesTunnel]) offers
+ * recovery advice if payment fails while traffic is held. Per-app rules can
+ * leave checkout outside the tunnel. Nothing disconnects for the user.
  */
 internal fun outOfBalanceNotice(
     buttons: ConnectActionButtons,
