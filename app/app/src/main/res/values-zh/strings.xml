@@ -113,7 +113,7 @@
     <string name="bittensor_key_card_short">URnetwork 不是钱包。“设置支付”会在这台设备上创建一个 Bittensor 密钥，您整个网络的 SN25α 都会支付到该密钥。请备份该密钥的恢复短语：如果您在保存恢复短语之前丢失这台设备，您的 SN25α 将无法访问。</string>
     <string name="bittensor_key_change_wallet_body">选择此网络的收益从下一个周期开始支付到哪里。之前的收益仍保留在原来支付到的地方。</string>
     <string name="bittensor_key_confirm_top200">删除此密钥也意味着放弃一键获取前 200 名席位。您仍可以从持有此恢复短语的 Bittensor 钱包获取席位。</string>
-    <string name="bittensor_key_copy_warning_2">其他应用可能会读取剪贴板。副本会保留在这台设备上，并在 60 秒后清除。</string>
+    <string name="bittensor_key_copy_warning_2">其他应用可能会读取剪贴板。本应用会尝试在 60 秒后清除复制的内容，但无法保证。请检查剪贴板并自行清除。</string>
     <string name="bittensor_key_create_here">在这台设备上创建密钥</string>
     <string name="bittensor_key_create_here_body">URnetwork 不是钱包。一键即可在这台设备上创建 Bittensor 密钥。之后请备份其恢复短语。</string>
     <string name="bittensor_key_delete_account_message_2">您的 Bittensor 密钥未备份。删除账户也会从这台设备上删除该密钥，且 URnetwork 无法找回它。</string>
@@ -170,7 +170,7 @@
     <string name="bittensor_key_set_up">设置支付</string>
     <string name="bittensor_key_setting_up">正在将密钥保存到这台设备上并读回，然后签名。</string>
     <string name="bittensor_key_sign_out_message">您的 Bittensor 恢复短语尚未保存。密钥会保留在这台设备上，并在此网络再次登录时重新出现。如果您在保存恢复短语之前丢失这台设备，您的 SN25α 将无法访问。</string>
-    <string name="bittensor_key_sign_out_message_2">密钥会保留在这台设备上，并在您再次登录此网络时重新出现。如果您在保存密钥之前丢失这台设备，您的 SN25α 将无法访问。</string>
+    <string name="bittensor_key_sign_out_message_2">密钥会保留在这台设备上，并在您再次登录此网络时重新出现。如果您在备份恢复短语之前丢失这台设备，您的 SN25α 将无法访问。</string>
     <string name="bittensor_key_sign_out_title_2">您的 Bittensor 密钥未备份</string>
     <string name="bittensor_key_signing">正在设置支付：正在使用此密钥签署您网络的收益支付授权。</string>
     <string name="bittensor_key_status_saved">密钥在这台设备上，恢复短语已保存</string>
@@ -669,6 +669,7 @@
     <string name="insufficient_balance_disconnect_first_kill_switch">要升级，请先选择“断开连接”；如果断网保护已开启，请将其关闭。在此之前，付款无法完成。</string>
     <string name="insufficient_balance_exhausted">在免费数据更新或升级之前，你的数据已用完。</string>
     <string name="insufficient_balance_held_notice">在你升级或断开连接之前，你的流量会保留在隧道中。</string>
+    <string name="insufficient_balance_always_on_vpn">如果已为本应用设置 Android 的“始终开启的 VPN”，请同时在 Android 的 VPN 设置中将其关闭。断开连接后，它仍会阻止付款。</string>
     <string name="insufficient_balance_reconnecting">数据已再次可用。正在重新连接…</string>
     <string name="insufficient_balance_refreshes_in">免费数据将在 %1$s 后更新。</string>
     <string name="insufficient_balance_reserved">%1$s 已为你当前打开的连接预留。未使用的部分会在连接关闭时退回。</string>

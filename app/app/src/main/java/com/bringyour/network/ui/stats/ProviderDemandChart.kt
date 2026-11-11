@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -153,7 +154,10 @@ fun ProviderDemandChart(
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(DEMAND_CHART_HEIGHT),
+                .then(
+                    if (display.demand == ProviderDemandState.UNAVAILABLE) Modifier.heightIn(min = DEMAND_CHART_HEIGHT)
+                    else Modifier.height(DEMAND_CHART_HEIGHT)
+                ),
             contentAlignment = Alignment.Center
         ) {
             when (display.demand) {

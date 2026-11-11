@@ -65,6 +65,9 @@ data class SnClaimStatusState(
         get() = reason != Sdk.SnClaimReasonRelayNotRunning && reason != Sdk.SnClaimReasonRelayPaused
 }
 
+fun snClaimStatusUnavailable(): SnClaimStatusState =
+    SnClaimStatusState(showsTile = true, unavailable = true)
+
 /**
  * One of the network's accounts in the operator's pool, as the relay sees it
  * (sdk SnClaimRelayAccount). Amounts are rao of SN25α.
@@ -115,7 +118,7 @@ sealed class SnClaimNowOutcome {
  * relay claims for its consent, while the sdk says the tile shows.
  */
 fun snLedgerTileWithRelay(hasWallet: Boolean, ledgerTile: SnLedgerTile?, claimStatus: SnClaimStatusState?): SnLedgerTile? {
-    if (hasWallet && ledgerTile != null) {
+    if (hasWallet) {
         return ledgerTile
     }
     if (claimStatus == null || !claimStatus.showsTile) {
@@ -123,10 +126,10 @@ fun snLedgerTileWithRelay(hasWallet: Boolean, ledgerTile: SnLedgerTile?, claimSt
     }
     return SnLedgerTile(
         accounts = null,
-        unavailable = false,
+        unavailable = claimStatus.unavailable,
         showClaim = false,
         claimEnabled = false,
-        relayClaimableRao = claimStatus.claimableRao,
+        relayClaimableRao = claimStatus.claimableRao.takeUnless { claimStatus.unavailable },
     )
 }
 

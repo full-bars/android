@@ -113,7 +113,7 @@
     <string name="bittensor_key_card_short">URnetwork n’est pas un portefeuille. « Configurer les paiements » crée une clé Bittensor sur cet appareil, et les SN25α de tout votre réseau y sont versés. Gardez une copie de la phrase de sauvegarde de la clé : si vous perdez cet appareil avant de l’avoir enregistrée, vos SN25α seront inaccessibles.</string>
     <string name="bittensor_key_change_wallet_body">Choisissez où les gains de ce réseau sont versés à partir de la prochaine époque. Les gains précédents restent là où ils ont été versés.</string>
     <string name="bittensor_key_confirm_top200">Supprimer cette clé signifie aussi renoncer à réserver une place dans le Top 200 d’une simple touche. Vous pourriez toujours en réserver une depuis un portefeuille Bittensor contenant cette phrase de sauvegarde.</string>
-    <string name="bittensor_key_copy_warning_2">D’autres applications pourraient lire le presse-papiers. La copie reste sur cet appareil et est effacée après 60 s.</string>
+    <string name="bittensor_key_copy_warning_2">D’autres applications peuvent peut-être lire le presse-papiers. Cette application tente d’effacer la copie après 60 s, sans pouvoir le garantir. Vérifiez le presse-papiers et videz-le vous-même.</string>
     <string name="bittensor_key_create_here">Créer une clé sur cet appareil</string>
     <string name="bittensor_key_create_here_body">URnetwork n’est pas un portefeuille. Une simple touche crée une clé Bittensor sur cet appareil ; enregistrez ensuite sa phrase de sauvegarde.</string>
     <string name="bittensor_key_delete_account_message_2">Votre clé Bittensor n’est pas sauvegardée. Supprimer votre compte la supprime aussi de cet appareil, et URnetwork ne peut pas la récupérer.</string>
@@ -170,7 +170,7 @@
     <string name="bittensor_key_set_up">Configurer les paiements</string>
     <string name="bittensor_key_setting_up">Enregistrement de la clé sur cet appareil et relecture, puis signature.</string>
     <string name="bittensor_key_sign_out_message">Votre phrase de sauvegarde Bittensor n’est pas encore enregistrée. La clé reste sur cet appareil et revient lorsque ce réseau se reconnecte. Si vous perdez cet appareil avant de l’avoir enregistrée, vos SN25α seront inaccessibles.</string>
-    <string name="bittensor_key_sign_out_message_2">Elle reste sur cet appareil et revient lorsque vous vous reconnectez à ce réseau. Si vous perdez cet appareil avant de l’avoir enregistrée, vos SN25α seront inaccessibles.</string>
+    <string name="bittensor_key_sign_out_message_2">La clé reste sur cet appareil et revient lorsque vous vous reconnectez à ce réseau. Si vous perdez cet appareil avant d’avoir sauvegardé la phrase de sauvegarde, vos SN25α seront inaccessibles.</string>
     <string name="bittensor_key_sign_out_title_2">Votre clé Bittensor n’est pas sauvegardée</string>
     <string name="bittensor_key_signing">Configuration des paiements : signature du consentement aux paiements de votre réseau avec cette clé.</string>
     <string name="bittensor_key_status_saved">Clé sur cet appareil, phrase de sauvegarde enregistrée</string>
@@ -669,6 +669,7 @@
     <string name="insufficient_balance_disconnect_first_kill_switch">Pour passer à une offre supérieure, choisissez d’abord « Déconnecter » et désactivez le Kill switch s’il est activé. Le paiement ne peut pas aboutir avant cela.</string>
     <string name="insufficient_balance_exhausted">Vous n’avez plus de données jusqu’au renouvellement gratuit ou à un passage à une offre supérieure.</string>
     <string name="insufficient_balance_held_notice">Votre trafic est retenu dans le tunnel jusqu’à ce que vous passiez à une offre supérieure ou que vous vous déconnectiez.</string>
+    <string name="insufficient_balance_always_on_vpn">Si le VPN permanent d’Android est défini pour cette application, désactivez-le aussi dans les paramètres VPN d’Android. Il continue de bloquer le paiement après la déconnexion.</string>
     <string name="insufficient_balance_reconnecting">Des données sont de nouveau disponibles. Reconnexion…</string>
     <string name="insufficient_balance_refreshes_in">Les données gratuites seront renouvelées dans %1$s.</string>
     <string name="insufficient_balance_reserved">%1$s sont réservés à vos connexions ouvertes. Ce qu’elles n’utilisent pas vous est rendu à mesure qu’elles se ferment.</string>

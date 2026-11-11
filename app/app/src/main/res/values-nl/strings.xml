@@ -113,7 +113,7 @@
     <string name="bittensor_key_card_short">URnetwork is geen wallet. ‘Uitbetalingen instellen’ maakt een Bittensor-sleutel op dit apparaat, en de SN25α van je hele netwerk wordt aan die sleutel uitbetaald. Maak een back-up van de herstelzin van de sleutel: als je dit apparaat kwijtraakt voordat je de herstelzin hebt opgeslagen, is je SN25α niet meer bereikbaar.</string>
     <string name="bittensor_key_change_wallet_body">Kies waar de verdiensten van dit netwerk vanaf de volgende epoch worden uitbetaald. Eerdere verdiensten blijven waar ze zijn uitbetaald.</string>
     <string name="bittensor_key_confirm_top200">Als je deze sleutel verwijdert, geef je ook op dat je met één tik een plek in de Top 200 kunt claimen. Je kunt nog steeds claimen vanuit een Bittensor-wallet met deze herstelzin.</string>
-    <string name="bittensor_key_copy_warning_2">Andere apps kunnen het klembord mogelijk lezen. De kopie blijft op dit apparaat en wordt na 60 s gewist.</string>
+    <string name="bittensor_key_copy_warning_2">Andere apps kunnen mogelijk het klembord lezen. Deze app probeert de kopie na 60 sec. te wissen, maar kan dat niet garanderen. Controleer het klembord en wis het zelf.</string>
     <string name="bittensor_key_create_here">Een sleutel maken op dit apparaat</string>
     <string name="bittensor_key_create_here_body">URnetwork is geen wallet. Eén tik maakt een Bittensor-sleutel op dit apparaat; maak daarna een back-up van de bijbehorende herstelzin.</string>
     <string name="bittensor_key_delete_account_message_2">Je Bittensor-sleutel heeft geen back-up. Als je je account verwijdert, wordt hij ook van dit apparaat verwijderd, en URnetwork kan hem niet terugkrijgen.</string>
@@ -170,7 +170,7 @@
     <string name="bittensor_key_set_up">Uitbetalingen instellen</string>
     <string name="bittensor_key_setting_up">De sleutel wordt op dit apparaat opgeslagen en teruggelezen, daarna wordt er ondertekend.</string>
     <string name="bittensor_key_sign_out_message">Je Bittensor-herstelzin is nog niet opgeslagen. De sleutel blijft op dit apparaat staan en komt terug wanneer dit netwerk opnieuw inlogt. Als je dit apparaat kwijtraakt voordat je de herstelzin hebt opgeslagen, is je SN25α niet meer bereikbaar.</string>
-    <string name="bittensor_key_sign_out_message_2">Hij blijft op dit apparaat staan en komt terug wanneer je opnieuw inlogt bij dit netwerk. Als je dit apparaat kwijtraakt voordat je hem hebt opgeslagen, is je SN25α niet meer bereikbaar.</string>
+    <string name="bittensor_key_sign_out_message_2">De sleutel blijft op dit apparaat staan en komt terug wanneer je opnieuw inlogt bij dit netwerk. Als je dit apparaat kwijtraakt voordat je een back-up van de herstelzin hebt gemaakt, is je SN25α niet meer bereikbaar.</string>
     <string name="bittensor_key_sign_out_title_2">Je Bittensor-sleutel heeft geen back-up</string>
     <string name="bittensor_key_signing">Uitbetalingen worden ingesteld: de toestemming voor uitbetaling van je netwerk wordt met deze sleutel ondertekend.</string>
     <string name="bittensor_key_status_saved">Sleutel op dit apparaat, herstelzin opgeslagen</string>
@@ -669,6 +669,7 @@
     <string name="insufficient_balance_disconnect_first_kill_switch">Kies eerst ‘Verbinding verbreken’ om te upgraden en zet de Kill switch uit als die aan staat. Tot die tijd kan de betaling niet doorgaan.</string>
     <string name="insufficient_balance_exhausted">Je data is op tot de gratis vernieuwing of een upgrade.</string>
     <string name="insufficient_balance_held_notice">Je verkeer wordt in de tunnel vastgehouden totdat je upgradet of de verbinding verbreekt.</string>
+    <string name="insufficient_balance_always_on_vpn">Als de altijd-aan-VPN van Android voor deze app is ingesteld, zet die dan ook uit in de VPN-instellingen van Android. Die blokkeert betalen ook na het verbreken van de verbinding.</string>
     <string name="insufficient_balance_reconnecting">Er is weer data beschikbaar. Opnieuw verbinden…</string>
     <string name="insufficient_balance_refreshes_in">Gratis data wordt over %1$s vernieuwd.</string>
     <string name="insufficient_balance_reserved">%1$s is gereserveerd voor je open verbindingen. Wat ze niet gebruiken, krijg je terug zodra ze worden gesloten.</string>

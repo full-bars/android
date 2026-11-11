@@ -149,6 +149,9 @@ fun EarningsScreen(
         onDispose {
             earningsViewModel.consumeTop200Focus()
             earningsViewModel.keyModel.closeScreen()
+            if (!BittensorKeyScreenRequests.navigation.value) {
+                BittensorKeyScreenRequests.clear()
+            }
         }
     }
     val isSeekerHolder by earningsViewModel.isSeekerHolder.collectAsState()

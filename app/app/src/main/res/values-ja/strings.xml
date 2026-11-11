@@ -113,7 +113,7 @@
     <string name="bittensor_key_card_short">URnetwork はウォレットではありません。「支払いを設定」で、このデバイスに Bittensor キーが作成され、ネットワーク全体の SN25α がそのキーに支払われます。キーの復元フレーズをバックアップしてください。復元フレーズを保存する前にこのデバイスをなくすと、SN25α にアクセスできなくなります。</string>
     <string name="bittensor_key_change_wallet_body">次のエポックからこのネットワークの収益を支払う先を選択してください。これまでの収益は、支払われた先に残ります。</string>
     <string name="bittensor_key_confirm_top200">このキーを削除すると、ワンタップでトップ 200 の枠を確保することもできなくなります。この復元フレーズを入れた Bittensor ウォレットからなら、引き続き確保できます。</string>
-    <string name="bittensor_key_copy_warning_2">他のアプリがクリップボードを読み取れる可能性があります。コピーはこのデバイス内にとどまり、60 秒後に消去されます。</string>
+    <string name="bittensor_key_copy_warning_2">他のアプリがクリップボードを読み取れる可能性があります。このアプリは 60 秒後にコピーの消去を試みますが、確実ではありません。クリップボードを確認し、ご自身で消去してください。</string>
     <string name="bittensor_key_create_here">このデバイスでキーを作成</string>
     <string name="bittensor_key_create_here_body">URnetwork はウォレットではありません。ワンタップでこのデバイスに Bittensor キーが作成されます。作成後は、その復元フレーズをバックアップしてください。</string>
     <string name="bittensor_key_delete_account_message_2">Bittensor キーがバックアップされていません。アカウントを削除すると、キーもこのデバイスから削除され、URnetwork はキーを取り戻すことができません。</string>
@@ -170,7 +170,7 @@
     <string name="bittensor_key_set_up">支払いを設定</string>
     <string name="bittensor_key_setting_up">このデバイスにキーを保存して読み戻し、その後署名します。</string>
     <string name="bittensor_key_sign_out_message">Bittensor の復元フレーズはまだ保存されていません。キーはこのデバイスに残り、このネットワークが再度サインインすると戻ります。復元フレーズを保存する前にこのデバイスをなくすと、SN25α にアクセスできなくなります。</string>
-    <string name="bittensor_key_sign_out_message_2">キーはこのデバイスに残り、このネットワークに再度サインインすると戻ります。キーを保存する前にこのデバイスをなくすと、SN25α にアクセスできなくなります。</string>
+    <string name="bittensor_key_sign_out_message_2">キーはこのデバイスに残り、このネットワークに再度サインインすると戻ります。復元フレーズをバックアップする前にこのデバイスをなくすと、SN25α にアクセスできなくなります。</string>
     <string name="bittensor_key_sign_out_title_2">Bittensor キーがバックアップされていません</string>
     <string name="bittensor_key_signing">支払いを設定しています：このキーでネットワークの支払いの同意に署名しています。</string>
     <string name="bittensor_key_status_saved">キーはこのデバイスにあり、復元フレーズは保存済みです</string>
@@ -669,6 +669,7 @@
     <string name="insufficient_balance_disconnect_first_kill_switch">アップグレードするには、先に「切断する」を選択し、キルスイッチがオンの場合はオフにしてください。それまでは支払いを完了できません。</string>
     <string name="insufficient_balance_exhausted">無料の更新またはアップグレードまで、使えるデータがありません。</string>
     <string name="insufficient_balance_held_notice">アップグレードするか切断するまで、通信はトンネル内に保持されます。</string>
+    <string name="insufficient_balance_always_on_vpn">このアプリに Android の常時 VPN が設定されている場合は、Android の VPN 設定でもオフにしてください。切断後も支払いがブロックされたままになります。</string>
     <string name="insufficient_balance_reconnecting">データが再び利用可能になりました。再接続しています…</string>
     <string name="insufficient_balance_refreshes_in">無料データはあと %1$s で更新されます。</string>
     <string name="insufficient_balance_reserved">%1$s が開いている接続のために予約されています。使われなかった分は、接続が閉じるにつれて戻ります。</string>

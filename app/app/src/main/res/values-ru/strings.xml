@@ -113,7 +113,7 @@
     <string name="bittensor_key_card_short">URnetwork не является кошельком. «Настроить выплаты» создаёт на этом устройстве ключ Bittensor, и на него выплачиваются SN25α всей вашей сети. Создайте резервную копию фразы восстановления ключа: если вы потеряете это устройство, не сохранив её, получить доступ к вашим SN25α будет невозможно.</string>
     <string name="bittensor_key_change_wallet_body">Выберите, куда со следующей эпохи будет выплачиваться заработок этой сети. Прежний заработок останется там, куда он был выплачен.</string>
     <string name="bittensor_key_confirm_top200">Удаляя этот ключ, вы также отказываетесь от возможности занять место в Топ-200 одним нажатием. Вы по-прежнему сможете занять его из кошелька Bittensor с этой фразой восстановления.</string>
-    <string name="bittensor_key_copy_warning_2">Другие приложения могут прочитать буфер обмена. Копия остаётся на этом устройстве и удаляется через 60 с.</string>
+    <string name="bittensor_key_copy_warning_2">Другие приложения могут прочитать буфер обмена. Это приложение пытается очистить копию через 60 с, но гарантировать этого не может. Проверьте буфер обмена и очистите его сами.</string>
     <string name="bittensor_key_create_here">Создать ключ на этом устройстве</string>
     <string name="bittensor_key_create_here_body">URnetwork не является кошельком. Одно нажатие создаёт ключ Bittensor на этом устройстве; после этого создайте резервную копию его фразы восстановления.</string>
     <string name="bittensor_key_delete_account_message_2">У вашего ключа Bittensor нет резервной копии. При удалении аккаунта он также будет удалён с этого устройства, и URnetwork не сможет его вернуть.</string>
@@ -170,7 +170,7 @@
     <string name="bittensor_key_set_up">Настроить выплаты</string>
     <string name="bittensor_key_setting_up">Сохранение ключа на этом устройстве и повторное чтение, затем подписание.</string>
     <string name="bittensor_key_sign_out_message">Ваша фраза восстановления Bittensor ещё не сохранена. Ключ останется на этом устройстве и вернётся, когда эта сеть снова войдёт в систему. Если вы потеряете это устройство, не сохранив её, получить доступ к вашим SN25α будет невозможно.</string>
-    <string name="bittensor_key_sign_out_message_2">Он останется на этом устройстве и вернётся, когда вы снова войдёте в эту сеть. Если вы потеряете это устройство, не сохранив его, получить доступ к вашим SN25α будет невозможно.</string>
+    <string name="bittensor_key_sign_out_message_2">Ключ останется на этом устройстве и вернётся, когда вы снова войдёте в эту сеть. Если вы потеряете это устройство, не сохранив резервную копию фразы восстановления, получить доступ к вашим SN25α будет невозможно.</string>
     <string name="bittensor_key_sign_out_title_2">У вашего ключа Bittensor нет резервной копии</string>
     <string name="bittensor_key_signing">Настройка выплат: подписание согласия на выплаты вашей сети этим ключом.</string>
     <string name="bittensor_key_status_saved">Ключ на этом устройстве, фраза восстановления сохранена</string>
@@ -669,6 +669,7 @@
     <string name="insufficient_balance_disconnect_first_kill_switch">Чтобы повысить тариф, сначала выберите «Отключить» и выключите Kill switch, если он включён. До этого оплата не пройдёт.</string>
     <string name="insufficient_balance_exhausted">Данные закончились до бесплатного обновления или повышения тарифа.</string>
     <string name="insufficient_balance_held_notice">Ваш трафик удерживается в туннеле, пока вы не повысите тариф или не отключитесь.</string>
+    <string name="insufficient_balance_always_on_vpn">Если для этого приложения включён постоянный VPN Android (Always-on VPN), выключите его также в настройках VPN Android. Он продолжает блокировать оплату и после отключения.</string>
     <string name="insufficient_balance_reconnecting">Данные снова доступны. Переподключение…</string>
     <string name="insufficient_balance_refreshes_in">Бесплатные данные обновятся через %1$s.</string>
     <string name="insufficient_balance_reserved">%1$s зарезервировано для ваших открытых подключений. То, что они не используют, возвращается по мере их закрытия.</string>

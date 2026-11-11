@@ -116,7 +116,7 @@
     <string name="bittensor_key_card_short">URnetwork is not a wallet. Set up payouts creates a Bittensor key on this device, and your whole network\'s SN25α is paid to it. Back up its recovery phrase: if you lose this device before saving it, your SN25α can\'t be reached.</string>
     <string name="bittensor_key_change_wallet_body">Choose where this network\'s earnings are paid from the next epoch. Earlier earnings stay where they were paid.</string>
     <string name="bittensor_key_confirm_top200">Deleting this key also gives up claiming a Top 200 spot with one tap. You could still claim from a Bittensor wallet holding this recovery phrase.</string>
-    <string name="bittensor_key_copy_warning_2">Other apps may be able to read the clipboard. The copy stays on this device and is cleared after 60 s.</string>
+    <string name="bittensor_key_copy_warning_2">Other apps may be able to read the clipboard. This app tries to clear the copy after 60 s, but can\'t guarantee it. Check the clipboard and clear it yourself.</string>
     <string name="bittensor_key_create_here">Create a key on this device</string>
     <string name="bittensor_key_create_here_body">URnetwork is not a wallet. One tap creates a Bittensor key on this device; back up its recovery phrase afterwards.</string>
     <string name="bittensor_key_delete_account_message_2">Your Bittensor key isn\'t backed up. Deleting your account also deletes it from this device, and URnetwork can\'t get it back.</string>
@@ -173,7 +173,7 @@
     <string name="bittensor_key_set_up">Set up payouts</string>
     <string name="bittensor_key_setting_up">Saving the key on this device and reading it back, then signing.</string>
     <string name="bittensor_key_sign_out_message">Your Bittensor recovery phrase isn\'t saved yet. The key stays on this device and comes back when this network signs in again. If you lose this device before saving it, your SN25α can\'t be reached.</string>
-    <string name="bittensor_key_sign_out_message_2">It stays on this device and comes back when you sign in to this network again. If you lose this device before saving it, your SN25α can\'t be reached.</string>
+    <string name="bittensor_key_sign_out_message_2">The key stays on this device and comes back when you sign in to this network again. If you lose this device before backing up the recovery phrase, your SN25α can\'t be reached.</string>
     <string name="bittensor_key_sign_out_title_2">Your Bittensor key isn\'t backed up</string>
     <string name="bittensor_key_signing">Setting up payouts: signing your network\'s payout consent with this key.</string>
     <string name="bittensor_key_status_saved">Key on this device, recovery phrase saved</string>
@@ -676,6 +676,7 @@
     <string name="insufficient_balance_disconnect_first_kill_switch">To upgrade, press Disconnect first, and turn off the kill switch if it\'s on. Payment can\'t get through until you do.</string>
     <string name="insufficient_balance_exhausted">You\'re out of data until the free refresh or an upgrade.</string>
     <string name="insufficient_balance_held_notice">Your traffic is held in the tunnel until you upgrade or disconnect.</string>
+    <string name="insufficient_balance_always_on_vpn">If Android\'s Always-on VPN is set for this app, also turn it off in Android\'s VPN settings. It keeps blocking payment after Disconnect.</string>
     <string name="insufficient_balance_reconnecting">Data is available again. Reconnecting…</string>
     <string name="insufficient_balance_refreshes_in">Free data refreshes in %1$s.</string>
     <string name="insufficient_balance_reserved">%1$s is reserved for your open connections. What they don\'t use is returned as they close.</string>

@@ -113,7 +113,7 @@
     <string name="bittensor_key_card_short">URnetwork는 지갑이 아닙니다. \'지급 설정\'은 이 기기에 Bittensor 키를 만들며, 네트워크 전체의 SN25α는 이 키로 지급됩니다. 키의 복구 문구를 백업하세요. 복구 문구를 저장하기 전에 이 기기를 잃어버리면 SN25α에 접근할 수 없습니다.</string>
     <string name="bittensor_key_change_wallet_body">다음 에포크부터 이 네트워크의 수익이 지급될 곳을 선택하세요. 이전 수익은 지급된 곳에 그대로 남습니다.</string>
     <string name="bittensor_key_confirm_top200">이 키를 삭제하면 한 번의 탭으로 Top 200 자리를 확보하는 기능도 포기하게 됩니다. 이 복구 문구가 들어 있는 Bittensor 지갑에서는 여전히 자리를 확보할 수 있습니다.</string>
-    <string name="bittensor_key_copy_warning_2">다른 앱이 클립보드를 읽을 수도 있습니다. 복사본은 이 기기에 남으며 60초 후에 지워집니다.</string>
+    <string name="bittensor_key_copy_warning_2">다른 앱이 클립보드를 읽을 수 있습니다. 이 앱은 60초 후 복사본 삭제를 시도하지만 보장하지는 못합니다. 클립보드를 확인하고 직접 비우세요.</string>
     <string name="bittensor_key_create_here">이 기기에서 키 만들기</string>
     <string name="bittensor_key_create_here_body">URnetwork는 지갑이 아닙니다. 한 번의 탭으로 이 기기에 Bittensor 키가 만들어집니다. 그 후 키의 복구 문구를 백업하세요.</string>
     <string name="bittensor_key_delete_account_message_2">Bittensor 키가 백업되지 않았습니다. 계정을 삭제하면 키도 이 기기에서 삭제되며, URnetwork는 키를 되찾을 수 없습니다.</string>
@@ -170,7 +170,7 @@
     <string name="bittensor_key_set_up">지급 설정</string>
     <string name="bittensor_key_setting_up">이 기기에 키를 저장하고 다시 읽은 다음 서명하는 중입니다.</string>
     <string name="bittensor_key_sign_out_message">Bittensor 복구 문구가 아직 저장되지 않았습니다. 키는 이 기기에 남아 있으며 이 네트워크가 다시 로그인하면 돌아옵니다. 복구 문구를 저장하기 전에 이 기기를 잃어버리면 SN25α에 접근할 수 없습니다.</string>
-    <string name="bittensor_key_sign_out_message_2">키는 이 기기에 남아 있으며 이 네트워크에 다시 로그인하면 돌아옵니다. 키를 저장하기 전에 이 기기를 잃어버리면 SN25α에 접근할 수 없습니다.</string>
+    <string name="bittensor_key_sign_out_message_2">키는 이 기기에 남아 있으며 이 네트워크에 다시 로그인하면 돌아옵니다. 복구 문구를 백업하기 전에 이 기기를 잃어버리면 SN25α에 접근할 수 없습니다.</string>
     <string name="bittensor_key_sign_out_title_2">Bittensor 키가 백업되지 않았습니다</string>
     <string name="bittensor_key_signing">지급 설정 중: 이 키로 네트워크의 지급 동의에 서명하는 중입니다.</string>
     <string name="bittensor_key_status_saved">키가 이 기기에 있음, 복구 문구 저장됨</string>
@@ -669,6 +669,7 @@
     <string name="insufficient_balance_disconnect_first_kill_switch">업그레이드하려면 먼저 \'연결 해제\'를 선택하고, 킬 스위치가 켜져 있으면 끄세요. 그 전에는 결제를 완료할 수 없습니다.</string>
     <string name="insufficient_balance_exhausted">무료 갱신 또는 업그레이드 전까지 데이터가 없습니다.</string>
     <string name="insufficient_balance_held_notice">업그레이드하거나 연결을 해제할 때까지 트래픽이 터널 안에 보류됩니다.</string>
+    <string name="insufficient_balance_always_on_vpn">이 앱에 Android 상시 VPN이 설정되어 있다면 Android VPN 설정에서도 끄세요. 연결을 끊은 뒤에도 결제가 계속 차단됩니다.</string>
     <string name="insufficient_balance_reconnecting">데이터를 다시 사용할 수 있습니다. 다시 연결하는 중…</string>
     <string name="insufficient_balance_refreshes_in">무료 데이터는 %1$s 후에 갱신됩니다.</string>
     <string name="insufficient_balance_reserved">%1$s이(가) 열려 있는 연결을 위해 예약되어 있습니다. 사용하지 않은 만큼은 연결이 닫히는 대로 돌아옵니다.</string>
